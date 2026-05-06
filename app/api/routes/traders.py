@@ -1,0 +1,76 @@
+"""Trader endpoints — top-N for the UI ranking list, drill-down for the modal."""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Any
+
+import asyncpg
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from app.api.deps import get_conn
+from app.db import crud
+from app.services.polymarket import LeaderboardCategory
+from app.services.trader_ranker import RankingMode, rank_traders
+
+router = APIRouter(prefix="/traders", tags=["traders"])
+
+VALID_MODES = ("absolute", "hybrid", "specialist")
+VALID_CATEGORIES = ("overall", "politics", "sports", "crypto", "culture", "tech", "finance")
+
+
+@router.get("/top")
+async def get_top_traders(
+    mode: str = Query("absolute"),
+    category: str = Query("overall"),
+    top_n: int = Query(50, ge=20, le=100),
+    conn: asyncpg.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Top-N traders for the user's (mode, category) selection.
+
+    `top_n` is clamped to 20-100 per UI-SPEC. Step 5 default is 50.
+    """
+    if mode not in VALID_MODES:
+        raise HTTPException(400, f"mode must be one of {VALID_MODES}")
+    if category not in VALID_CATEGORIES:
+        raise HTTPException(400, f"category must be one of {VALID_CATEGORIES}")
+
+    traders = await rank_traders(
+        conn,
+        mode=mode,             # type: ignore[arg-type]
+        category=category,     # type: ignore[arg-type]
+        top_n=top_n,
+    )
+    return {
+        "mode": mode,
+        "category": category,
+        "top_n": top_n,
+        "traders": [asdict(t) for t in traders],
+    }
+
+
+@router.get("/{wallet}")
+async def get_trader(
+    wallet: str,
+    conn: asyncpg.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Drill-down: profile + per-category stats + open positions + recent trades.
+
+    Per UI-SPEC the modal opens on wallet click.
+    """
+    # F23: extracted inline SQL into named crud helpers (CLAUDE.md rule).
+    wallet = wallet.lower()
+    profile = await crud.get_trader_profile(conn, wallet)
+    if profile is None:
+        raise HTTPException(404, f"trader {wallet} not found")
+    per_category = await crud.get_trader_per_category_stats(conn, wallet)
+    positions = await crud.get_trader_open_positions(conn, wallet, limit=200)
+    classification = await crud.get_trader_classification(conn, wallet)
+    cluster_row = await crud.get_trader_sybil_cluster(conn, wallet)
+    return {
+        "profile": profile,
+        "classification": classification,
+        "cluster": cluster_row,
+        "per_category": per_category,
+        "open_positions": positions,
+    }

@@ -1,0 +1,47 @@
+# Environment
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Local data
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Spike outputs (raw API dumps from validation runs)
+spike/output/
+
+# Claude Code local settings (machine-specific, not for sharing)
+.claude/settings.local.json
+
+# Database backups (never commit — could contain real data)
+*.sql.gz
+backup_*.sql
+*.dump
