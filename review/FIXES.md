@@ -759,3 +759,52 @@ it and the test that prevents regression.
   structurally fixed. Retries no longer cascade because the shared
   bucket is the single chokepoint, and `Retry-After` honoring lets the
   server's own pacing inform our backoff when present.
+
+### Tier A — migrations 018, 019, 020 (schema-only, no behavior change)
+
+- **Status**: fixed (commit 1 of the Pass 5 plan)
+- **Source**: `review/PASS5_PLAN.md` Tier A. Schema groundwork for items
+  #8, #9, #16. No code changes here — code consumers for #8 and #16 land
+  in later commits; #9 is fully fixed by migration 019 alone.
+- **Files**:
+  - `migrations/018_slice_lookups_bootstrap_p.sql` — adds nullable
+    `bootstrap_p NUMERIC` column. Legacy rows stay NULL;
+    `compute_corrections` keeps falling back to `_pvalue_from_ci` for
+    those, and new rows (after item #8 lands) will persist the real
+    bootstrap p-value.
+  - `migrations/019_dedup_view_skip_unavailable.sql` — drops and
+    recreates `vw_signals_unique_market`, moving the
+    `signal_entry_source != 'unavailable'` filter **inside** the
+    `first_fired` CTE so it runs **before** the `DISTINCT ON`. The
+    canonical row per `(condition_id, direction)` is now the earliest
+    *executable* fire, not the earliest fire period. Column list
+    preserved verbatim from migration 007 — no downstream code change
+    needed. Lens aggregation continues to count all fires (including
+    unavailable ones).
+  - `migrations/020_snapshot_runs.sql` — new completeness ledger keyed
+    by `snapshot_date`. Records `started_at`/`completed_at`,
+    `total_combos`/`succeeded_combos`/`failed_combos`, and a
+    `failures JSONB` list. Index on `completed_at DESC` for the future
+    `/system/errors` page consumer. Code that writes to this table
+    lands with item #16.
+  - `scripts/smoke_phase_pass5_migrations.py` — 34 new tests covering
+    file content (key SQL fragments, comments, structural ordering of
+    `WHERE` vs `ORDER BY` inside the CTE) plus live-DB checks
+    (column types, view comment, behavior round-trip on the dedup view
+    using a unique `mode='__pass5_test_019'` tag with full cleanup, PK
+    + index existence on `snapshot_runs`, JSONB round-trip).
+- **Decision call-out**: the original plan sketched the migration 019
+  view with extra Pass 3+ columns (`contributing_wallets`,
+  `first_net_dollar_skew`, etc.) that don't appear in the current view
+  contract. We preserved the existing column set verbatim — no scope
+  creep, no risk of breaking the backtest engine's existing reads. If a
+  future audit wants those columns surfaced via the dedup view, that's
+  a separate migration.
+- **Live verification**: `scripts/apply_migrations.py` applied all
+  three cleanly to live Supabase (commit `ad44c26` → migrations 018,
+  019, 020 registered in `_migrations`). Behavioral round-trip on the
+  rebuilt view confirms `unavailable` rows are filtered before the
+  `DISTINCT ON` (test row absent from the view; canonical row is the
+  later `clob_l2` row, not the earlier `unavailable` one).
+- **Total smoke count**: 623 → 657 across 12 suites (34 new
+  Tier A tests in `smoke_phase_pass5_migrations.py`).
