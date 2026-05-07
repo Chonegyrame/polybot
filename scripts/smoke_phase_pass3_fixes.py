@@ -950,6 +950,232 @@ asyncio.run(test_r4_r7_db())
 
 
 # ---------------------------------------------------------------------------
+# R3a + R3b + R3c -- exit detector trim/exit + cohort-aware
+# ---------------------------------------------------------------------------
+
+section("R3a -- two-tier _classify_drop (TRIM vs EXIT)")
+
+
+def test_r3a_pure() -> None:
+    from app.services.exit_detector import (
+        _classify_drop, TRIM_THRESHOLD, EXIT_THRESHOLD,
+    )
+
+    check("R3a: TRIM_THRESHOLD == 0.20", TRIM_THRESHOLD == 0.20,
+          f"got {TRIM_THRESHOLD}")
+    check("R3a: EXIT_THRESHOLD == 0.50", EXIT_THRESHOLD == 0.50,
+          f"got {EXIT_THRESHOLD}")
+
+    # Returns tuple now
+    res = _classify_drop(7, 10, 100_000, 100_000)  # 30% trader drop
+    check("R3a: 30% trader drop returns trim tier",
+          res == ("trader_count", "trim"), f"got {res}")
+
+    res = _classify_drop(4, 10, 100_000, 100_000)  # 60% trader drop
+    check("R3a: 60% trader drop returns exit tier",
+          res == ("trader_count", "exit"), f"got {res}")
+
+    # 50% drop on aggregate hits EXIT exactly
+    res = _classify_drop(10, 10, 50_000, 100_000)
+    check("R3a: 50% aggregate drop hits exit threshold",
+          res == ("aggregate", "exit"), f"got {res}")
+
+
+test_r3a_pure()
+
+
+section("R3b + R3c -- detect_exits uses contributing_wallets cohort")
+
+
+async def test_r3b_r3c_db() -> None:
+    """End-to-end: insert a synthetic signal with contributing_wallets,
+    insert positions for SOME of those wallets (simulating partial exit),
+    run detect_exits, verify cohort-based recompute."""
+    from app.db.connection import init_pool, close_pool
+    from app.services.exit_detector import detect_exits
+
+    pool = await init_pool(min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            mkt = await conn.fetchrow(
+                """
+                SELECT condition_id FROM markets
+                WHERE clob_token_yes IS NOT NULL AND clob_token_yes <> ''
+                  AND clob_token_no IS NOT NULL AND clob_token_no <> ''
+                  AND closed = FALSE
+                LIMIT 1
+                """
+            )
+            if mkt is None:
+                check("R3b/c: skipped (no market)", True)
+                return
+
+            # Need multiple traders for the cohort
+            wallets_rows = await conn.fetch(
+                "SELECT proxy_wallet FROM traders LIMIT 10"
+            )
+            if len(wallets_rows) < 8:
+                check("R3b/c: skipped (need >=8 traders)", True)
+                return
+            cohort = [r["proxy_wallet"] for r in wallets_rows[:8]]
+            cid = mkt["condition_id"]
+
+            # Snapshot existing positions for cleanup later
+            existing_pos = await conn.fetch(
+                """
+                SELECT proxy_wallet, condition_id, asset, outcome,
+                       size, cur_price, current_value, avg_price,
+                       first_seen_at, last_updated_at
+                FROM positions
+                WHERE condition_id = $1 AND proxy_wallet = ANY($2::TEXT[])
+                """,
+                cid, cohort,
+            )
+            await conn.execute(
+                "DELETE FROM positions WHERE condition_id = $1 AND proxy_wallet = ANY($2::TEXT[])",
+                cid, cohort,
+            )
+
+            # Insert a signal_log row with peak=8 traders + $80k aggregate +
+            # contributing_wallets=cohort
+            test_mode = "_R3_TEST"
+            await conn.execute(
+                "DELETE FROM signal_log WHERE mode = $1", test_mode,
+            )
+            sid = await conn.fetchval(
+                """
+                INSERT INTO signal_log
+                  (mode, category, top_n, condition_id, direction,
+                   first_fired_at, last_seen_at,
+                   peak_trader_count, peak_aggregate_usdc, peak_net_skew,
+                   first_trader_count, first_aggregate_usdc, first_net_skew,
+                   market_type, contributing_wallets)
+                VALUES ($1, '_test', 50, $2, 'YES',
+                        NOW() - INTERVAL '30 minutes',
+                        NOW() - INTERVAL '5 minutes',
+                        8, 80000, 0.85,
+                        8, 80000, 0.85,
+                        'binary', $3)
+                RETURNING id
+                """,
+                test_mode, cid, cohort,
+            )
+
+            # SCENARIO A: 6 of 8 still hold YES at $5k each = 6 traders, $30k
+            # Drop: 8->6 = 25% (TRIM threshold), $80k->$30k = 62% (EXIT threshold)
+            # Expected: EXIT event
+            for w in cohort[:6]:
+                await conn.execute(
+                    """
+                    INSERT INTO positions
+                      (proxy_wallet, condition_id, asset, outcome, size,
+                       cur_price, current_value, avg_price, first_seen_at,
+                       last_updated_at)
+                    VALUES ($1, $2, 'TEST_TOKEN', 'Yes', 10000, 0.50, 5000.0, 0.40,
+                            NOW(), NOW())
+                    """,
+                    w, cid,
+                )
+
+            events = await detect_exits(conn)
+            our_events = [e for e in events if e.signal_log_id == sid]
+            check("R3b: detect_exits found event for our test signal",
+                  len(our_events) == 1, f"got {len(our_events)} events")
+            if our_events:
+                ev = our_events[0]
+                check("R3b: cohort-recompute current trader_count = 6 (not 0)",
+                      ev.exit_trader_count == 6,
+                      f"got {ev.exit_trader_count}")
+                check("R3a: 62% dollar drop -> EXIT (not TRIM)",
+                      ev.event_type == "exit", f"got {ev.event_type}")
+
+            # Cleanup
+            await conn.execute(
+                "DELETE FROM signal_exits WHERE signal_log_id = $1", sid,
+            )
+            await conn.execute(
+                "DELETE FROM signal_log WHERE id = $1", sid,
+            )
+            await conn.execute(
+                "DELETE FROM positions WHERE condition_id = $1 AND proxy_wallet = ANY($2::TEXT[])",
+                cid, cohort,
+            )
+
+            # SCENARIO B: 7 of 8 still hold YES at $9k each = 7 traders, $63k
+            # Drop: 8->7 = 12.5% (below TRIM), $80k->$63k = 21% (TRIM threshold)
+            # Expected: TRIM event
+            sid2 = await conn.fetchval(
+                """
+                INSERT INTO signal_log
+                  (mode, category, top_n, condition_id, direction,
+                   first_fired_at, last_seen_at,
+                   peak_trader_count, peak_aggregate_usdc, peak_net_skew,
+                   first_trader_count, first_aggregate_usdc, first_net_skew,
+                   market_type, contributing_wallets)
+                VALUES ($1, '_test', 50, $2, 'YES',
+                        NOW() - INTERVAL '30 minutes',
+                        NOW() - INTERVAL '5 minutes',
+                        8, 80000, 0.85,
+                        8, 80000, 0.85,
+                        'binary', $3)
+                RETURNING id
+                """,
+                test_mode, cid, cohort,
+            )
+            for w in cohort[:7]:
+                await conn.execute(
+                    """
+                    INSERT INTO positions
+                      (proxy_wallet, condition_id, asset, outcome, size,
+                       cur_price, current_value, avg_price, first_seen_at,
+                       last_updated_at)
+                    VALUES ($1, $2, 'TEST_TOKEN', 'Yes', 18000, 0.50, 9000.0, 0.40,
+                            NOW(), NOW())
+                    """,
+                    w, cid,
+                )
+            events = await detect_exits(conn)
+            our_events = [e for e in events if e.signal_log_id == sid2]
+            check("R3a: 21% drop fires TRIM event (not EXIT, not None)",
+                  len(our_events) == 1
+                  and our_events[0].event_type == "trim",
+                  f"events={[(e.event_type, e.drop_reason) for e in our_events]}")
+
+            # Cleanup
+            await conn.execute(
+                "DELETE FROM signal_exits WHERE signal_log_id = $1", sid2,
+            )
+            await conn.execute(
+                "DELETE FROM signal_log WHERE id = $1", sid2,
+            )
+            await conn.execute(
+                "DELETE FROM positions WHERE condition_id = $1 AND proxy_wallet = ANY($2::TEXT[])",
+                cid, cohort,
+            )
+
+            # Restore originals
+            for er in existing_pos:
+                await conn.execute(
+                    """
+                    INSERT INTO positions
+                      (proxy_wallet, condition_id, asset, outcome, size,
+                       cur_price, current_value, avg_price, first_seen_at,
+                       last_updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    """,
+                    er["proxy_wallet"], er["condition_id"], er["asset"],
+                    er["outcome"], er["size"], er["cur_price"],
+                    er["current_value"], er["avg_price"],
+                    er["first_seen_at"], er["last_updated_at"],
+                )
+    finally:
+        await close_pool()
+
+
+asyncio.run(test_r3b_r3c_db())
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

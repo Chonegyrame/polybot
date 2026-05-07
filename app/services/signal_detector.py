@@ -84,6 +84,11 @@ class Signal:
     first_top_trader_first_seen_at: datetime | None  # earliest first_seen_at -- proxy entry time
     avg_entry_price: float | None   # mean avg_price on this direction (cost basis approximation)
 
+    # R3b (Pass 3): which wallet addresses contributed to this signal at fire
+    # time. Persisted on first-fire so the exit detector can recompute against
+    # the original cohort instead of the current top-N pool (which churns).
+    contributing_wallets: tuple[str, ...] = ()
+
 
 def _row_to_signal(
     r: asyncpg.Record,
@@ -91,6 +96,15 @@ def _row_to_signal(
     skew: float,
     dollar_skew: float,
 ) -> Signal:
+    contributing = r.get("contributing_wallets") if hasattr(r, "get") else None
+    if contributing is None:
+        try:
+            contributing = r["contributing_wallets"]
+        except (KeyError, IndexError):
+            contributing = None
+    contributing_tuple: tuple[str, ...] = (
+        tuple(contributing) if contributing else ()
+    )
     return Signal(
         condition_id=r["condition_id"],
         market_question=r["question"],
@@ -106,6 +120,7 @@ def _row_to_signal(
         current_price=float(r["current_price"]) if r["current_price"] is not None else None,
         first_top_trader_first_seen_at=r["earliest_first_seen_at"],
         avg_entry_price=float(r["avg_entry_price"]) if r["avg_entry_price"] is not None else None,
+        contributing_wallets=contributing_tuple,
     )
 
 
@@ -298,7 +313,12 @@ async def _aggregate_positions(
             CASE WHEN SUM(size) > 0
                  THEN SUM(avg_price * size) / SUM(size)
                  ELSE NULL
-            END                            AS avg_entry_price
+            END                            AS avg_entry_price,
+            -- R3b (Pass 3): collect the wallet addresses contributing to
+            -- this (cid, direction). Persisted to signal_log so exit
+            -- detector can recompute against the original cohort instead
+            -- of the current top-N pool (which churns).
+            ARRAY_AGG(DISTINCT proxy_wallet)  AS contributing_wallets
         FROM pool_positions
         GROUP BY condition_id, outcome
     ),
@@ -322,6 +342,7 @@ async def _aggregate_positions(
         d.condition_id, d.outcome, d.question, d.slug, d.category, d.event_id,
         d.trader_count, d.aggregate_usdc, d.avg_portfolio_fraction,
         d.current_price, d.earliest_first_seen_at, d.avg_entry_price,
+        d.contributing_wallets,
         m.traders_any_direction,
         m.total_dollars_in_market
     FROM direction_agg d

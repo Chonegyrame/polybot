@@ -776,25 +776,30 @@ async def insert_signal_exit(
     peak_aggregate_usdc: float,
     drop_reason: str,
     exit_bid_price: float | None,
+    event_type: str = "exit",
 ) -> int | None:
-    """Persist one detected exit event. Returns the new row id, or None if a
-    row already exists for this signal_log_id (UNIQUE-key dedup)."""
+    """Persist one detected trim/exit event. Returns the new row id, or None
+    if a row already exists for this signal_log_id (UNIQUE-key dedup).
+
+    R3a (Pass 3): event_type ('trim' | 'exit') tier added. Default 'exit'
+    preserves the pre-Pass-3 behavior. Migration 013 added the column.
+    """
     row = await conn.fetchrow(
         """
         INSERT INTO signal_exits (
             signal_log_id, exited_at,
             exit_trader_count, peak_trader_count,
             exit_aggregate_usdc, peak_aggregate_usdc,
-            drop_reason, exit_bid_price
+            drop_reason, exit_bid_price, event_type
         )
-        VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7)
+        VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8)
         ON CONFLICT (signal_log_id) DO NOTHING
         RETURNING id
         """,
         signal_log_id,
         exit_trader_count, peak_trader_count,
         exit_aggregate_usdc, peak_aggregate_usdc,
-        drop_reason, exit_bid_price,
+        drop_reason, exit_bid_price, event_type,
     )
     return int(row["id"]) if row else None
 

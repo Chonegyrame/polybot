@@ -584,7 +584,10 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                                     cluster_id=s.event_id,
                                     market_type="binary",
                                     direction_dollar_skew=s.direction_dollar_skew,
-                                    # contributing_wallets populated in R3b step
+                                    contributing_wallets=(
+                                        list(s.contributing_wallets)
+                                        if s.contributing_wallets else None
+                                    ),
                                 )
                                 if inserted:
                                     fresh_signals.append(s)
@@ -1080,24 +1083,26 @@ async def detect_and_persist_exits(
     trades_closed = 0
     realized_total = 0.0
 
-    # Step 1: short DB acquire — fetch tracked wallets + run detection
+    # Step 1: short DB acquire -- run detection. R3b/R3c (Pass 3): exit_detector
+    # now uses signal_log.contributing_wallets for cohort-aware aggregation;
+    # no longer needs the current top-N pool passed in.
     async with pool.acquire() as conn:
-        wallets = await gather_union_top_n_wallets(
-            conn, top_n=POSITION_REFRESH_TOP_N, categories=SNAPSHOT_CATEGORIES,
-        )
-        events = await detect_exits(conn, wallets)
+        events = await detect_exits(conn)
         candidates_evaluated = len(events)
 
     if not events:
         duration = (datetime.now(timezone.utc) - started).total_seconds()
-        log.info("=== done in %.2fs — 0 exits ===", duration)
+        log.info("=== done in %.2fs -- 0 exit/trim events ===", duration)
         return ExitDetectionResult(
             candidates_evaluated=0, exits_fired=0,
             paper_trades_closed=0, paper_trades_realized_pnl_usdc=0.0,
             duration_seconds=duration,
         )
 
-    # Step 2: for each event, capture current bid + persist + close paper trades
+    # Step 2: for each event, capture current bid + persist + (only on EXIT)
+    # close paper trades. R3a (Pass 3): TRIM events get persisted as
+    # signal_exits rows with event_type='trim' but DO NOT auto-close paper
+    # trades -- they're notification only.
     async with PolymarketClient() as pm:
         for ev in events:
             async with pool.acquire() as conn:
@@ -1113,23 +1118,31 @@ async def detect_and_persist_exits(
                     peak_aggregate_usdc=ev.peak_aggregate_usdc,
                     drop_reason=ev.drop_reason,
                     exit_bid_price=bid,
+                    event_type=ev.event_type,
                 )
                 if exit_id is None:
                     # Already exited (race); skip
                     continue
                 exits_fired += 1
                 log.info(
-                    "exit fired: signal_log_id=%d %s/%s (drop=%s; %d->%d traders, $%.0f->$%.0f)",
-                    ev.signal_log_id, ev.condition_id[:12], ev.direction,
+                    "%s fired: signal_log_id=%d %s/%s (drop=%s; %d->%d traders, $%.0f->$%.0f)",
+                    ev.event_type.upper(), ev.signal_log_id,
+                    ev.condition_id[:12], ev.direction,
                     ev.drop_reason,
                     ev.peak_trader_count, ev.exit_trader_count,
                     ev.peak_aggregate_usdc, ev.exit_aggregate_usdc,
                 )
 
+                # R3a: only EXIT events auto-close paper trades. TRIM events
+                # are notification-only -- the user might want to ride the
+                # remaining position.
+                if ev.event_type != "exit":
+                    continue
+
                 # Step 3: auto-close any open paper trades on this signal
                 if bid is None:
                     log.warning(
-                        "  no bid captured for %s — paper trades on this exit skipped",
+                        "  no bid captured for %s -- paper trades on this exit skipped",
                         ev.condition_id[:12],
                     )
                     continue

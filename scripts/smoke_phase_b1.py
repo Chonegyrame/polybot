@@ -61,45 +61,56 @@ def approx(a: float, b: float, tol: float = 0.01) -> bool:
 
 
 def test_classify_drop() -> None:
-    section("B1: _classify_drop classifies exits correctly")
+    # R3a (Pass 3): _classify_drop now returns (reason, event_type) tuple
+    # or None. Two tiers: TRIM (>=20%, <50%) + EXIT (>=50%). Pre-fix was
+    # single-tier ">=30% drop -> reason".
+    section("B1 + R3a: _classify_drop two-tier (trim/exit)")
 
     # No drop
     check("0% drop -> None", _classify_drop(10, 10, 100_000, 100_000) is None)
 
-    # Trader count only
-    check(
-        "30%+ trader drop only -> 'trader_count'",
-        _classify_drop(7, 10, 100_000, 100_000) == "trader_count",
-        f"got {_classify_drop(7, 10, 100_000, 100_000)}",
-    )
+    # Trader count drop 30% -> TRIM (>=20%, <50%)
+    res = _classify_drop(7, 10, 100_000, 100_000)
+    check("30% trader drop -> ('trader_count', 'trim')",
+          res == ("trader_count", "trim"), f"got {res}")
 
-    # Aggregate only
-    check(
-        "30%+ aggregate drop only -> 'aggregate'",
-        _classify_drop(10, 10, 50_000, 100_000) == "aggregate",
-        f"got {_classify_drop(10, 10, 50_000, 100_000)}",
-    )
+    # Trader count drop 60% -> EXIT (>=50%)
+    res = _classify_drop(4, 10, 100_000, 100_000)
+    check("60% trader drop -> ('trader_count', 'exit')",
+          res == ("trader_count", "exit"), f"got {res}")
 
-    # Both
-    check(
-        "Both drop -> 'both'",
-        _classify_drop(5, 10, 50_000, 100_000) == "both",
-        f"got {_classify_drop(5, 10, 50_000, 100_000)}",
-    )
+    # Aggregate drop 50% -> EXIT (at threshold)
+    res = _classify_drop(10, 10, 50_000, 100_000)
+    check("50% aggregate drop (at threshold) -> ('aggregate', 'exit')",
+          res == ("aggregate", "exit"), f"got {res}")
 
-    # Threshold edge — exactly 30%
-    check(
-        "Exactly 30% drop trips threshold",
-        _classify_drop(7, 10, 100_000, 100_000) == "trader_count",
-    )
+    # Aggregate drop 25% -> TRIM
+    res = _classify_drop(10, 10, 75_000, 100_000)
+    check("25% aggregate drop -> ('aggregate', 'trim')",
+          res == ("aggregate", "trim"), f"got {res}")
 
-    # Custom threshold
-    check(
-        "Custom threshold 0.5 — 30% drop is below",
-        _classify_drop(7, 10, 100_000, 100_000, threshold=0.5) is None,
-    )
+    # Both >= EXIT threshold
+    res = _classify_drop(2, 10, 30_000, 100_000)
+    check("Both 80% trader + 70% agg -> ('both', 'exit')",
+          res == ("both", "exit"), f"got {res}")
 
-    # Zero peaks
+    # Both >= TRIM but neither >= EXIT
+    res = _classify_drop(7, 10, 70_000, 100_000)  # 30% + 30%
+    check("Both 30% drops -> ('both', 'trim')",
+          res == ("both", "trim"), f"got {res}")
+
+    # Below trim threshold (15% drops)
+    res = _classify_drop(85, 100, 85_000, 100_000)
+    check("Both 15% drops -> None (below trim threshold)",
+          res is None, f"got {res}")
+
+    # Custom thresholds
+    res = _classify_drop(70, 100, 100_000, 100_000,
+                          trim_threshold=0.40, exit_threshold=0.80)
+    check("Custom: 30% drop with 40% trim threshold -> None",
+          res is None, f"got {res}")
+
+    # Zero peaks (defensive)
     check(
         "Zero peak trader count and zero aggregate -> None",
         _classify_drop(0, 0, 0, 0) is None,

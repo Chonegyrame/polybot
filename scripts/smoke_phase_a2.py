@@ -438,24 +438,35 @@ async def test_a30_tables_dropped() -> None:
 
 # ---------------------------------------------------------------------------
 def test_f18_exit_activity_guard_2h() -> None:
-    """F18 regression: detect_exits must apply EXIT_ACTIVITY_GUARD_HOURS=2
-    to last_seen_at, so signals that stopped being detected hours ago
-    don't emit stale exits the user can't act on.
+    """R3c (Pass 3) replaced F18.
 
-    See review/FIXES.md F18.
+    F18 added a 2h `last_seen_at` activity guard to suppress stale exit
+    notifications. But that very guard suppressed REAL exits when the
+    signal dropped below detection floors (last_seen_at stops refreshing).
+
+    R3c removed EXIT_ACTIVITY_GUARD_HOURS entirely. The new logic monitors
+    a signal as long as the market is open AND at least one of the original
+    contributing wallets still holds a position there. When all contributors
+    have closed -> that IS the exit, fire it. See R3c smoke tests in
+    smoke_phase_pass3_fixes.py.
     """
-    section("F18: exit detector applies 2h activity guard")
+    section("R3c (formerly F18): activity guard removed in Pass 3")
     from app.services import exit_detector
     check(
-        "EXIT_ACTIVITY_GUARD_HOURS = 2",
-        exit_detector.EXIT_ACTIVITY_GUARD_HOURS == 2,
-        f"got {exit_detector.EXIT_ACTIVITY_GUARD_HOURS}",
+        "R3c: EXIT_ACTIVITY_GUARD_HOURS no longer exists (removed)",
+        not hasattr(exit_detector, "EXIT_ACTIVITY_GUARD_HOURS"),
     )
     src = inspect.getsource(exit_detector.detect_exits)
     check(
-        "detect_exits source uses EXIT_ACTIVITY_GUARD_HOURS",
-        "EXIT_ACTIVITY_GUARD_HOURS" in src and "min(window_hours" in src,
-        "fix marker missing — exit window may not be capped",
+        "R3c: detect_exits no longer uses an activity guard",
+        "EXIT_ACTIVITY_GUARD_HOURS" not in src
+        and "activity_guard" not in src,
+        "F18 guard pattern still present -- R3c didn't take effect",
+    )
+    check(
+        "R3c: detect_exits uses cohort-aware contributing_wallets",
+        "contributing_wallets" in src,
+        "R3b cohort-recompute marker missing",
     )
 
 
