@@ -619,6 +619,158 @@ asyncio.run(test_r8_db())
 
 
 # ---------------------------------------------------------------------------
+# R10 + D1 -- unified close formula + correct Polymarket fee math
+# ---------------------------------------------------------------------------
+
+section("R10 + D1 -- compute_pnl_per_dollar with new fee formula")
+
+
+def test_r10_d1_pnl() -> None:
+    """Verify the new fee math matches the formula by hand."""
+    from app.services.backtest_engine import (
+        compute_pnl_per_dollar, compute_pnl_per_dollar_exit,
+    )
+
+    # $1 stake YES @ 0.40 in Politics (rate=0.04), no slippage, wins:
+    #   shares = 1/0.40 = 2.5
+    #   entry_fee = 0.04 * (1 - 0.40) = 0.024
+    #   payout = 2.5 * 1.0 = 2.5
+    #   P&L = 2.5 - 1 - 0.024 = 1.476
+    # (Use a huge liquidity to make slippage ~0)
+    pnl = compute_pnl_per_dollar(0.40, "YES", "YES", "Politics", 1.0, 1_000_000_000.0)
+    check("R10: Politics YES@0.40 winner = +1.476 (no slip)",
+          pnl is not None and abs(pnl - 1.476) < 0.001,
+          f"got {pnl:+.4f}" if pnl is not None else "got None")
+
+    # Same trade but loses
+    pnl = compute_pnl_per_dollar(0.40, "YES", "NO", "Politics", 1.0, 1_000_000_000.0)
+    # P&L = 0 - 1 - 0.024 = -1.024 (lose stake + entry fee)
+    check("R10: Politics YES@0.40 loser = -1.024 (entry fee on loss)",
+          pnl is not None and abs(pnl - (-1.024)) < 0.001,
+          f"got {pnl:+.4f}" if pnl is not None else "got None")
+
+    # Crypto rate is 7% -- much higher than the old placeholder. Crypto YES@0.40
+    # wins: entry_fee = 0.07 * 0.60 = 0.042; P&L = 2.5 - 1 - 0.042 = 1.458
+    pnl = compute_pnl_per_dollar(0.40, "YES", "YES", "Crypto", 1.0, 1_000_000_000.0)
+    check("R10: Crypto YES@0.40 winner = +1.458 (high fee)",
+          pnl is not None and abs(pnl - 1.458) < 0.001,
+          f"got {pnl:+.4f}" if pnl is not None else "got None")
+
+    # Geopolitics is fee-free. Politics YES@0.40 winner with rate=0:
+    # P&L = 2.5 - 1 - 0 = 1.500 (no fee at all)
+    pnl = compute_pnl_per_dollar(0.40, "YES", "YES", "Geopolitics", 1.0, 1_000_000_000.0)
+    check("R10: Geopolitics YES@0.40 winner = +1.500 (fee-free)",
+          pnl is not None and abs(pnl - 1.500) < 0.001,
+          f"got {pnl:+.4f}" if pnl is not None else "got None")
+
+    # 50/50 case in Politics: payoff = 0.5
+    # P&L = 0.5/0.40 - 1 - 0.024 = 1.25 - 1 - 0.024 = +0.226
+    pnl = compute_pnl_per_dollar(0.40, "YES", "50_50", "Politics", 1.0, 1_000_000_000.0)
+    check("R10: Politics YES@0.40 50_50 = +0.226",
+          pnl is not None and abs(pnl - 0.226) < 0.001,
+          f"got {pnl:+.4f}" if pnl is not None else "got None")
+
+    # VOID returns None
+    pnl = compute_pnl_per_dollar(0.40, "YES", "VOID", "Politics", 1.0, 1_000_000_000.0)
+    check("R10: VOID returns None", pnl is None)
+
+    # Smart-money-exit path:
+    # Buy at 0.40 in Politics, exit-bid at 0.55:
+    #   shares = 1/0.40 = 2.5
+    #   entry_fee = 0.04 * (1 - 0.40) = 0.024
+    #   revenue = 2.5 * 0.55 = 1.375
+    #   exit_fee = (0.04 * 0.55 * 0.45) / 0.40 = 0.02475
+    #   P&L = 1.375 - 1 - 0.024 - 0.02475 = 0.32625
+    pnl = compute_pnl_per_dollar_exit(
+        0.40, 0.55, "Politics", 1.0, 1_000_000_000.0,
+    )
+    check("R10: exit-strategy Politics 0.40->0.55 = +0.326 (entry+exit fee)",
+          pnl is not None and abs(pnl - 0.326) < 0.001,
+          f"got {pnl:+.4f}" if pnl is not None else "got None")
+
+
+test_r10_d1_pnl()
+
+
+section("R10 -- compute_realized_pnl unified close helper")
+
+
+def test_r10_unified_close() -> None:
+    """Verify all three close paths (manual / resolution / smart_money_exit)
+    compute the same P&L for the same inputs."""
+    from app.services.paper_trade_close import compute_realized_pnl
+
+    # Common inputs: $100 stake at $0.40 in Politics
+    # entry_fee = 100 * 0.04 * 0.60 = $2.40 (computed by Polymarket curve)
+    # Suppose actual stored entry_fee = $2.40 and slippage = $0.00
+    common = dict(
+        entry_price=0.40, entry_size_usdc=100.0,
+        entry_slippage_usdc=0.0, entry_fee_usdc=2.40,
+        category="Politics",
+    )
+
+    # Resolution as winner: payoff = 1.0
+    # shares = 100/0.40 = 250; revenue = 250*1 = $250
+    # P&L = 250 - 100 - 2.40 = $147.60 (no exit fee on resolution)
+    r = compute_realized_pnl(**common, exit_price=1.0, exit_kind="resolution")
+    check("R10: $100 Politics @0.40 winner resolution = +$147.60",
+          abs(r.realized_pnl_usdc - 147.60) < 0.01,
+          f"got {r.realized_pnl_usdc:+.2f}")
+    check("R10: resolution path has zero exit_fee", r.exit_fee_usdc == 0.0)
+
+    # Resolution as loser: payoff = 0.0
+    # P&L = 0 - 100 - 2.40 = -$102.40
+    r = compute_realized_pnl(**common, exit_price=0.0, exit_kind="resolution")
+    check("R10: $100 Politics @0.40 loser resolution = -$102.40",
+          abs(r.realized_pnl_usdc - (-102.40)) < 0.01,
+          f"got {r.realized_pnl_usdc:+.2f}")
+
+    # Manual close at $0.55 (smart_money_exit also same path)
+    # revenue = 250 * 0.55 = $137.50
+    # exit_fee = compute_taker_fee_usdc(137.50, 0.55, "Politics")
+    #          = 137.50 * 0.04 * 0.45 = $2.475
+    # P&L = 137.50 - 100 - 2.40 - 2.475 = $32.625
+    r_manual = compute_realized_pnl(**common, exit_price=0.55, exit_kind="manual")
+    r_exit = compute_realized_pnl(**common, exit_price=0.55, exit_kind="smart_money_exit")
+    check("R10: manual close @0.55 = +$32.63",
+          abs(r_manual.realized_pnl_usdc - 32.625) < 0.01,
+          f"got {r_manual.realized_pnl_usdc:+.2f}")
+    check("R10: manual + smart_money_exit produce IDENTICAL P&L",
+          abs(r_manual.realized_pnl_usdc - r_exit.realized_pnl_usdc) < 0.0001,
+          f"manual={r_manual.realized_pnl_usdc:.4f} exit={r_exit.realized_pnl_usdc:.4f}")
+
+    # Geopolitics: fee-free in BOTH directions. $100 @0.40 winner:
+    # P&L = 250 - 100 - 0 = +$150
+    r = compute_realized_pnl(
+        entry_price=0.40, entry_size_usdc=100.0,
+        entry_slippage_usdc=0.0, entry_fee_usdc=0.0,
+        exit_price=1.0, exit_kind="resolution", category="Geopolitics",
+    )
+    check("R10: Geopolitics fee-free winner = +$150 exact",
+          abs(r.realized_pnl_usdc - 150.0) < 0.01,
+          f"got {r.realized_pnl_usdc:+.2f}")
+
+    # Crypto manual close to verify high-rate exit fee
+    # $100 @0.40 in Crypto, sell @0.50:
+    #   shares = 250
+    #   entry_fee = 100 * 0.07 * 0.60 = $4.20
+    #   revenue = 250 * 0.50 = $125
+    #   exit_fee = 125 * 0.07 * 0.50 = $4.375
+    #   P&L = 125 - 100 - 4.20 - 4.375 = $16.425
+    r = compute_realized_pnl(
+        entry_price=0.40, entry_size_usdc=100.0,
+        entry_slippage_usdc=0.0, entry_fee_usdc=4.20,
+        exit_price=0.50, exit_kind="manual", category="Crypto",
+    )
+    check("R10: Crypto manual close 0.40->0.50 = +$16.43",
+          abs(r.realized_pnl_usdc - 16.425) < 0.01,
+          f"got {r.realized_pnl_usdc:+.2f}")
+
+
+test_r10_unified_close()
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

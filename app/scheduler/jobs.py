@@ -1012,35 +1012,50 @@ async def _settle_paper_trade_at_exit(
 ) -> tuple[bool, float]:
     """Settle one open paper trade against an exit price (current bid).
 
-    Same accounting model as resolution settlement, but `payoff` is the bid
-    price instead of $1/$0/$0.50. Fees apply to gross proceeds; slippage was
-    already paid at entry (recovered from `entry_slippage_usdc`).
+    R10 (Pass 3): unified close formula via paper_trade_close.compute_realized_pnl.
+    Pre-fix this used a hand-rolled (and inconsistent with manual-close) formula
+    that derived fee_rate as fee_usdc/size -- which divided correctly by
+    accident under the OLD flat-percentage fee model but breaks under the
+    correct Polymarket curve where fee_rate varies with price.
 
     Returns (closed_ok, realized_pnl).
     """
+    from app.services.paper_trade_close import compute_realized_pnl
+
     entry_price = float(trade["entry_price"])
     size = float(trade["entry_size_usdc"])
-    fee = float(trade["entry_fee_usdc"] or 0.0)
-    slip = float(trade["entry_slippage_usdc"] or 0.0)
-    if entry_price <= 0 or size <= 0 or exit_price <= 0:
+    if entry_price <= 0 or size <= 0 or exit_price <= 0 or entry_price >= 1.0:
         return False, 0.0
 
-    effective_entry = entry_price * (1.0 + slip / size)
-    if effective_entry <= 0:
-        return False, 0.0
-    shares = size / effective_entry
-    gross_value = shares * exit_price
-    fee_rate = (fee / size) if size > 0 else 0.0
-    realized_fee = gross_value * fee_rate
-    realized = gross_value - size - realized_fee
+    # The trade's category is needed for the new fee curve. paper_trades doesn't
+    # store it directly -- look it up from markets via the condition_id.
+    cat_row = await conn.fetchrow(
+        """
+        SELECT e.category FROM markets m
+        LEFT JOIN events e ON e.id = m.event_id
+        WHERE m.condition_id = $1
+        """,
+        trade["condition_id"],
+    )
+    category = cat_row["category"] if cat_row else None
+
+    close = compute_realized_pnl(
+        entry_price=entry_price,
+        entry_size_usdc=size,
+        entry_slippage_usdc=float(trade.get("entry_slippage_usdc") or 0.0),
+        entry_fee_usdc=float(trade.get("entry_fee_usdc") or 0.0),
+        exit_price=exit_price,
+        exit_kind="smart_money_exit",
+        category=category,
+    )
 
     ok = await crud.close_paper_trade_smart_money_exit(
         conn,
         trade_id=int(trade["id"]),
         exit_price=exit_price,
-        realized_pnl_usdc=realized,
+        realized_pnl_usdc=close.realized_pnl_usdc,
     )
-    return ok, realized
+    return ok, close.realized_pnl_usdc
 
 
 async def detect_and_persist_exits(
@@ -1321,51 +1336,54 @@ async def auto_close_resolved_paper_trades() -> AutoCloseResult:
             candidates = await crud.list_open_paper_trades_on_resolved_markets(conn)
             log.info("found %d open trade(s) on resolved markets", len(candidates))
 
+            from app.services.paper_trade_close import compute_realized_pnl
+
             for t in candidates:
                 entry_price = float(t["entry_price"])
                 size = float(t["entry_size_usdc"])
-                fee = float(t["entry_fee_usdc"] or 0.0)
-                slip = float(t["entry_slippage_usdc"] or 0.0)
                 payoff = _payoff_for_resolution(t["direction"], t["resolved_outcome"])
                 if payoff is None or entry_price <= 0 or size <= 0:
                     continue
+                if entry_price >= 1.0:
+                    continue  # bad entry price; skip
 
-                # Slippage was previously double-counted: shares were computed
-                # as size/entry_price (too many — ignores that you actually
-                # paid effective entry), then `slip` was deducted AGAIN as a
-                # flat dollar amount. Correct path: derive effective_entry
-                # from entry_slippage_usdc, then compute shares from that.
-                #
-                # Recover effective_entry from how it was stored at trade-open:
-                #   slippage_usdc = slip_pct * (size / entry_price)
-                #   slip_pct = slippage_usdc * entry_price / size
-                #   effective_entry = entry_price + slip_pct
-                #                   = entry_price * (1 + slippage_usdc / size)
-                effective_entry = entry_price * (1.0 + slip / size)
-                if effective_entry <= 0:
-                    continue
-                shares = size / effective_entry
-                gross_value = shares * payoff
-                # Fees on Polymarket are taken on PAYOUT, not on stake.
-                # `fee` was stored at entry as fee_rate × size; recover
-                # fee_rate and apply it to gross_value instead. For losers
-                # this naturally produces zero fee (no payout to fee on);
-                # for winners it scales correctly with the payout.
-                fee_rate = (fee / size) if size > 0 else 0.0
-                realized_fee = gross_value * fee_rate
-                realized = gross_value - size - realized_fee
+                # R10 (Pass 3): unified close formula via paper_trade_close.
+                # Pre-fix had a special-case "fee on payout" formula that
+                # divided fee_usdc by size to recover a fee_rate -- correct
+                # only under the OLD flat-percentage model. Under the correct
+                # Polymarket curve, that division gives the wrong rate. The
+                # new helper does the math right + matches manual close.
+                cat_row = await conn.fetchrow(
+                    """
+                    SELECT e.category FROM markets m
+                    LEFT JOIN events e ON e.id = m.event_id
+                    WHERE m.condition_id = $1
+                    """,
+                    t["condition_id"],
+                )
+                category = cat_row["category"] if cat_row else None
+
+                close = compute_realized_pnl(
+                    entry_price=entry_price,
+                    entry_size_usdc=size,
+                    entry_slippage_usdc=float(t["entry_slippage_usdc"] or 0.0),
+                    entry_fee_usdc=float(t["entry_fee_usdc"] or 0.0),
+                    exit_price=payoff,
+                    exit_kind="resolution",
+                    category=category,
+                )
 
                 ok = await crud.close_paper_trade_resolved(
                     conn, trade_id=int(t["id"]), exit_price=payoff,
-                    realized_pnl_usdc=realized,
+                    realized_pnl_usdc=close.realized_pnl_usdc,
                 )
                 if ok:
                     closed += 1
-                    realized_total += realized
+                    realized_total += close.realized_pnl_usdc
                     log.info(
                         "  closed trade #%d: %s on %s (resolved=%s) -> $%+.2f",
                         t["id"], t["direction"], t["condition_id"][:12],
-                        t["resolved_outcome"], realized,
+                        t["resolved_outcome"], close.realized_pnl_usdc,
                     )
 
     duration = (datetime.now(timezone.utc) - started).total_seconds()

@@ -379,29 +379,42 @@ def test_f13_safe_list_from_response() -> None:
 
 
 def test_a22_a23_pnl_formula() -> None:
-    section("A22 + A23: compute_pnl_per_dollar — fee on payout, win = pnl > 0")
+    # R10/D1 (Pass 3): rewritten for the correct Polymarket fee formula.
+    # Pre-fix used flat-percentage-of-payout with placeholder rates that
+    # were wildly off (Politics 0%, Sports 1.8% vs real 4%/3%). Now: fee
+    # is charged on entry as stake x rate x (1 - price); losers pay
+    # entry fee too (you can't avoid the fee just by losing).
+    section("A22 + A23: compute_pnl_per_dollar -- correct Polymarket fee model")
 
-    # YES @ 0.40 winning, no fee — gross = 1/0.40 = 2.5, pnl = 1.5 (less slippage)
-    v = compute_pnl_per_dollar(0.40, "YES", "YES", "politics", 1.0, 25000.0)
+    # Politics rate=0.04. YES@0.40 winning, ~no slip:
+    #   entry_fee = 0.04 * (1 - 0.40) = 0.024
+    #   payout = 1/0.40 = 2.5
+    #   P&L = 2.5 - 1 - 0.024 = 1.476 (slight slip-adjustment: ~1.475)
+    v = compute_pnl_per_dollar(0.40, "YES", "YES", "Politics", 1.0, 25000.0)
     check(
-        "YES@0.40 politics WIN (no fee)",
-        v is not None and approx(v, 1.499, 0.01),
+        "YES@0.40 Politics WIN (rate=0.04, P&L ~ +1.475)",
+        v is not None and approx(v, 1.475, 0.01),
         f"got {v:+.4f}" if v is not None else "got None",
     )
 
-    # YES @ 0.40 winning, sports 1.8% fee — fee charged on payout, not stake
-    v = compute_pnl_per_dollar(0.40, "YES", "YES", "sports", 1.0, 25000.0)
+    # Sports rate=0.03. YES@0.40 winning:
+    #   entry_fee = 0.03 * 0.60 = 0.018
+    #   P&L = 2.5 - 1 - 0.018 = 1.482 (~1.481 with slip)
+    v = compute_pnl_per_dollar(0.40, "YES", "YES", "Sports", 1.0, 25000.0)
     check(
-        "YES@0.40 sports WIN (fee on $2.5 payout, ~1.45)",
-        v is not None and approx(v, 1.454, 0.01),
+        "YES@0.40 Sports WIN (rate=0.03, P&L ~ +1.481)",
+        v is not None and approx(v, 1.481, 0.01),
         f"got {v:+.4f}" if v is not None else "got None",
     )
 
-    # YES @ 0.40 losing, sports — fee should be ZERO on loser, not -1.018
-    v = compute_pnl_per_dollar(0.40, "YES", "NO", "sports", 1.0, 25000.0)
+    # Sports loser: P&L = 0 - 1 - 0.018 = -1.018
+    # (Pre-Pass-3 expected exactly -1.0 because flat-fee-on-payout gave
+    # zero fee on payout=0. Real Polymarket DOES charge entry fee even
+    # when you lose, since the fee is paid at order time not settlement.)
+    v = compute_pnl_per_dollar(0.40, "YES", "NO", "Sports", 1.0, 25000.0)
     check(
-        "YES@0.40 sports LOSS (no fee on losers — exactly -1.0)",
-        v is not None and approx(v, -1.0, 0.001),
+        "YES@0.40 Sports LOSS (entry fee charged: ~ -1.018)",
+        v is not None and approx(v, -1.018, 0.005),
         f"got {v:+.4f}" if v is not None else "got None",
     )
 

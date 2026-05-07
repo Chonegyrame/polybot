@@ -21,8 +21,8 @@ from pydantic import BaseModel  # FastAPI v0.136 supports plain dataclasses too,
 
 from app.api.deps import get_conn
 from app.db import crud
-from app.services.backtest_engine import SLIPPAGE_K, TAKER_FEES
 from app.services.orderbook import compute_book_metrics
+from app.services.paper_trade_close import compute_realized_pnl, estimate_open_costs
 from app.services.polymarket import PolymarketClient
 
 router = APIRouter(prefix="/paper_trades", tags=["paper_trades"])
@@ -44,23 +44,18 @@ class OpenPaperTradeRequest(BaseModel):
     notes: str | None = None
 
 
+# R10 (Pass 3): _estimate_costs moved to app.services.paper_trade_close
+# (estimate_open_costs) so manual + auto-close paths use one shared
+# implementation. Old version used wrong flat-percentage fee model with
+# placeholder rates; new version uses the official Polymarket curve.
 def _estimate_costs(
     entry_price: float, size_usdc: float, category: str | None,
     liquidity_5c: float | None,
 ) -> tuple[float, float, float]:
-    """Mirror the backtest engine's cost model for consistency.
-
-    Returns (effective_entry, fee_usdc, slippage_usdc).
-    """
-    if liquidity_5c and liquidity_5c > 0:
-        slip_pct = min(0.10, SLIPPAGE_K * math.sqrt(size_usdc / liquidity_5c))
-    else:
-        slip_pct = min(0.05, size_usdc / 50_000.0)
-    effective_entry = min(0.999, entry_price + slip_pct)
-    slippage_usdc = (effective_entry - entry_price) * (size_usdc / max(entry_price, 1e-9))
-    fee_rate = TAKER_FEES.get(category or "", TAKER_FEES["_default"])
-    fee_usdc = size_usdc * fee_rate
-    return effective_entry, fee_usdc, slippage_usdc
+    return estimate_open_costs(
+        entry_price=entry_price, size_usdc=size_usdc,
+        category=category, liquidity_5c_usdc=liquidity_5c,
+    )
 
 
 @router.post("")
@@ -165,16 +160,26 @@ async def close_trade(
         raise HTTPException(503, "no live book available; cannot close at market right now")
 
     exit_price = metrics.best_bid  # selling crosses to bid
-    fee_rate = TAKER_FEES.get(mkt["category"] or "", TAKER_FEES["_default"])
 
-    # Per $1 invested, return = (exit/entry - 1) - fees both sides
-    entry = float(t["entry_price"])
-    size = float(t["entry_size_usdc"])
-    gross_pnl = size * (exit_price / entry - 1.0)
-    exit_fee = size * fee_rate
-    realized = gross_pnl - exit_fee  # entry fee already deducted at open
+    # R10 (Pass 3): unified close formula via paper_trade_close helper.
+    # Pre-fix this path silently ignored entry_slippage_usdc and double-counted
+    # nothing for entry fee (comment claimed "already deducted at open" but
+    # it never was), so manual closes reported P&L higher than reality. The
+    # helper makes manual + auto-close-resolved + auto-close-on-exit all use
+    # the same Polymarket-correct math.
+    close = compute_realized_pnl(
+        entry_price=float(t["entry_price"]),
+        entry_size_usdc=float(t["entry_size_usdc"]),
+        entry_slippage_usdc=float(t.get("entry_slippage_usdc") or 0.0),
+        entry_fee_usdc=float(t.get("entry_fee_usdc") or 0.0),
+        exit_price=exit_price,
+        exit_kind="manual",
+        category=mkt["category"],
+    )
 
-    ok = await crud.close_paper_trade_manual(conn, trade_id, exit_price, realized)
+    ok = await crud.close_paper_trade_manual(
+        conn, trade_id, exit_price, close.realized_pnl_usdc,
+    )
     if not ok:
         raise HTTPException(409, "close failed (concurrent update?)")
     return await crud.get_paper_trade(conn, trade_id) or {}

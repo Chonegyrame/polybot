@@ -74,18 +74,16 @@ LATENCY_OFFSET_TOLERANCE_MIN = 5.0  # ±tolerance for "matches a canonical offse
 LATENCY_FALLBACK_WARN_FRACTION = 0.5
 SLIPPAGE_K = 0.02   # square-root impact coefficient; calibrate empirically
 
-# Per-category taker fees as of March 2026 — APPROXIMATE. Verify against
-# polymarket.com/learn/fees before locking. Encoded here so they're easy to
-# override; v2 should move this to a versioned `fee_schedule` DB table.
-TAKER_FEES: dict[str, float] = {
-    "politics": 0.000,  # geopolitics fee-free per public schedule
-    "sports":   0.018,
-    "crypto":   0.018,
-    "culture":  0.012,
-    "tech":     0.012,
-    "finance":  0.012,
-    "_default": 0.012,
-}
+# Pass 3 / D1: per-category taker fees moved to app.services.fees with
+# the CORRECT Polymarket formula (fee = stake x rate x (1 - price), not
+# the flat-percentage-of-payout placeholder the old TAKER_FEES dict used).
+#
+# Pre-fix the dict had Politics as 0%, Sports/Crypto as 1.8%, etc -- all
+# materially wrong. Real rates: Crypto 7%, Sports 3%, Politics 4%,
+# Culture/Economics/Weather/Other 5%, Geopolitics free.
+#
+# All fee math goes through compute_taker_fee_usdc / compute_taker_fee_per_dollar
+# from app.services.fees -- single source of truth.
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +442,30 @@ def cluster_bootstrap_mean_with_p(
 # ---------------------------------------------------------------------------
 
 
+def _slippage_per_dollar(
+    trade_size_usdc: float,
+    liquidity_at_signal: float | None,
+    median_liquidity_fallback: float | None,
+) -> float:
+    """Square-root impact slippage as a fraction of price.
+
+    SLIPPAGE_K=0.02 placeholder until calibrated. When liquidity is missing,
+    falls back to median across resolvable rows in this backtest pass; if
+    that's also missing, uses a fixed $50k-depth approximation.
+    """
+    effective_liquidity: float | None
+    if liquidity_at_signal and liquidity_at_signal > 0:
+        effective_liquidity = liquidity_at_signal
+    elif median_liquidity_fallback and median_liquidity_fallback > 0:
+        effective_liquidity = median_liquidity_fallback
+    else:
+        effective_liquidity = None
+
+    if effective_liquidity is not None:
+        return min(0.10, SLIPPAGE_K * math.sqrt(trade_size_usdc / effective_liquidity))
+    return min(0.05, trade_size_usdc / 50_000.0)
+
+
 def compute_pnl_per_dollar_exit(
     entry_price: float,
     exit_bid_price: float,
@@ -454,43 +476,45 @@ def compute_pnl_per_dollar_exit(
 ) -> float | None:
     """P&L per $1 when exiting at a known bid (smart-money-exit strategy).
 
-    Same structure as `compute_pnl_per_dollar` but the payoff is the bid we
-    sell into, not the binary $1/$0 resolution payoff. Entry slippage is
-    already absorbed via `effective_entry`; we don't model exit slippage
-    separately because the bid we captured IS the price you'd actually clear
-    at (worst-case fill).
+    R10 + D1 (Pass 3): correct Polymarket fee formula. Per $1 stake:
+      shares      = 1 / effective_entry
+      entry_fee   = rate x (1 - effective_entry)            [USDC, paid up-front]
+      revenue     = shares x exit_bid_price = exit / entry  [USDC, on sale]
+      exit_fee    = shares x rate x exit x (1 - exit)
+                  = (rate x exit x (1 - exit)) / effective_entry  [USDC]
+      P&L         = revenue - 1 - entry_fee - exit_fee
 
-    Returns None for invalid inputs (entry >= 1.0, non-positive bid, etc.) so
-    callers can filter the row out cleanly.
+    Pre-fix used `gross x (1 - rate) - 1` -- a flat-percentage-of-payout
+    model that's mathematically the wrong shape. It also under-charged
+    fees because the placeholder rates (1.2-1.8%) were ~half of real
+    Polymarket rates (3-7%).
+
+    Returns None for invalid inputs.
     """
+    from app.services.fees import _resolve_rate
+
     if entry_price is None or entry_price <= 0:
         return None
     if entry_price >= 1.0:
         log.warning(
-            "compute_pnl_per_dollar_exit: entry_price=%.4f >= 1.0 — skipping",
+            "compute_pnl_per_dollar_exit: entry_price=%.4f >= 1.0 -- skipping",
             entry_price,
         )
         return None
     if exit_bid_price is None or exit_bid_price <= 0:
         return None
 
-    effective_liquidity: float | None
-    if liquidity_at_signal and liquidity_at_signal > 0:
-        effective_liquidity = liquidity_at_signal
-    elif median_liquidity_fallback and median_liquidity_fallback > 0:
-        effective_liquidity = median_liquidity_fallback
-    else:
-        effective_liquidity = None
-
-    if effective_liquidity is not None:
-        slip = min(0.10, SLIPPAGE_K * math.sqrt(trade_size_usdc / effective_liquidity))
-    else:
-        slip = min(0.05, trade_size_usdc / 50_000.0)
-
+    slip = _slippage_per_dollar(
+        trade_size_usdc, liquidity_at_signal, median_liquidity_fallback,
+    )
     effective_entry = min(0.999, entry_price + slip)
-    fee_rate = TAKER_FEES.get(category, TAKER_FEES["_default"])
-    gross_per_dollar = exit_bid_price / effective_entry
-    return gross_per_dollar * (1.0 - fee_rate) - 1.0
+    rate = _resolve_rate(category)
+
+    revenue_per_dollar = exit_bid_price / effective_entry
+    entry_fee = rate * (1.0 - effective_entry)
+    # exit_bid_price is clamped to (0, 1) above; use it directly for fee curve
+    exit_fee = (rate * exit_bid_price * (1.0 - exit_bid_price)) / effective_entry
+    return revenue_per_dollar - 1.0 - entry_fee - exit_fee
 
 
 def compute_pnl_per_dollar(
@@ -502,26 +526,24 @@ def compute_pnl_per_dollar(
     liquidity_at_signal: float | None,
     median_liquidity_fallback: float | None = None,
 ) -> float | None:
-    """P&L per $1 invested at signal-fire entry, fee + slippage adjusted.
+    """P&L per $1 invested at signal-fire entry, hold to resolution.
 
-    Math: buy `1/effective_entry` shares with $1, get `payout_per_share`
-    each at resolution. Subtract fee. Returns None for VOID or unknown.
+    R10 + D1 (Pass 3): correct Polymarket fee formula. Per $1 stake:
+      shares      = 1 / effective_entry
+      entry_fee   = rate x (1 - effective_entry)               [paid up-front]
+      payout      = shares x payoff_per_share = payoff / entry [at resolution]
+      resolution_fee = 0  (resolution payouts are NOT charged fees per docs)
+      P&L         = payout - 1 - entry_fee
 
-    Slippage: square-root impact in trade size relative to depth at fire,
-    capped at 10c. Empirically the right shape per the IMDEA arbitrage
-    paper; magnitude (`SLIPPAGE_K=0.02`) is a placeholder until calibrated.
-    When liquidity is missing, falls back to `median_liquidity_fallback`
-    (the median of liquidity_at_signal across resolvable rows in the same
-    backtest pass) before resorting to the hard-coded $50k tier guess.
+    Returns None for VOID or unknown outcomes.
     """
+    from app.services.fees import _resolve_rate
+
     if entry_price is None or entry_price <= 0:
         return None
     if entry_price >= 1.0:
-        # Sanity check — exchange would never let an order print at >=$1.
-        # Almost always indicates a stale/garbage data point. Log so we can
-        # spot systematic capture issues in raw snapshots.
         log.warning(
-            "compute_pnl_per_dollar: entry_price=%.4f >= 1.0 (direction=%s, outcome=%s) — skipping",
+            "compute_pnl_per_dollar: entry_price=%.4f >= 1.0 (direction=%s, outcome=%s) -- skipping",
             entry_price, direction, resolved_outcome,
         )
         return None
@@ -535,30 +557,18 @@ def compute_pnl_per_dollar(
     elif resolved_outcome == "50_50":
         payout_per_share = 0.5
     else:
-        return None  # PENDING or unknown — caller should have filtered
+        return None  # PENDING or unknown -- caller should have filtered
 
-    effective_liquidity: float | None
-    if liquidity_at_signal and liquidity_at_signal > 0:
-        effective_liquidity = liquidity_at_signal
-    elif median_liquidity_fallback and median_liquidity_fallback > 0:
-        effective_liquidity = median_liquidity_fallback
-    else:
-        effective_liquidity = None
-
-    if effective_liquidity is not None:
-        slip = min(0.10, SLIPPAGE_K * math.sqrt(trade_size_usdc / effective_liquidity))
-    else:
-        slip = min(0.05, trade_size_usdc / 50_000.0)
-
+    slip = _slippage_per_dollar(
+        trade_size_usdc, liquidity_at_signal, median_liquidity_fallback,
+    )
     effective_entry = min(0.999, entry_price + slip)
-    fee_rate = TAKER_FEES.get(category, TAKER_FEES["_default"])
-    gross_per_dollar = payout_per_share / effective_entry
-    # Polymarket charges taker fees on PAYOUT value, not on stake. Previously
-    # we deducted `fee_rate` flat from every trade — this over-penalized
-    # losers (you can't lose more than your stake) and under-penalized big
-    # winners (where the fee on the larger payout is bigger). The correct
-    # form: fee scales with what you actually receive.
-    return gross_per_dollar * (1.0 - fee_rate) - 1.0
+    rate = _resolve_rate(category)
+
+    payout_per_dollar = payout_per_share / effective_entry
+    entry_fee = rate * (1.0 - effective_entry)
+    # Resolution payouts are NOT charged fees (only trades are).
+    return payout_per_dollar - 1.0 - entry_fee
 
 
 # ---------------------------------------------------------------------------

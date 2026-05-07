@@ -107,50 +107,73 @@ def test_classify_drop() -> None:
 
 
 def test_compute_pnl_per_dollar_exit() -> None:
-    section("B1: compute_pnl_per_dollar_exit math")
+    # R10/D1 (Pass 3): rewritten for the correct Polymarket fee formula.
+    # Pre-fix used flat-percentage with placeholder rates (Politics 0%,
+    # Sports 1.8%). Real rates: Politics 4%, Sports 3%. Plus the math
+    # shape changed: now BOTH entry-fee and exit-fee are charged
+    # separately (entry on stake, exit on revenue).
+    section("B1: compute_pnl_per_dollar_exit math (new fee formula)")
 
-    # Bought at 0.40, exited at 0.65 with no fee, deep liquidity
-    # effective_entry ≈ 0.40 (slippage tiny), shares = 1/0.40 = 2.5
-    # gross = 2.5 * 0.65 = 1.625, fee=0, pnl/$ ≈ 0.625
+    # Politics rate=0.04. Entry 0.40, exit 0.65, deep liquidity:
+    #   entry_fee = 0.04 * (1-0.40) = 0.024
+    #   revenue = 0.65/0.40 = 1.625
+    #   exit_fee = 0.04 * 0.65 * 0.35 / 0.40 = 0.02275
+    #   P&L = 1.625 - 1 - 0.024 - 0.02275 = ~+0.578
     v = compute_pnl_per_dollar_exit(
         entry_price=0.40, exit_bid_price=0.65,
-        category="politics",  # 0% fee
+        category="Politics",
         trade_size_usdc=1.0, liquidity_at_signal=25_000.0,
     )
     check(
-        "Buy 0.40 / exit 0.65 / politics -> ~+0.625",
+        "Buy 0.40 / exit 0.65 / Politics -> ~+0.578 (entry+exit fee)",
+        v is not None and approx(v, 0.578, 0.01),
+        f"got {v:+.4f}" if v is not None else "got None",
+    )
+
+    # Sports rate=0.03. Same trade:
+    #   entry_fee = 0.03 * 0.60 = 0.018
+    #   exit_fee = 0.03 * 0.65 * 0.35 / 0.40 = 0.01706
+    #   P&L = 1.625 - 1 - 0.018 - 0.01706 = ~+0.590
+    v = compute_pnl_per_dollar_exit(
+        entry_price=0.40, exit_bid_price=0.65,
+        category="Sports", trade_size_usdc=1.0, liquidity_at_signal=25_000.0,
+    )
+    check(
+        "Buy 0.40 / exit 0.65 / Sports -> ~+0.590 (3% rate)",
+        v is not None and approx(v, 0.590, 0.01),
+        f"got {v:+.4f}" if v is not None else "got None",
+    )
+
+    # Exited LOW (loss): bought 0.40, exited 0.20 in Politics
+    #   entry_fee = 0.024
+    #   revenue = 0.20/0.40 = 0.5
+    #   exit_fee = 0.04 * 0.20 * 0.80 / 0.40 = 0.016
+    #   P&L = 0.5 - 1 - 0.024 - 0.016 = -0.540
+    v = compute_pnl_per_dollar_exit(
+        entry_price=0.40, exit_bid_price=0.20,
+        category="Politics", trade_size_usdc=1.0, liquidity_at_signal=25_000.0,
+    )
+    check(
+        "Buy 0.40 / exit 0.20 / Politics -> ~-0.540 (entry + exit fee)",
+        v is not None and approx(v, -0.540, 0.01),
+        f"got {v:+.4f}" if v is not None else "got None",
+    )
+
+    # Geopolitics is fee-free in BOTH directions. P&L = 1.625 - 1 = +0.625 exact.
+    v = compute_pnl_per_dollar_exit(
+        entry_price=0.40, exit_bid_price=0.65,
+        category="Geopolitics", trade_size_usdc=1.0, liquidity_at_signal=25_000.0,
+    )
+    check(
+        "Buy 0.40 / exit 0.65 / Geopolitics -> ~+0.625 (fee-free)",
         v is not None and approx(v, 0.625, 0.01),
         f"got {v:+.4f}" if v is not None else "got None",
     )
 
-    # Same trade in sports (1.8% fee on payout)
-    v = compute_pnl_per_dollar_exit(
-        entry_price=0.40, exit_bid_price=0.65,
-        category="sports", trade_size_usdc=1.0, liquidity_at_signal=25_000.0,
-    )
-    # gross_per_dollar = 0.65 / 0.40 = 1.625; with 1.8% fee on payout → 1.625 * 0.982 - 1 = +0.596
-    check(
-        "Buy 0.40 / exit 0.65 / sports -> ~+0.596",
-        v is not None and approx(v, 0.596, 0.01),
-        f"got {v:+.4f}" if v is not None else "got None",
-    )
-
-    # Exited LOW (loss): bought 0.40, exited 0.20
-    # gross = 1/0.40 * 0.20 = 0.5, pnl/$ ≈ -0.5
-    v = compute_pnl_per_dollar_exit(
-        entry_price=0.40, exit_bid_price=0.20,
-        category="politics", trade_size_usdc=1.0, liquidity_at_signal=25_000.0,
-    )
-    check(
-        "Buy 0.40 / exit 0.20 / politics -> ~-0.5",
-        v is not None and approx(v, -0.5, 0.01),
-        f"got {v:+.4f}" if v is not None else "got None",
-    )
-
     # Bad inputs return None
-    check("entry=1.0 returns None", compute_pnl_per_dollar_exit(1.0, 0.5, "politics", 1.0, 25_000) is None)
-    check("exit_bid=0 returns None", compute_pnl_per_dollar_exit(0.4, 0.0, "politics", 1.0, 25_000) is None)
-    check("entry=0 returns None", compute_pnl_per_dollar_exit(0.0, 0.5, "politics", 1.0, 25_000) is None)
+    check("entry=1.0 returns None", compute_pnl_per_dollar_exit(1.0, 0.5, "Politics", 1.0, 25_000) is None)
+    check("exit_bid=0 returns None", compute_pnl_per_dollar_exit(0.4, 0.0, "Politics", 1.0, 25_000) is None)
+    check("entry=0 returns None", compute_pnl_per_dollar_exit(0.0, 0.5, "Politics", 1.0, 25_000) is None)
 
 
 def test_summarize_rows_strategy_branch() -> None:
