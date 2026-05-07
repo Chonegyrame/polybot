@@ -303,6 +303,130 @@ asyncio.run(test_r2())
 
 
 # ---------------------------------------------------------------------------
+# R5 -- portfolio_value recency in latest_pv CTE
+# ---------------------------------------------------------------------------
+
+section("R5 -- latest_pv CTE filters to fetched_at >= NOW() - INTERVAL '1 hour'")
+
+
+def test_r5_source_inspection() -> None:
+    """Source-inspection test: verify the CTE has the recency filter inline.
+    Pure structural test (no DB needed)."""
+    sd = (ROOT / "app" / "services" / "signal_detector.py").read_text(encoding="utf-8")
+    check("R5: latest_pv CTE has fetched_at recency filter",
+          "fetched_at >= NOW() - INTERVAL '1 hour'" in sd
+          and "latest_pv" in sd,
+          "either the CTE is missing or the recency filter wasn't added")
+
+    jobs_src = (ROOT / "app" / "scheduler" / "jobs.py").read_text(encoding="utf-8")
+    # Verify the always-write logic: condition is "if pv_api is not None or portfolio_total > 0"
+    check("R5: jobs.py writes PV when pv_api available even if positions=0",
+          "if pv_api is not None or portfolio_total > 0" in jobs_src,
+          "always-write logic missing")
+
+
+test_r5_source_inspection()
+
+
+async def test_r5_db() -> None:
+    """End-to-end DB test: stale PV row is excluded; fresh PV row is used."""
+    from app.db.connection import init_pool, close_pool
+
+    pool = await init_pool(min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            # Borrow a real trader for the FK -- portfolio_value_snapshots
+            # has FK to traders. Cleanup our test rows after.
+            test_wallet = await conn.fetchval(
+                "SELECT proxy_wallet FROM traders LIMIT 1"
+            )
+            if not test_wallet:
+                check("R5: DB round-trip skipped (no traders)", True)
+                return
+
+            # Snapshot what's already there so we restore it after
+            existing_rows = await conn.fetch(
+                "SELECT value, fetched_at FROM portfolio_value_snapshots "
+                "WHERE proxy_wallet = $1",
+                test_wallet,
+            )
+
+            # Insert STALE row (2 hours ago)
+            await conn.execute(
+                "DELETE FROM portfolio_value_snapshots WHERE proxy_wallet = $1",
+                test_wallet,
+            )
+
+            # Insert STALE row (2 hours ago)
+            await conn.execute(
+                """
+                INSERT INTO portfolio_value_snapshots (proxy_wallet, value, fetched_at)
+                VALUES ($1, $2, NOW() - INTERVAL '2 hours')
+                """,
+                test_wallet, 5_000_000.0,  # $5M stale value
+            )
+
+            # Run the latest_pv CTE manually with the recency filter
+            row = await conn.fetchrow(
+                """
+                SELECT DISTINCT ON (proxy_wallet)
+                    proxy_wallet, value AS portfolio_value
+                FROM portfolio_value_snapshots
+                WHERE proxy_wallet = $1
+                  AND fetched_at >= NOW() - INTERVAL '1 hour'
+                ORDER BY proxy_wallet, fetched_at DESC
+                """,
+                test_wallet,
+            )
+            check("R5: stale row (2h old) excluded by recency filter",
+                  row is None, f"got {dict(row) if row else None}")
+
+            # Insert FRESH row (now)
+            await conn.execute(
+                """
+                INSERT INTO portfolio_value_snapshots (proxy_wallet, value, fetched_at)
+                VALUES ($1, $2, NOW())
+                """,
+                test_wallet, 50_000.0,  # $50k fresh value
+            )
+
+            # Re-run the CTE: should now return the fresh row
+            row = await conn.fetchrow(
+                """
+                SELECT DISTINCT ON (proxy_wallet)
+                    proxy_wallet, value AS portfolio_value
+                FROM portfolio_value_snapshots
+                WHERE proxy_wallet = $1
+                  AND fetched_at >= NOW() - INTERVAL '1 hour'
+                ORDER BY proxy_wallet, fetched_at DESC
+                """,
+                test_wallet,
+            )
+            check("R5: fresh row (now) included; stale row ignored",
+                  row is not None
+                  and abs(float(row["portfolio_value"]) - 50_000.0) < 0.01,
+                  f"got {row['portfolio_value'] if row else None}")
+
+            # Cleanup -- delete our test rows, restore originals
+            await conn.execute(
+                "DELETE FROM portfolio_value_snapshots WHERE proxy_wallet = $1",
+                test_wallet,
+            )
+            for er in existing_rows:
+                await conn.execute(
+                    "INSERT INTO portfolio_value_snapshots "
+                    "(proxy_wallet, value, fetched_at) VALUES ($1, $2, $3) "
+                    "ON CONFLICT (proxy_wallet, fetched_at) DO NOTHING",
+                    test_wallet, er["value"], er["fetched_at"],
+                )
+    finally:
+        await close_pool()
+
+
+asyncio.run(test_r5_db())
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

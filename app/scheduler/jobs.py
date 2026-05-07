@@ -336,10 +336,21 @@ async def refresh_top_trader_positions(
                         portfolio_total = pv_api
                     else:
                         portfolio_total = sum((p.current_value or 0.0) for p in valid)
-                    if portfolio_total > 0:
+                    # R5 (Pass 3): always write a PV snapshot, even when 0.
+                    # Pre-fix only wrote when portfolio_total > 0, so wallets
+                    # that briefly went flat had no fresh PV row. The signal
+                    # detector then read a stale row from weeks ago, biasing
+                    # avg_portfolio_fraction. Now: always write -- a flat
+                    # wallet legitimately has portfolio_value=0 and we record
+                    # that. Only skip writes if the API call failed AND we
+                    # have no positions (genuinely no information).
+                    if pv_api is not None or portfolio_total > 0:
                         await crud.insert_portfolio_value(
                             conn,
-                            PortfolioValue(proxy_wallet=wallet, value=portfolio_total),
+                            PortfolioValue(
+                                proxy_wallet=wallet,
+                                value=max(portfolio_total, 0.0),
+                            ),
                         )
                         portfolio_values_persisted += 1
                     succeeded += 1

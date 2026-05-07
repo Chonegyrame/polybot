@@ -240,12 +240,20 @@ async def _aggregate_positions(
         FROM wallet_pool w
         LEFT JOIN cluster_membership cm USING (proxy_wallet)
     ),
-    -- Latest portfolio value per wallet (ours, derived from sum of position values)
+    -- Latest portfolio value per wallet, REQUIRED to be fresh.
+    -- R5 (Pass 3): pre-fix had no recency filter, so a wallet that briefly
+    -- went flat (no positions) and stopped getting a new PV row would keep
+    -- returning a weeks-old portfolio value. Their next $20k position then
+    -- got divided by an obsolete denominator -- the headline avg_portfolio_
+    -- fraction metric was lying on those wallets. Now: only PV rows from
+    -- the last hour count; pair this with jobs.py always-write-PV (so a
+    -- wallet that goes flat still gets a fresh row with their cash value).
     latest_pv AS (
         SELECT DISTINCT ON (proxy_wallet)
             proxy_wallet, value AS portfolio_value
         FROM portfolio_value_snapshots
         WHERE proxy_wallet IN (SELECT proxy_wallet FROM wallet_pool)
+          AND fetched_at >= NOW() - INTERVAL '1 hour'
         ORDER BY proxy_wallet, fetched_at DESC
     ),
     -- Tracked positions for the pool, joined to market/event for filter/display.
