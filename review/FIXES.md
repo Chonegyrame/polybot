@@ -1324,3 +1324,33 @@ across hundreds of backtest signals, the bias adds up.
 - All 20 smoke suites pass: **862/862** (was 831, +31 new — 29 new
   in the bundle file plus 2 added to existing pass3_fixes for the
   #4 + #11 boundary updates).
+
+### Tier E — item #18 — `iter_trades` paginator-mode flag
+
+- **Status**: fixed (commit 10 of the Pass 5 plan).
+- **Source**: `review/PASS5_AUDIT.md` item #18 (Low/Medium).
+- **Files**:
+  - `app/services/polymarket.py` — `get_trades` gains a
+    `_paginator_mode: bool = False` kwarg. When True, uses
+    `_safe_list_from_response` (raises `ResponseShapeError`); when
+    False (default), keeps the existing `_safe_list_or_empty` silent
+    `[]` behavior. `iter_trades` passes `_paginator_mode=True` and
+    propagates `ResponseShapeError` so a malformed mid-pagination
+    response aborts the iteration loudly with a logged
+    `iter_trades: aborted at offset=N` message.
+  - `scripts/smoke_phase_pass5_iter_trades.py` — 15 new tests:
+    code-shape regressions (kwarg present + default False; both
+    helpers referenced; `iter_trades` raises and logs), divergence
+    between the two helpers on the same malformed input, behavioral
+    coverage of `get_trades` in both modes (silent vs raise),
+    end-to-end `iter_trades` propagation when page 2 is malformed
+    (page 1 trades yielded before raise), and regression on the
+    clean-exhaustion + partial-last-page paths.
+- **Behavioral change**: a downstream backtest that consumes
+  `iter_trades` no longer sees a half-truncated stream as if it were
+  a clean exhaustion. A malformed page mid-pagination raises an
+  exception with a clear log line; the caller knows the dataset is
+  incomplete instead of computing wrong P&L on partial data. One-shot
+  `get_trades` callers retain the silent-`[]` behavior (back-compat).
+- **Live verification**: 21 smoke suites — **877/877 passing** (was
+  862, +15 new).

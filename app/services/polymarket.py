@@ -514,23 +514,56 @@ class PolymarketClient:
         return kept
 
     async def get_trades(
-        self, proxy_wallet: str, limit: int = 500, offset: int = 0
+        self, proxy_wallet: str, limit: int = 500, offset: int = 0,
+        _paginator_mode: bool = False,
     ) -> list[Trade]:
-        """One page of historical trades. Use `iter_trades` for full history."""
+        """One page of historical trades. Use `iter_trades` for full history.
+
+        Pass 5 #18: `_paginator_mode` (default False) controls how shape
+        errors propagate. The default uses `_safe_list_or_empty` (silent
+        []), which is the right behavior for one-shot callers that can
+        tolerate partial failure. `iter_trades` passes True so it sees
+        `_safe_list_from_response` (raises `ResponseShapeError`) and can
+        abort the page loop instead of silently truncating mid-pagination
+        and returning a partial dataset that callers think is complete.
+        """
         url = f"{settings.data_api_base}/trades"
         data = await self._get_json(
             url, params={"user": proxy_wallet, "limit": limit, "offset": offset}
         )
-        items = _safe_list_or_empty(data, "data-api/trades?user")
+        if _paginator_mode:
+            items = _safe_list_from_response(data, "data-api/trades?user")
+        else:
+            items = _safe_list_or_empty(data, "data-api/trades?user")
         return [Trade.from_dict(d) for d in items]
 
     async def iter_trades(
         self, proxy_wallet: str, page_size: int = 500
     ) -> AsyncIterator[Trade]:
-        """Yield every trade for a wallet, paging until exhausted."""
+        """Yield every trade for a wallet, paging until exhausted.
+
+        Pass 5 #18: pages are fetched via `_paginator_mode=True`, so a
+        mid-pagination shape error raises `ResponseShapeError` instead of
+        silently returning []. Pre-fix a malformed page-2 response would
+        end iteration as if the wallet had no more trades; a downstream
+        backtest treats the partial dataset as complete and computes
+        wrong P&L. Now the error propagates and the caller knows the
+        dataset is incomplete.
+        """
         offset = 0
         while True:
-            page = await self.get_trades(proxy_wallet, limit=page_size, offset=offset)
+            try:
+                page = await self.get_trades(
+                    proxy_wallet, limit=page_size, offset=offset,
+                    _paginator_mode=True,
+                )
+            except ResponseShapeError:
+                log.error(
+                    "iter_trades: aborted at offset=%d for wallet=%s due to "
+                    "API shape error -- dataset is incomplete",
+                    offset, proxy_wallet,
+                )
+                raise
             if not page:
                 return
             for t in page:
