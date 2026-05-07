@@ -385,6 +385,8 @@ async def upsert_signal_log_entry(
     current_price: float | None,
     cluster_id: str | None = None,
     market_type: str = "binary",
+    direction_dollar_skew: float | None = None,   # R2 (Pass 3)
+    contributing_wallets: list[str] | None = None,  # R3b (Pass 3)
 ) -> bool:
     """Insert or update one signal_log row.
 
@@ -396,8 +398,14 @@ async def upsert_signal_log_entry(
 
     On conflict: bump last_seen_at, monotonically max() the peak metrics, and
     refresh `current_price`. `first_fired_at`, all `first_*` fields, and
-    `cluster_id` / `market_type` are never overwritten — they describe the
+    `cluster_id` / `market_type` are never overwritten -- they describe the
     moment the signal first fired.
+
+    R2: also persists `first_net_dollar_skew` (USDC-weighted skew at fire time).
+    R3b: also persists `contributing_wallets` (the wallet addresses that fed
+    into this signal at fire time, used by exit_detector for cohort-aware
+    aggregation). Both fields preserved at first-fire (never overwritten on
+    re-fire) since they describe the original cohort/composition.
 
     Returns True iff this was a fresh insert (signal first fired now).
     """
@@ -411,12 +419,14 @@ async def upsert_signal_log_entry(
             first_trader_count, first_avg_portfolio_fraction,
             first_aggregate_usdc, first_net_skew,
             first_top_trader_entry_price, current_price,
-            cluster_id, market_type
+            cluster_id, market_type,
+            first_net_dollar_skew, contributing_wallets
         )
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW(),
                 $6, $7, $8, $9,
                 $6, $7, $8, $9,
-                $10, $11, $12, $13)
+                $10, $11, $12, $13,
+                $14, $15)
         ON CONFLICT (mode, category, top_n, condition_id, direction) DO UPDATE SET
             last_seen_at                  = NOW(),
             peak_trader_count             = GREATEST(signal_log.peak_trader_count, EXCLUDED.peak_trader_count),
@@ -454,6 +464,8 @@ async def upsert_signal_log_entry(
         current_price,
         cluster_id,
         market_type,
+        direction_dollar_skew,
+        contributing_wallets,
     )
     return bool(row["inserted"]) if row else False
 
@@ -686,19 +698,34 @@ async def get_session_slice_lookups(
     conn: asyncpg.Connection,
     window_hours: int = 4,
 ) -> list[dict[str, float | None]]:
-    """Return all slice_lookup entries within the session window.
+    """Return DISTINCT slice_lookup entries within the session window.
 
     A "session" is defined as the last `window_hours` hours. Used to count N
-    for Bonferroni / BH-FDR corrections: every distinct backtest query the
-    user has run in this session is a potential false positive.
+    for Bonferroni / BH-FDR corrections.
+
+    R9 (Pass 3): deduplicates by slice_definition before counting. Pre-fix
+    every backtest API call inserted a row, so repeatedly hitting Refresh
+    on the same query inflated N -- the user paid a multiplicity penalty
+    for clicking. /slice was even worse (one row per bucket per call).
+    Now identical filter specs collapse to a single hypothesis regardless
+    of how many times they were queried.
+
+    Among duplicates we keep the most-recent one (DISTINCT ON ... ORDER BY
+    slice_definition, ran_at DESC) so the latest CI/value is used.
     """
     from datetime import timezone, timedelta
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
     rows = await conn.fetch(
         """
+        WITH deduped AS (
+            SELECT DISTINCT ON (slice_definition)
+                ran_at, reported_value, ci_low, ci_high
+            FROM slice_lookups
+            WHERE ran_at >= $1
+            ORDER BY slice_definition, ran_at DESC
+        )
         SELECT reported_value, ci_low, ci_high
-        FROM slice_lookups
-        WHERE ran_at >= $1
+        FROM deduped
         ORDER BY ran_at
         """,
         cutoff,
@@ -1738,14 +1765,19 @@ async def upsert_watchlist_signal(
     aggregate_usdc: float,
     net_skew: float,
     avg_portfolio_fraction: float | None,
+    dollar_skew: float | None = None,  # R2 (Pass 3)
 ) -> bool:
-    """B3 — record/refresh a watchlist candidate. last_seen_at always bumps.
+    """B3 -- record/refresh a watchlist candidate. last_seen_at always bumps.
 
     F10: skips the insert when an OFFICIAL signal already exists for this
     (condition_id, direction) in any lens. Pre-fix mutual exclusion was
     enforced only within one (mode, category, top_n) lens, so the same
     market could appear in /signals/active under one lens and
     /watchlist/active under another simultaneously, breaking the spec.
+
+    R2: also persists `dollar_skew` (USDC-weighted direction skew). Updated
+    on each refresh since watchlist tracks current state, not first-fire.
+
     Returns True if the row was inserted/updated, False if skipped due to
     an existing official signal.
     """
@@ -1753,9 +1785,10 @@ async def upsert_watchlist_signal(
         """
         INSERT INTO watchlist_signals (
             mode, category, top_n, condition_id, direction,
-            trader_count, aggregate_usdc, net_skew, avg_portfolio_fraction
+            trader_count, aggregate_usdc, net_skew, avg_portfolio_fraction,
+            dollar_skew
         )
-        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
         WHERE NOT EXISTS (
             SELECT 1 FROM signal_log
             WHERE condition_id = $4 AND direction = $5
@@ -1765,10 +1798,12 @@ async def upsert_watchlist_signal(
             aggregate_usdc         = EXCLUDED.aggregate_usdc,
             net_skew               = EXCLUDED.net_skew,
             avg_portfolio_fraction = EXCLUDED.avg_portfolio_fraction,
+            dollar_skew            = EXCLUDED.dollar_skew,
             last_seen_at           = NOW()
         """,
         mode, category, top_n, condition_id, direction,
         trader_count, aggregate_usdc, net_skew, avg_portfolio_fraction,
+        dollar_skew,
     )
     # asyncpg returns "INSERT 0 1" on success, "INSERT 0 0" on the
     # WHERE-NOT-EXISTS skip path.

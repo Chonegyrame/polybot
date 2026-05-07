@@ -25,17 +25,25 @@ from app.services.trader_ranker import RankingMode, rank_traders
 
 log = logging.getLogger(__name__)
 
-# Eligibility floors — every firing signal satisfies all three.
+# Eligibility floors -- every firing signal satisfies all four.
+# R2 (Pass 3): "skew" is now BOTH count-skew AND dollar-skew. Pre-fix used
+# headcount only, so 6 minnows on YES + 1 whale on NO would fire YES even
+# though dollar consensus was 99% NO. Requiring both axes to clear catches
+# whale-vs-retail mismatches.
 MIN_TRADER_COUNT = 5
 MIN_AGGREGATE_USDC = 25_000.0
-MIN_NET_DIRECTION_SKEW = 0.60
+MIN_NET_DIRECTION_SKEW = 0.65         # headcount fraction
+MIN_NET_DIRECTION_DOLLAR_SKEW = 0.65  # USDC-weighted fraction
 
-# B3: watchlist floors — looser pre-signal threshold for markets building
+# B3: watchlist floors -- looser pre-signal threshold for markets building
 # consensus. A watchlist row is mutually exclusive with signal_log: a market
 # crossing the official floors is a signal, NOT a watchlist row.
+# R2: watchlist also requires dual-axis but at the same 0.65 threshold
+# (we don't want noisy watchlist hits on markets with dollar mismatch).
 WATCHLIST_MIN_TRADER_COUNT = 2
 WATCHLIST_MIN_AGGREGATE_USDC = 5_000.0
-WATCHLIST_MIN_NET_DIRECTION_SKEW = 0.60
+WATCHLIST_MIN_NET_DIRECTION_SKEW = 0.65
+WATCHLIST_MIN_NET_DIRECTION_DOLLAR_SKEW = 0.65
 
 # Map outcome string from Polymarket to our canonical direction label.
 # Polymarket markets are binary; outcomes are typically "Yes"/"No" but
@@ -57,7 +65,7 @@ def _outcome_to_direction(outcome: str | None) -> Direction | None:
 
 @dataclass(frozen=True)
 class Signal:
-    """One firing signal — a (market × direction) pair with strong consensus."""
+    """One firing signal -- a (market x direction) pair with strong consensus."""
 
     condition_id: str
     market_question: str | None
@@ -66,17 +74,23 @@ class Signal:
     event_id: str | None
 
     direction: Direction
-    direction_skew: float           # fraction of involved-traders on this direction (0..1)
+    direction_skew: float           # headcount fraction on this direction (0..1)
+    direction_dollar_skew: float    # R2: dollar-weighted fraction on this direction (0..1)
     trader_count: int               # distinct top-N traders on this direction
     aggregate_usdc: float           # sum of current_value for those traders' positions
     avg_portfolio_fraction: float   # mean of (position_current_value / portfolio_total)
 
     current_price: float | None     # latest cur_price observed across the involved positions
-    first_top_trader_first_seen_at: datetime | None  # earliest first_seen_at — proxy entry time
+    first_top_trader_first_seen_at: datetime | None  # earliest first_seen_at -- proxy entry time
     avg_entry_price: float | None   # mean avg_price on this direction (cost basis approximation)
 
 
-def _row_to_signal(r: asyncpg.Record, direction: Direction, skew: float) -> Signal:
+def _row_to_signal(
+    r: asyncpg.Record,
+    direction: Direction,
+    skew: float,
+    dollar_skew: float,
+) -> Signal:
     return Signal(
         condition_id=r["condition_id"],
         market_question=r["question"],
@@ -85,6 +99,7 @@ def _row_to_signal(r: asyncpg.Record, direction: Direction, skew: float) -> Sign
         event_id=r["event_id"],
         direction=direction,
         direction_skew=skew,
+        direction_dollar_skew=dollar_skew,
         trader_count=int(r["trader_count"]),
         aggregate_usdc=float(r["aggregate_usdc"] or 0.0),
         avg_portfolio_fraction=float(r["avg_portfolio_fraction"] or 0.0),
@@ -144,15 +159,25 @@ async def detect_signals_and_watchlist(
 
         trader_count = int(r["trader_count"])
         aggregate = float(r["aggregate_usdc"] or 0.0)
+        # R2: dual-axis skew. Headcount ratio + dollar ratio. Both must
+        # clear floor for the signal to fire.
+        total_dollars_in_market = float(r["total_dollars_in_market"] or 0.0)
         skew = trader_count / total_traders_in_market
+        dollar_skew = (
+            aggregate / total_dollars_in_market
+            if total_dollars_in_market > 0 else 0.0
+        )
 
-        if skew < WATCHLIST_MIN_NET_DIRECTION_SKEW:
-            continue  # Skew floor is the same on both tiers; below it = nothing
+        # Below the watchlist threshold on EITHER axis -> drop entirely
+        if (skew < WATCHLIST_MIN_NET_DIRECTION_SKEW
+                or dollar_skew < WATCHLIST_MIN_NET_DIRECTION_DOLLAR_SKEW):
+            continue
 
         passes_official = (
             trader_count >= MIN_TRADER_COUNT
             and aggregate >= MIN_AGGREGATE_USDC
             and skew >= MIN_NET_DIRECTION_SKEW
+            and dollar_skew >= MIN_NET_DIRECTION_DOLLAR_SKEW
         )
         passes_watchlist = (
             trader_count >= WATCHLIST_MIN_TRADER_COUNT
@@ -160,9 +185,9 @@ async def detect_signals_and_watchlist(
         )
 
         if passes_official:
-            official.append(_row_to_signal(r, direction, skew))
+            official.append(_row_to_signal(r, direction, skew, dollar_skew))
         elif passes_watchlist:
-            watchlist.append(_row_to_signal(r, direction, skew))
+            watchlist.append(_row_to_signal(r, direction, skew, dollar_skew))
 
     official.sort(key=lambda s: s.direction_skew, reverse=True)
     watchlist.sort(key=lambda s: s.direction_skew, reverse=True)
@@ -270,14 +295,17 @@ async def _aggregate_positions(
         GROUP BY condition_id, outcome
     ),
     -- F17: Total distinct identities per market across YES/NO outcomes only
-    -- (denominator for skew). Pre-fix counted across EVERY outcome, so stray
-    -- non-YES/NO position rows on a binary market (legacy data, edge-case
-    -- outcome strings, reclassifications) inflated the denominator and
-    -- legitimate signals fell below the 60% skew threshold. Conservative
-    -- bias — false negatives. Filter mirrors what _outcome_to_direction
-    -- accepts upstream.
+    -- (headcount denominator for skew). Pre-fix counted across EVERY outcome,
+    -- so stray non-YES/NO position rows on a binary market inflated the
+    -- denominator and legitimate signals fell below the threshold.
+    -- R2 (Pass 3): also expose total_dollars_in_market for dollar-weighted
+    -- skew. Same WHERE clause keeps the dollar denominator consistent with
+    -- the headcount denominator (don't count multi-outcome positions).
     market_totals AS (
-        SELECT condition_id, COUNT(DISTINCT identity) AS traders_any_direction
+        SELECT
+            condition_id,
+            COUNT(DISTINCT identity)         AS traders_any_direction,
+            SUM(current_value)               AS total_dollars_in_market
         FROM pool_positions
         WHERE LOWER(outcome) IN ('yes', 'no')
         GROUP BY condition_id
@@ -286,7 +314,8 @@ async def _aggregate_positions(
         d.condition_id, d.outcome, d.question, d.slug, d.category, d.event_id,
         d.trader_count, d.aggregate_usdc, d.avg_portfolio_fraction,
         d.current_price, d.earliest_first_seen_at, d.avg_entry_price,
-        m.traders_any_direction
+        m.traders_any_direction,
+        m.total_dollars_in_market
     FROM direction_agg d
     JOIN market_totals m ON m.condition_id = d.condition_id
     ORDER BY d.aggregate_usdc DESC

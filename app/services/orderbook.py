@@ -83,6 +83,19 @@ def compute_book_metrics(book: dict[str, Any] | None, direction: str) -> BookMet
         return empty
 
     best_bid, best_ask = bids[0][0], asks[0][0]
+
+    # R6 (Pass 3): guard against crossed/locked books. Polymarket occasionally
+    # returns best_bid >= best_ask during fast moves or on illiquid markets.
+    # Without this guard we'd persist a bogus mid (could exceed 1.0), a
+    # NEGATIVE spread_bps, and a wrong-window liquidity figure -- all of
+    # which feed downstream into backtest math as "real" entry data.
+    if best_bid >= best_ask:
+        log.warning(
+            "R6: crossed book detected (bid=%.4f >= ask=%.4f) -- marking unavailable",
+            best_bid, best_ask,
+        )
+        return empty
+
     mid = (best_bid + best_ask) / 2
     spread_bps = int(((best_ask - best_bid) / mid) * 10_000) if mid > 0 else None
 

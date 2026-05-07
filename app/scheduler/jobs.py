@@ -572,6 +572,8 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                                     current_price=s.current_price,
                                     cluster_id=s.event_id,
                                     market_type="binary",
+                                    direction_dollar_skew=s.direction_dollar_skew,
+                                    # contributing_wallets populated in R3b step
                                 )
                                 if inserted:
                                     fresh_signals.append(s)
@@ -589,6 +591,7 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                                     aggregate_usdc=w.aggregate_usdc,
                                     net_skew=w.direction_skew,
                                     avg_portfolio_fraction=w.avg_portfolio_fraction,
+                                    dollar_skew=w.direction_dollar_skew,
                                 )
                             keep_keys = {(w.condition_id, w.direction) for w in watch}
                             dropped = await crud.cleanup_watchlist_dropouts(
