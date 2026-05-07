@@ -37,6 +37,12 @@ ZOMBIE_DROP_REDEEMABLE: Final[str] = "zombie_drop_redeemable"
 ZOMBIE_DROP_MARKET_CLOSED: Final[str] = "zombie_drop_market_closed"
 ZOMBIE_DROP_DUST_SIZE: Final[str] = "zombie_drop_dust_size"
 ZOMBIE_DROP_RESOLVED_PRICE_PAST: Final[str] = "zombie_drop_resolved_price_past"
+# Pass 5 #17: positions where Polymarket has stopped maintaining metadata
+# entirely (no `redeemable`, no `closed`, no `curPrice`) AND `endDate` is
+# in the past. Distinct counter so the operator can see when this code
+# path is needed -- a high count here suggests Polymarket let the position
+# row drift even further out of date than the 4 base predicates assume.
+ZOMBIE_DROP_INCOMPLETE_METADATA: Final[str] = "zombie_drop_incomplete_metadata"
 
 # Pass 5 #6: trader_category_stats freshness. Recorded by the ranker
 # entrypoints when stats are seeded but the most recent last_trade_at
@@ -54,6 +60,7 @@ _RETENTION: dict[str, timedelta] = {
     ZOMBIE_DROP_MARKET_CLOSED: timedelta(hours=24),
     ZOMBIE_DROP_DUST_SIZE: timedelta(hours=24),
     ZOMBIE_DROP_RESOLVED_PRICE_PAST: timedelta(hours=24),
+    ZOMBIE_DROP_INCOMPLETE_METADATA: timedelta(hours=24),
     STATS_STALE: timedelta(hours=1),
 }
 
@@ -94,6 +101,7 @@ def snapshot() -> dict[str, int]:
         ZOMBIE_DROP_MARKET_CLOSED,
         ZOMBIE_DROP_DUST_SIZE,
         ZOMBIE_DROP_RESOLVED_PRICE_PAST,
+        ZOMBIE_DROP_INCOMPLETE_METADATA,
         STATS_STALE,
     )
     for name in counters:

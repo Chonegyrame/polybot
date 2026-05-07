@@ -190,6 +190,25 @@ class Position:
                                     indistinguishable from a resolved
                                     zombie. Defensive backup if 'redeemable'
                                     ever drifts.
+          'incomplete_metadata_resolved' -- (Pass 5 #17) Polymarket has
+                                    stopped maintaining metadata for this
+                                    position entirely: the API response
+                                    has NO 'redeemable', NO 'closed', NO
+                                    'curPrice', AND end_date is in the
+                                    past. Catches the residual bucket of
+                                    stale resolved-market rows that fall
+                                    through the 4 base predicates because
+                                    each individual signal is missing
+                                    rather than affirmatively resolved.
+                                    Reads the raw dict (not the dataclass
+                                    field) for `redeemable` and `closed`
+                                    so we can distinguish "API didn't
+                                    return the field" from "field
+                                    explicitly returned False". Strict
+                                    AND with past-end_date prevents
+                                    false-positives on live markets where
+                                    the API just briefly returned partial
+                                    metadata.
 
         Fail-open default: missing/None redeemable in the API response
         defaults to False (keep). The other three predicates serve as the
@@ -204,6 +223,20 @@ class Position:
             return "dust_size"
         if self.cur_price in RESOLVED_PRICES and self._end_date_in_past():
             return "resolved_price_past"
+        # Pass 5 #17: residual stale-metadata sweep. Position.from_dict
+        # coerces the dataclass `redeemable` to `bool`, so we inspect the
+        # raw dict to tell apart "explicitly False" from "API didn't send
+        # the field." All four signals must be missing AND end_date must
+        # be in the past -- conjunctive so live markets with brief partial
+        # metadata don't get caught.
+        raw = self.raw or {}
+        if (
+            raw.get("redeemable") is None
+            and raw.get("closed") is None
+            and self.cur_price is None
+            and self._end_date_in_past()
+        ):
+            return "incomplete_metadata_resolved"
         return None
 
 

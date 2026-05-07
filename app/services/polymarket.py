@@ -42,6 +42,10 @@ _ZOMBIE_DROP_COUNTERS: dict[str, str] = {
     "market_closed": health_counters.ZOMBIE_DROP_MARKET_CLOSED,
     "dust_size": health_counters.ZOMBIE_DROP_DUST_SIZE,
     "resolved_price_past": health_counters.ZOMBIE_DROP_RESOLVED_PRICE_PAST,
+    # Pass 5 #17: residual stale-metadata sweep -- positions where the
+    # API has stopped returning redeemable/closed/curPrice and end_date
+    # is in the past. See Position.drop_reason for full criteria.
+    "incomplete_metadata_resolved": health_counters.ZOMBIE_DROP_INCOMPLETE_METADATA,
 }
 
 log = logging.getLogger(__name__)

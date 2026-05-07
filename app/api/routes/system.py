@@ -215,11 +215,14 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
                 "market_closed": counters["zombie_drop_market_closed"],
                 "dust_size": counters["zombie_drop_dust_size"],
                 "resolved_price_past": counters["zombie_drop_resolved_price_past"],
+                # Pass 5 #17: residual stale-metadata sweep.
+                "incomplete_metadata": counters["zombie_drop_incomplete_metadata"],
                 "total": (
                     counters["zombie_drop_redeemable"]
                     + counters["zombie_drop_market_closed"]
                     + counters["zombie_drop_dust_size"]
                     + counters["zombie_drop_resolved_price_past"]
+                    + counters["zombie_drop_incomplete_metadata"]
                 ),
             },
         },

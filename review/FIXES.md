@@ -1187,3 +1187,52 @@ across hundreds of backtest signals, the bias adds up.
     skips runs with `failed_combos > 0` even when they're more
     recent.
 - All 18 smoke suites pass: **811/811** (was 775, +36 new).
+
+### Tier C — item #17 — zombie filter incomplete-metadata predicate
+
+- **Status**: fixed (commit 8 of the Pass 5 plan).
+- **Source**: `review/PASS5_AUDIT.md` item #17 (Medium). Pass 4
+  shipped 4 zombie predicates (redeemable, market_closed, dust_size,
+  resolved_price_past). Audit found a residual fall-open path:
+  positions where Polymarket has stopped maintaining metadata
+  entirely -- no `redeemable`, no `closed`, no `curPrice` -- AND the
+  endDate is in the past. Each base predicate fails open because
+  every individual signal is missing rather than affirmatively
+  resolved. The position then gets persisted into the live tables.
+- **Files**:
+  - `app/services/health_counters.py` — new
+    `ZOMBIE_DROP_INCOMPLETE_METADATA` constant + 24h retention +
+    included in `snapshot()`.
+  - `app/services/polymarket_types.py` — `Position.drop_reason`
+    gains a 5th predicate that fires when ALL four metadata signals
+    are missing AND `_end_date_in_past()` returns True. Reads
+    `redeemable` and `closed` from `self.raw` (not the dataclass
+    field, which is coerced to `bool`) so we can distinguish "API
+    didn't send the field" from "explicitly returned False." Returns
+    `'incomplete_metadata_resolved'`.
+  - `app/services/polymarket.py` — `_ZOMBIE_DROP_COUNTERS` map
+    extended with `incomplete_metadata_resolved →
+    ZOMBIE_DROP_INCOMPLETE_METADATA` so attribution lands in the
+    right counter (the existing exhaustive-lookup invariant catches
+    drift if a future predicate is added without updating the map).
+  - `app/api/routes/system.py` —
+    `/system/status.counters.zombie_drops_last_24h` gains
+    `incomplete_metadata` field; total includes the new counter.
+  - `scripts/smoke_phase_pass5_incomplete_metadata.py` — 20 new
+    tests: code-shape regressions (constant present, in `snapshot`,
+    predicate reads raw dict, counter map updated, `/system/status`
+    surfaces it), behavioral coverage (drops on full-blank+past;
+    keeps on full-blank+future; keeps on missing endDate; keeps on
+    `curPrice` present; keeps on explicit `redeemable=False`; keeps
+    on explicit `closed=False`), priority order (redeemable / closed
+    / dust still win when their conditions are met), and a
+    real-world stale-shape regression.
+- **Behavioral change**: positions returned with absolute-minimum
+  metadata + past endDate are now dropped at the API boundary
+  instead of persisted. The conjunction (`raw.redeemable IS NULL`
+  AND `raw.closed IS NULL` AND `cur_price IS NULL` AND end_date in
+  past) is strict enough that live markets with brief partial
+  metadata are kept; only positions where the API has affirmatively
+  let the metadata go cold get dropped.
+- **Live verification**: 19 smoke suites — **831/831 passing** (was
+  811, +20 new).
