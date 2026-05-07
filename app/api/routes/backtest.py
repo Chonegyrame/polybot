@@ -215,6 +215,7 @@ async def get_summary(
             conn, slice_def,
             result.n_signals, "mean_pnl_per_dollar",
             result.mean_pnl_per_dollar, result.pnl_ci_lo, result.pnl_ci_hi,
+            bootstrap_p=result.pnl_bootstrap_p,
         )
         session_entries = await crud.get_session_slice_lookups(conn)
 
@@ -307,6 +308,7 @@ async def get_slice(
                 conn, bucket_def,
                 br.n_signals, "mean_pnl_per_dollar",
                 br.mean_pnl_per_dollar, br.pnl_ci_lo, br.pnl_ci_hi,
+                bootstrap_p=br.pnl_bootstrap_p,
             )
         session_entries = await crud.get_session_slice_lookups(conn)
 

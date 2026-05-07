@@ -732,13 +732,24 @@ async def insert_slice_lookup(
     reported_value: float | None,
     ci_low: float | None,
     ci_high: float | None,
+    bootstrap_p: float | None = None,
 ) -> None:
-    """Append one backtest query to the audit log for multiple-testing tracking."""
+    """Append one backtest query to the audit log for multiple-testing tracking.
+
+    Pass 5 #8: `bootstrap_p` is the empirical 2-sided bootstrap p-value
+    (vs H0: mean = 0) computed by `cluster_bootstrap_mean_with_p`. Pre-fix
+    we never persisted it -- so every prior session entry returned NULL
+    in `compute_corrections`, which then fell back to the Gaussian-from-CI
+    approximation F21 said was wrong. The kwarg defaults to None so old
+    rows persisted before migration 018 are forwards-compatible (the
+    column was added by migration 018, nullable).
+    """
     await conn.execute(
         """
         INSERT INTO slice_lookups
-            (slice_definition, n_signals, reported_metric, reported_value, ci_low, ci_high)
-        VALUES ($1::jsonb, $2, $3, $4, $5, $6)
+            (slice_definition, n_signals, reported_metric, reported_value,
+             ci_low, ci_high, bootstrap_p)
+        VALUES ($1::jsonb, $2, $3, $4, $5, $6, $7)
         """,
         json.dumps(slice_definition),
         n_signals,
@@ -746,6 +757,7 @@ async def insert_slice_lookup(
         reported_value,
         ci_low,
         ci_high,
+        bootstrap_p,
     )
 
 
@@ -767,6 +779,10 @@ async def get_session_slice_lookups(
 
     Among duplicates we keep the most-recent one (DISTINCT ON ... ORDER BY
     slice_definition, ran_at DESC) so the latest CI/value is used.
+
+    Pass 5 #8: now also returns `bootstrap_p` per entry (NULL on rows
+    persisted before migration 018; `compute_corrections` falls back to
+    the Gaussian-from-CI approximation only for those NULL rows).
     """
     from datetime import timezone, timedelta
     cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
@@ -774,12 +790,12 @@ async def get_session_slice_lookups(
         """
         WITH deduped AS (
             SELECT DISTINCT ON (slice_definition)
-                ran_at, reported_value, ci_low, ci_high
+                ran_at, reported_value, ci_low, ci_high, bootstrap_p
             FROM slice_lookups
             WHERE ran_at >= $1
             ORDER BY slice_definition, ran_at DESC
         )
-        SELECT reported_value, ci_low, ci_high
+        SELECT reported_value, ci_low, ci_high, bootstrap_p
         FROM deduped
         ORDER BY ran_at
         """,
@@ -790,6 +806,7 @@ async def get_session_slice_lookups(
             "reported_value": float(r["reported_value"]) if r["reported_value"] is not None else None,
             "ci_low":         float(r["ci_low"])         if r["ci_low"]         is not None else None,
             "ci_high":        float(r["ci_high"])        if r["ci_high"]        is not None else None,
+            "bootstrap_p":    float(r["bootstrap_p"])    if r["bootstrap_p"]    is not None else None,
         }
         for r in rows
     ]

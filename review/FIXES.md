@@ -940,3 +940,52 @@ it and the test that prevents regression.
   the baseline (they have high volume + ~0% ROI), giving specialists
   the wrong target. The exclusion is about data quality, not about
   candidate restriction — keeping it is the right call.
+
+### Tier B — item #8 — bootstrap_p persisted to slice_lookups
+
+- **Status**: fixed (commit 4 of the Pass 5 plan; depends on
+  migration 018 from Tier A).
+- **Source**: `review/PASS5_AUDIT.md` item #8 (Critical). F21 (Pass 2)
+  added the empirical bootstrap p-value to `BacktestResult` to replace
+  a Gaussian-from-CI approximation that's broken on skewed P&L
+  distributions. F21 deferred persisting the value to
+  `slice_lookups` — so every prior session entry returned NULL for
+  `bootstrap_p` in `compute_corrections`, which then fell back to the
+  broken approximation for every comparator. BH-FDR ranking was
+  unstable across sessions: two CIs of identical width could rank
+  differently depending on whether the result pre- or post-dated F21.
+- **Files**:
+  - `app/db/crud.py` — `insert_slice_lookup` gains a `bootstrap_p:
+    float | None = None` kwarg (defaults to None for back-compat);
+    INSERT writes the new column (positional `$7`).
+    `get_session_slice_lookups` SELECTs `bootstrap_p` and includes it
+    in each returned dict.
+  - `app/api/routes/backtest.py` — both call sites updated:
+    `get_summary` passes `bootstrap_p=result.pnl_bootstrap_p`;
+    `get_slice` passes `bootstrap_p=br.pnl_bootstrap_p` per bucket.
+    Smoke regression-checks the count of `bootstrap_p=` keyword passes
+    matches the count of `insert_slice_lookup(` call sites in the file
+    so we can't silently regress one of them in a future edit.
+  - `scripts/smoke_phase_pass5_bootstrap_p.py` — 19 new tests:
+    code-shape regressions (signature has the kwarg, INSERT writes the
+    column, SELECT pulls it, both route call sites pass it,
+    `compute_corrections` still prefers `bootstrap_p`), DB round-trip
+    (insert with 0.04 + insert without; verify both via direct DB
+    query AND via the session helper), and a behavioral test on
+    `compute_corrections` proving the persisted column is actually
+    consumed (scenario A with persisted small-p comparators produces
+    a narrower BH-FDR widened CI than scenario B with NULL/Gaussian-
+    fallback comparators; ratio ~1.27x matches theoretical
+    `z_{0.0125}/z_{0.05}`).
+- **Behavioral change**: `compute_corrections` now reads the persisted
+  `bootstrap_p` for prior session entries instead of falling through
+  to `_pvalue_from_ci` for every comparator. BH-FDR ranks based on
+  the empirical bootstrap p, so heavy-tailed P&L distributions are
+  correctly handled. Existing slice_lookup rows persisted before
+  migration 018 (any row before 2026-05-07) have `bootstrap_p IS NULL`
+  in the DB and continue to use the Gaussian fallback — back-compat
+  is intact.
+- **Live verification**: 15 smoke suites — **742/742 passing** (was
+  723, +19 new). DB round-trip uses a unique
+  `_pass5_8_test_roundtrip` slice_definition tag with cleanup; no
+  pollution of real session data.
