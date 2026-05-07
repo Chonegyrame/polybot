@@ -196,10 +196,92 @@ The headline product. **A vertical scrollable list of signal cards** — one car
   - 🔴 **>+20%** ("Likely already moved — entering near smart money's profit zone")
 - **Liquidity tier badge** — Small / Medium / Large with USDC depth on hover. Lets the user judge whether they can actually size into the trade.
 - **Lens count badge** — e.g. "Confirmed by 5 lenses" with tooltip listing which (mode, category) combos agree. Replaces showing the same market 5 times.
-- **Counterparty warning** — if any seller in recent CLOB fills is in current top-N: "⚠ Smart money on the other side" badge in red.
+- **Counterparty warning** — count-based, with tier:
+  - "⚠ 1-2 top traders hold opposite side" (mild — amber)
+  - "⚠ 3+ top traders hold opposite side" (strong — red)
+  - Backed by `counterparty_count` int (cluster-aware — multiple wallets in one sybil cluster count as one entity, not multiple counterparties).
+- **Hedge warning** — if any contributing wallet (or their cluster) ALSO holds a meaningful position on the OPPOSITE side of this market: "⚠ 1 of 5 contributing entities is hedged" badge in amber. This is distinct from the counterparty warning — counterparty is "different top traders on the other side"; hedge is "the same entity firing this signal also holds the opposite side."
 - **Freshness label** — "Formed 4h ago" / "Stale (>4h since refresh)" — stale signals get **strikethrough on the direction badge** + reduced opacity + an explicit age warning. The card remains visible but visually de-prioritised.
 
-**Backend:** all of these come from existing fields on `signal_log` + new `counterparty_warning` boolean + `lens_count` from the deduped view. UI does not compute thresholds — backend tags each signal with its quality state.
+**Backend:** all of these come from existing fields on `signal_log` + `counterparty_count` int + `lens_count` from the deduped view + a new hedge flag computed from the contributors endpoint described below.
+
+#### Contributors panel (expandable section on each card)
+
+Below the headline indicators, each signal card has a collapsible **"Show contributors"** section. When expanded, it lists every wallet that fired this signal — and every top-N wallet currently on the opposite side as counterparty — with their actual position sizes. This lets the user verify the system's read manually instead of trusting the aggregate numbers.
+
+**For each contributing wallet (signal side):**
+- Wallet name (`user_name` if set, else short address `0xab...cd`) + verified badge if applicable
+- Cluster label if part of a known sybil/co-entry cluster (e.g. "Cluster A · 4 wallets" — wallets in the same cluster grouped together visually so the user sees "this is one entity")
+- Same-side position: `$70,000 on YES (size 175k shares @ avg $0.40)`
+- Opposite-side position if any: `also $20,000 on NO ⚠ hedged` — visually flagged so it's hard to miss
+- Lifetime PnL + ROI (small, secondary)
+- Click wallet name → opens trader drill-down modal (Section 4)
+
+**For each counterparty wallet (opposite side):**
+- Same shape as contributors, but on the other side
+- Sorted by opposite-side dollar amount descending (biggest counterparties first)
+- Cluster grouping applies here too — a 4-wallet sybil cluster on the opposite side is shown as one entity, not four
+
+**Worked example (what the user actually sees):**
+
+> Signal: YES on "Will Trump nominate Rubio for Sec State?" — 5 entities, $90k aggregate, 82% dollar-skew
+> 
+> **Contributors (5 entities, click to expand):**
+> - **Théo (Cluster A · 4 wallets):** $70k on YES — ⚠ also $20k on NO (hedged, net +$50k YES)
+> - **0xab...cd:** $5k on YES
+> - **0xef...01:** $5k on YES
+> - **0x12...34:** $5k on YES
+> - **0x56...78:** $5k on YES
+> 
+> **Counterparty (1 top trader on NO):**
+> - **Whale_X:** $80k on NO
+
+With this view the user can immediately see: "the 82% YES skew is mostly one hedged whale plus four small bets — and there's an $80k counterparty whale on the other side." Their decision becomes a real read of the situation, not a trust exercise in the aggregate number.
+
+**Backend endpoint:** `GET /signals/{signal_log_id}/contributors`. Returns:
+
+```json
+{
+  "contributors": [
+    {
+      "proxy_wallet": "0x...",
+      "user_name": "Théo",
+      "verified_badge": true,
+      "cluster_id": 42,
+      "cluster_label": "Cluster A",
+      "cluster_size": 4,
+      "same_side_usdc": 70000,
+      "opposite_side_usdc": 20000,
+      "is_hedged": true,
+      "net_exposure_usdc": 50000,
+      "avg_entry_price": 0.40,
+      "lifetime_pnl_usdc": 12000000,
+      "lifetime_roi": 0.18
+    },
+    ...
+  ],
+  "counterparty": [
+    {
+      "proxy_wallet": "0x...",
+      "user_name": "Whale_X",
+      "cluster_id": null,
+      "same_side_usdc": 0,
+      "opposite_side_usdc": 80000,
+      "is_hedged": false,
+      ...
+    }
+  ],
+  "summary": {
+    "n_contributors": 5,
+    "n_hedged_contributors": 1,
+    "n_counterparty": 1,
+    "total_same_side_usdc": 90000,
+    "total_opposite_side_usdc": 80000
+  }
+}
+```
+
+The card's badges (`hedge warning`, `counterparty count`) are derived from `summary` so they can be rendered without expanding the panel. The full contributor list is fetched lazily on first expand to keep the dashboard light.
 
 #### Signal eligibility floors (backend filters before sending to UI)
 
@@ -670,6 +752,83 @@ When the system detects that an active signal's `trader_count` or `aggregate_usd
 #### Backend
 
 `GET /signals/exits?since=<iso8601>` returns recent exit events. Same scheduler job that fires exits also auto-closes paper trades.
+
+---
+
+### Section 8 — Errors / data-quality page
+
+A dedicated page (top-nav route, e.g. `/errors`) that surfaces every place in the pipeline where data fetching, persistence, or scheduled jobs failed or returned suspect data. The dashboard health pill (Section 1) gives a one-pill summary; this page gives the full breakdown, so when the pill goes amber/red the user knows exactly what failed.
+
+#### Why this exists
+
+The system has many independent layers that fetch from Polymarket:
+- Position refresh (per-wallet `/positions` calls, hundreds per cycle)
+- Portfolio value (`/value` calls, per wallet)
+- Daily leaderboard snapshot (28 combos: 7 categories × 2 time-periods × 2 order-bys)
+- Market metadata via JIT discovery (gamma `/markets`, `/events`)
+- Order book snapshots for fired signals (CLOB `/book`)
+- Signal-price snapshots (every 10 min for active signals)
+- Trader-stats nightly batch
+- Wallet-classifier and sybil-detector weekly jobs
+
+Any of these can fail silently or partially. Without a centralized error page, the user has to read logs to know what's incomplete. With it, every failure is one click away.
+
+#### Page structure
+
+Vertical scrollable timeline grouped by recency. Each entry shows:
+- Timestamp (when the failure happened)
+- Subsystem (which job / endpoint)
+- Severity (Info / Warning / Error)
+- Short human description ("Daily snapshot completed with 5 of 28 combos failed", "Position fetch returned empty for wallet 0xabc... (suspected API blip)")
+- Affected scope (e.g. "5 categories × time-periods" or "1 wallet" or "12 markets")
+- Click row → expand to show raw context (failing endpoint, response excerpt, what was retried)
+
+Top of page: a counter strip showing rolling totals — "Last 24h: 3 errors, 12 warnings, 47 info notes."
+
+Filter chips at the top: by subsystem (snapshot, positions, signals, half-life, …) and by severity.
+
+#### What feeds it
+
+Backend already emits structured log entries and `health_counters`. This page just surfaces them through a dedicated endpoint:
+
+`GET /system/errors?since=<iso8601>&severity=&subsystem=`
+
+Returns recent entries from a unified errors view that joins:
+- `health_counters` rolling 24h totals (rate-limit hits, API failures, cycle-duration warnings, zombie-drop reasons)
+- `daily_snapshot_runs` row per day (partial-failure rows, see also Pass 5 finding #16)
+- `signal_price_snapshots` failure log (when a snapshot was due but couldn't be captured)
+- API client error log (when a `/positions`, `/value`, etc. call returned a non-list shape, hit a 4xx, or timed out)
+
+#### Concrete cases the page must surface (initial set)
+
+| Subsystem | Trigger | Severity |
+|---|---|---|
+| Daily snapshot | run completed with `failed_combos > 0` | Warning (or Error if >50% failed) |
+| Position refresh | wallet fetch failed (transport error, shape error, 4xx) | Info per wallet, Warning if >10% of pool failed |
+| JIT market discovery | gamma dropped event_ids; markets persisted with `event_id=NULL` | Warning |
+| Signal-price snapshot | signal needed a snapshot at +5/15/30/60/120 but capture failed | Info per snapshot |
+| Order-book API | crossed/locked book detected and rejected | Info |
+| Rate limit | 429 from Polymarket | Info per hit, Warning if >threshold/hour |
+| Trader-stats nightly | job ran but data is now >7 days stale (Pass 5 finding #6) | Error |
+| Multi-page paginator | `iter_trades` raised ResponseShapeError mid-pagination (Pass 5 finding #18) | Error |
+| Cycle duration | refresh cycle exceeded 9 min | Warning |
+| Polymarket overload pattern | repeated 200-OK-with-garbage responses | Warning |
+
+Add to this list as new failure modes are discovered. The page is the single canonical home for "did the data update correctly today."
+
+#### Notification badge
+
+The top nav "Errors" link displays a small numeric badge for `count(severity='error')` in the last 24h, plus an amber dot if any warnings in the last 24h. Click visit clears the badge (stores `localStorage.lastReadErrorsAt`).
+
+#### Relationship to the health pill (Section 1)
+
+The pill is the headline. The errors page is the detail.
+
+- Pill stays green if errors page has zero recent errors and no warnings older than 1 cycle.
+- Pill goes amber if any warnings in last 24h.
+- Pill goes red if any errors in last 24h, OR if a critical subsystem (position refresh / signal detection) failed in the last 2 cycles.
+
+Clicking the pill should deep-link to the errors page filtered to the relevant subsystem.
 
 ---
 
