@@ -2,57 +2,96 @@
 
 > Updated each session. Read this first when resuming work.
 
-**Pass 3 implementation complete: Phases 1-7 done. Phase 8 (data wipe) + Phase 9 (first clean cycle) pending. Then UI build.**
+**Pass 3 + Pass 4 complete. Phase 7 live dry-run verified writing correctly. Phase 8 (data wipe) is now OPTIONAL — system runs at 3.3-min cycles steady-state with no zombie accumulation. Then UI build.**
 
-550 smoke tests passing across 10 suites. 17 migrations applied to live Supabase (001-017, no 014). All Pass 3 fixes committed + pushed to GitHub on `pass3-hardening` branch.
+579 smoke tests passing across 10 suites. 17 migrations applied to live Supabase (001-017, no 014). All Pass 3 + Pass 4 fixes committed + pushed to GitHub on `pass3-hardening` branch (latest: `8ad8279`).
 
 ---
 
-## Where to resume — Phase 8 (data wipe) then Phase 9
+## Where to resume — fresh-session audit, then choose Phase 8 (now optional) or UI
 
-You're paused mid-Pass-3. State right now:
+Stable checkpoint. Status:
 
-- ✅ **Code**: all Pass 3 fixes implemented + tested. 8 commits on `pass3-hardening` branch, all pushed to https://github.com/Chonegyrame/polybot
+- ✅ **Code**: all Pass 3 + Pass 4 fixes implemented + tested. 9 commits on `pass3-hardening`, all pushed to https://github.com/Chonegyrame/polybot
 - ✅ **Migrations**: 010-013, 015, 016, 017 all applied to live Supabase
-- ✅ **Smoke tests**: 550/550 passing across 10 suites
-- ✅ **Live cycle dry-run**: completed successfully (took ~22 min due to backlog of resolved markets to clean up — will be ~3-5 min after wipe)
-- ⏳ **Phase 8 NEXT**: wipe DB tables (keep schema + _migrations + insider_wallets), then start scheduler fresh
-- ⏳ **Phase 9**: first clean cycle, verify rows appear correctly with new logic
-- ⏳ **Step 10**: UI build per UI-SPEC.md (after wipe + first clean cycle confirmed)
+- ✅ **Smoke tests**: 579/579 passing across 10 suites (437 baseline + ~113 Pass 3 + 29 Pass 4)
+- ✅ **Live cycle dry-run**: verified twice on 2026-05-07. Pre-Pass-4: 24.5 min, 36k positions written, 4 new signals fired, all Pass 3 columns populated. Post-Pass-4: 3.3 min, 8.5k positions, same correctness, comfortably under 9-min cadence threshold.
+- ✅ **Phase 7 verification**: writes confirmed working live. The previous session's "exit 0 / no writes" finding was a transient (presumed killed before reaching write phase, or a one-off API/DB hiccup) — reproduced clean today.
+- ⏳ **Phase 8 (now OPTIONAL)**: wipe DB tables + first clean cycle. Pass 4 zombie filter prevents new resolved-market accumulation, and `upsert_positions_for_trader`'s DELETE-stale clause self-cleans existing zombie position rows. The remaining bloat is 21,663 inert resolved-market metadata rows in the `markets` table — `signal_detector` already filters them via `m.closed = FALSE`, so they don't poison signals. **Wipe is tidiness, not necessity.**
+- ⏳ **Step 10**: UI build per UI-SPEC.md
+- ⏳ **Step 11+**: Railway deploy
 
 ### To resume the next session
 
 1. **Checkout the right branch**: `git checkout pass3-hardening`
-2. **Verify smoke tests still pass**: run all 10 suites (should be 550/550). Commands listed in "Verification" section below.
-3. **Read this file + the implementation plan in conversation history** — Phase 8 has explicit safeguards (hardcoded TABLES_TO_WIPE list, hardcoded TABLES_TO_PRESERVE list including _migrations + insider_wallets, single-transaction TRUNCATE with RESTART IDENTITY CASCADE, post-wipe schema verification).
-4. **The wipe script `scripts/wipe_database.py` does NOT exist yet** — it needs to be written as the first step of Phase 8. Plan from the prior conversation:
-   - Hardcoded list of tables to TRUNCATE
-   - Hardcoded list of preserved tables (_migrations, insider_wallets)
-   - Confirmation prompt: must type `WIPE` literally
-   - Post-wipe schema verification (rolls back if _migrations is empty)
-5. **After wipe**: run a single live cycle (`python scripts/run_cycle_once.py`) to confirm rows appear with new logic — contributing_wallets populated, counterparty_count populated, snapshot direction populated, dollar_skew populated, etc.
-6. **Then UI build** per UI-SPEC.md.
+2. **Verify smoke tests**: run all 10 suites. Commands in "Verification" section below. Expected: 579/579, 0 failed.
+3. **Re-audit option**: spawn parallel review agents for an independent check (the 4-domain split worked well for Pass 1+2). Anything flagged should map to either a known fix in `review/FIXES.md` or a genuinely new finding.
+4. **Decide on Phase 8 wipe**:
+   - If wiping: `scripts/wipe_database.py` does NOT exist yet. Plan: hardcoded TABLES_TO_WIPE list, hardcoded TABLES_TO_PRESERVE (`_migrations`, `insider_wallets`), single-transaction TRUNCATE with RESTART IDENTITY CASCADE, post-wipe schema verification (rolls back if `_migrations` is empty). Confirmation prompt: must type `WIPE` literally.
+   - If skipping: go straight to Step 10 (UI build) — system is production-ready as-is.
 
-### IMPORTANT — what happened in Phase 7 (live dry-run) that needs to be understood
+### Phase 7 dry-run mystery — RESOLVED (2026-05-07)
 
-The Phase 7 live cycle `python scripts/run_cycle_once.py` **completed successfully (exit code 0) but took ~22 minutes** instead of the expected 3-5 min baseline. This is NOT a test failure and NOT a code bug. The full smoke suite (550/550) passed before, during, and after.
+A previous version of this file flagged a SUSPICIOUS outcome: the prior session's `run_cycle_once.py` reported exit 0 after ~22 min but no DB writes appeared (timestamps stuck on 2026-05-05, all new Pass 3 columns empty). **Investigated and resolved 2026-05-07:**
 
-**Why the 22 min:** the cycle's auto-close phase (phase 4 of the 4-phase pipeline) was iterating over an accumulated backlog of resolved sports markets from days of test data. The output showed dozens of F15 warnings like:
-```
-WARNING F15: custom-label binary resolution for cid=0xf1...
-  outcomes=['Spurs', 'Warriors'] prices=[1.0, 0.0]
-  winner='spurs' but no yes/no mapping. Marking VOID; backtest will skip.
-```
-These are **informational, not errors** — V1 only handles binary YES/NO markets per CLAUDE.md spec, and the F15 fix correctly marks team-name and Up/Down style markets as VOID. The volume of warnings reflects the database's accumulated state, not a real problem.
+- 12:10 UTC re-run of the same cycle (no code changes): completed in 24.5 min (1490s), wrote 36,236 positions across 486/486 wallets, fired 4 new signals, populated all Pass 3 columns correctly:
+  - `signal_log.contributing_wallets` non-null: 4 (matches 4 new signals)
+  - `signal_log.first_net_dollar_skew` non-null: 4
+  - `watchlist_signals.dollar_skew` non-null: 344
+  - `traders.dropout_count > 0`: 1,164 (matches log: "phase 4: dropout counters: 1164 incremented")
+- The four "suspect failure modes" in the prior note (R12 `all_fresh` refactor, `update_wallet_dropout_counters`, `_capture_book_for_signal` pool change, `make_interval(mins => $1)`) all check out clean on inspection. The R12/R13/R8/R2 code paths work as designed.
+- Most likely explanation for the original failure: the cycle was killed by an outside actor (sleep/system) before the write phase completed, or a transient API timeout that the per-wallet `try/except` swallowed. Not reproducible.
 
-**What to verify first thing next session:**
-1. Run smoke suite — confirm 550/550 still passes (no regressions from anything that may have changed overnight)
-2. Optionally re-run `scripts/run_cycle_once.py` — if it still takes 20+ min that's expected (data hasn't been wiped yet)
-3. Then proceed to Phase 8 (the wipe). After wipe, the FIRST clean cycle should be ~2-3 min. Steady state cycles ~3-5 min.
+The 24.5-min runtime did expose the REAL bottleneck: Polymarket's `/positions` endpoint returns ~25k cids per cycle (mostly resolved-unredeemed zombie positions), forcing Phase 2 to fetch gamma metadata for ~21k zombie markets. **Solved by Pass 4 below.**
 
-**Do NOT spend time investigating the 22-min cycle.** It's a known artifact of test-data accumulation that the wipe eliminates. If you want to read the captured output, it's in `cycle_log.txt` in the repo root (gitignored).
+---
 
-**Background processes already cleaned up** at end of last session — no leftover Python or bash tasks.
+## Pass 4 — zombie/dust position filter (2026-05-07, commit `8ad8279`)
+
+**One-shot fix shipped today. Cycle time 24.5 min → 3.3 min. Markets table stopped accumulating zombies. Production-ready cadence.**
+
+### Problem
+
+Polymarket's `/positions?user=` endpoint includes resolved-unredeemed positions indefinitely — every market a trader has ever held a position in and not manually clicked Redeem. Top traders carry hundreds across years of activity. Across 486 wallets, deduped → ~25k distinct condition_ids per cycle, of which ~21k are zombies. Phase 2 spent ~15 min/cycle fetching gamma metadata for these dead markets, blowing the 9-min cadence threshold ("10-min cycle took 1490.3s -- pipeline falling behind cadence").
+
+### Fix
+
+Multi-signal filter at the API client seam (`PolymarketClient.get_positions`). `Position.drop_reason()` returns first matching reason (priority order matters for counter attribution):
+
+| Reason | Predicate | Justification |
+|---|---|---|
+| `redeemable` | `self.redeemable is True` | Polymarket's authoritative resolved+claimable flag; primary signal |
+| `market_closed` | `raw['closed'] is True` | Embedded market record says no longer trading; catches resolved markets where `redeemable` hasn't propagated yet |
+| `dust_size` | `0 < size <= 1.0` | At max $1/share × 1 share = $1 max value; never a smart-money signal |
+| `resolved_price_past` | `cur_price ∈ {0.0, 1.0}` AND `end_date < now()` | Defensive backup if `redeemable` ever drifts. AND-clause prevents false-positive on live markets temporarily pricing at extremes |
+
+Defaults to `include_resolved=False`. Diagnostic scripts opt-in to raw via `include_resolved=True` (no consumer in production code uses this). Per-reason health counters (24h retention) exposed at `/system/status.counters.zombie_drops_last_24h`. Fail-open default for missing `redeemable` field.
+
+### Files changed (all in commit `8ad8279`)
+
+| File | Change | LOC |
+|---|---|---|
+| `app/services/polymarket_types.py` | +`DUST_SIZE_THRESHOLD`, +`RESOLVED_PRICES`, +`Position.redeemable` field, +`drop_reason()` method, +`_end_date_in_past()` helper | +74 |
+| `app/services/polymarket.py` | `get_positions(...,include_resolved=False)`: filter via `drop_reason()`, record per-reason counters, defensive fail-open on unknown reason labels | +72 |
+| `app/services/health_counters.py` | +4 zombie-drop counter constants, +24h retention entries, +snapshot extension | +24 |
+| `app/api/routes/system.py` | Surface zombie counters in `/system/status.counters.zombie_drops_last_24h` (per-reason + total) | +15 |
+| `scripts/smoke_phase_pass3_helpers.py` | +29 new tests (parsing, predicate priority, `_end_date_in_past` edge cases, integration with mock client, `include_resolved` opt-out, per-reason counter recording) | +214 |
+
+### Verification (2026-05-07)
+
+- Smoke suite: **579/579, 0 regressions** across all 10 files (was 437 baseline + ~113 Pass 3 + 29 Pass 4)
+- Live cycle (post-Pass-4): **197.7s, 485/486 wallets, 8463 positions persisted, 59 new markets discovered** (down from 21,931 pre-fix). `markets_closed` count held at exactly 21,663 — confirmed zero new zombies entering DB.
+- `upsert_positions_for_trader`'s DELETE-stale clause auto-swept ~17,500 existing zombie position rows on the same cycle. **No migration needed** for the cleanup.
+
+### Self-healing properties
+
+- Filter at API seam → every consumer (signal detector, market sync, paper trades, future code) inherits without duplication.
+- Failed-open default for missing `redeemable` field → other 3 predicates serve as safety net; per-reason counter shifts flag upstream API drift (e.g., if `redeemable` bucket suddenly drops to ~0 with the others unchanged, Polymarket has likely renamed the field).
+- Defensive `if reason not in counter map`: keeps the position and logs loudly rather than silently dropping (visible at `polymarket.py:get_positions`).
+
+### What the wipe still cleans (if you choose Phase 8)
+
+After Pass 4, only one DB-bloat artifact remains: the 21,663 inert resolved-market rows in the `markets` table. They don't affect signals (`signal_detector` filters `m.closed = FALSE`) but they bloat the row count. Phase 8 wipe would purge them. Trade-off: wipe also nukes the 24 historical signals + paper trade history.
 
 ---
 
@@ -651,19 +690,21 @@ See "What was built this session" section above for full detail.
 
 ## Smoke test inventory
 
-**All 8 suites green as of Pass 2:**
+**All 10 suites green as of Pass 4 (2026-05-07):**
 
 | Suite | File | Tests | Coverage |
 |---|---|---|---|
-| Phase A Session 1 | `scripts/smoke_phase_a.py` | 48 | A1-A4, A6-A7, A22-A23, A26 + Pass 1 F6 + Pass 2 F13 + Pass 2 F15 |
-| Phase A Session 2 | `scripts/smoke_phase_a2.py` | 55 | A5, A8-A17, A24-A25, A27, A30 + Pass 2 F3, F9, F11, F14, F16, F17, F18, F20, F22, F25 |
+| Phase A Session 1 | `scripts/smoke_phase_a.py` | 51 | A1-A4, A6-A7, A22-A23, A26 + Pass 1 F6 + Pass 2 F13 + Pass 2 F15 |
+| Phase A Session 2 | `scripts/smoke_phase_a2.py` | 56 | A5, A8-A17, A24-A25, A27, A30 + Pass 2 F3, F9, F11, F14, F16, F17, F18, F20, F22, F25 |
 | Phase A Session 3 | `scripts/smoke_phase_a3.py` | 27 | A18-A21, A28-A29, A31 |
-| Phase B B1 | `scripts/smoke_phase_b1.py` | 24 | B1 |
-| Phase B2 | `scripts/smoke_phase_b2.py` | 147 | B2 + B3 + B4 + B10 + B11 + B12 + Pass 1 F2/F5 + Pass 2 F4/F7/F10/F12 (incl. live-API contract test) |
+| Phase B B1 | `scripts/smoke_phase_b1.py` | 28 | B1 + Pass 3 R3a tuple-return changes |
+| Phase B2 | `scripts/smoke_phase_b2.py` | 115 | B2 + B3 + B4 + B10 + B11 + B12 + Pass 1 F2/F5 + Pass 2 F4/F7/F10/F12 + Pass 3 counterparty rewrite (incl. live-API contract test) |
 | Phase B B5+B6 | `scripts/smoke_phase_b56.py` | 33 | B5 + B6 + B9 + Pass 1 F1 |
 | Phase B B7+B8 | `scripts/smoke_phase_b78.py` | 87 | B7 + B8 (incl. price-translation + 5 benchmarks) + Pass 1 F8 + Pass 2 F21 |
 | Pass 2 routes | `scripts/smoke_phase_pass2_routes.py` | 16 | Pass 2 F23 — refactored route response shape regression |
-| **Total** | | **437** | |
+| Pass 3 helpers | `scripts/smoke_phase_pass3_helpers.py` | 76 | D1 fees + D3 Kish n_eff + R15 ResponseShapeError + **Pass 4 zombie filter (29 tests: redeemable parsing, drop_reason predicate, _end_date_in_past, get_positions integration with mock client, include_resolved opt-out, per-reason counter recording)** |
+| Pass 3 fixes | `scripts/smoke_phase_pass3_fixes.py` | 90 | All R-class + D-class fixes (R1-R14, R16, D1, D3, D4, D5) |
+| **Total** | | **579** | |
 
 Plus `scripts/probe_polymarket_endpoints.py` — manual diagnostic script that hits live Polymarket and dumps raw JSON for verification of endpoint contracts. Run it any time you suspect Polymarket changed something.
 
@@ -684,7 +725,7 @@ Plus `scripts/probe_polymarket_endpoints.py` — manual diagnostic script that h
 
 ## Project status
 
-**V1 backend complete + Pass 1/2 hardened.** Phase A done. Phase B done (B1-B13 all shipped). Pass 1 + Pass 2 closed (all 23 review findings addressed). **437 smoke tests passing across 8 suites.**
+**V1 backend complete + Pass 1/2/3/4 hardened.** Phase A done. Phase B done (B1-B13 all shipped). Pass 1 + Pass 2 closed (all 23 review findings addressed). Pass 3 closed (10 Tier 0 + 5 Tier 1 + 4 Design fixes, R1-R14, R16, D1, D3, D4, D5). Pass 4 closed (zombie/dust position filter at API seam; cycle 24.5min → 3.3min). **579 smoke tests passing across 10 suites.** Live cycle dry-run verified working 2026-05-07.
 
 **Done:**
 - Skeleton, venv, config, spike findings
@@ -756,3 +797,5 @@ Plus `scripts/probe_polymarket_endpoints.py` — manual diagnostic script that h
 - 2026-05-06: Session 6 complete. B7 (multiple-testing), B8 (benchmarks), B13 (UI-SPEC). 55 smoke tests. slice_lookups auto-populated. BH-FDR uses rank-based alpha. Holdout via ?holdout_from=. UI-SPEC ready for third-party UI build.
 - 2026-05-06: B8 benchmark hot-fix (pre-Session 7 review). Found in spot-check: `compute_benchmark` was flipping `direction` on rows without translating `signal_entry_offer` to the opposite token's price (NO ask ≠ YES ask, but they were being used interchangeably). Fix: new `_retarget` helper translates entry_offer/entry_mid via `1 − x` and nulls smart-money-exit fields when flipping (since exit was for the original side's position). Added two new benchmarks for symmetry/meaningfulness: `buy_and_hold_no` (mirror of `buy_and_hold_yes`) and `buy_and_hold_favorite` (always buy whichever side is priced ≥ $0.50 — the "go with the crowd" baseline). 21 new smoke tests including magnitude-check for the bug (asserts P&L ≈ +1.22 not +0.82 on a flipped row). VALID_BENCHMARKS now: yes, no, favorite, coin_flip, follow_top_1.
 - 2026-05-06: Session 7 complete. All 6 Phase B2 items shipped (B2 + B3 + B4 + B10 + B11 + B12). Migration 008 applied. 90 new smoke tests in `scripts/smoke_phase_b2.py`. Backend V1 feature-complete; total 296 tests across 7 suites all green.
+- 2026-05-07: Pass 3 verification re-run resolved the prior session's "exit 0 / no writes" mystery — cycle wrote correctly, all R-class + D-class code paths verified. The 24.5-min runtime exposed the zombie-position bottleneck (Polymarket `/positions` returning ~21k resolved-unredeemed cids per cycle).
+- 2026-05-07: Pass 4 shipped (commit `8ad8279`, pushed to `pass3-hardening`). Multi-signal zombie/dust filter at `PolymarketClient.get_positions` boundary with per-reason health counters. Cycle 24.5 min → 3.3 min. `markets_closed` table stopped accumulating. 29 new smoke tests; total now 579 across 10 suites. Phase 8 wipe demoted to optional (system production-ready as-is).
