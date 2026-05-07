@@ -39,7 +39,11 @@ class Settings:
     alert_email_from: str = _str("ALERT_EMAIL_FROM", "")
 
     log_level: str = _str("LOG_LEVEL", "INFO")
-    rate_limit_per_second: float = _float("RATE_LIMIT_PER_SECOND", 10.0)
+    # Pass 5 R17: lowered from 10.0 → 8.0 to leave 20% headroom for retries.
+    # Combined with the per-host shared bucket (rate_limiter.get_bucket), the
+    # process-wide ceiling stays comfortably under Polymarket's per-IP limit
+    # even when retries fire after a 429.
+    rate_limit_per_second: float = _float("RATE_LIMIT_PER_SECOND", 8.0)
     http_timeout_seconds: float = _float("HTTP_TIMEOUT_SECONDS", 30.0)
 
 

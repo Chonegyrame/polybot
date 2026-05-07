@@ -697,3 +697,65 @@ it and the test that prevents regression.
 - **F25** — extend `signals_health` quiet window from 48h to **72h** before
   flipping to amber. Keeps the cycle-died-because-of-bug signal, kills the
   weekend false alarms.
+
+---
+
+## Pass 5 — rate-limiter consolidation (R17)
+
+### R17 — TokenBucket per `PolymarketClient` instance → module-level per-host registry
+
+- **Status**: fixed
+- **Source**: `review/PASS5_AUDIT.md` finding #15 (Critical)
+- **Files**: `app/services/rate_limiter.py` (full rewrite — registry + lazy
+  lock), `app/services/polymarket.py` (drop `self._limiter`, add
+  `_bucket_for(url)`, replace `wait_exponential` with
+  `_DecorrelatedJitterWait`, honor `Retry-After`), `app/config.py`
+  (default 10.0 → 8.0 to leave 20% headroom for retries),
+  `scripts/smoke_phase_pass5_rate_limiter.py` (44 new tests).
+- **Error**: Each `PolymarketClient.__init__` instantiated a fresh
+  `TokenBucket`. With 12 distinct `async with PolymarketClient()` call
+  sites and APScheduler running concurrent jobs (e.g.
+  `record_signal_price_snapshots` and `refresh_and_log` both on 10-min
+  crons with no cross-job lock), the effective outgoing rate to
+  Polymarket was 2-5× the configured 10/s → cascading 429s → tenacity
+  retries amplified the burn.
+- **Fix**:
+  1. Module-level `_BUCKETS: dict[str, TokenBucket]` registry in
+     `rate_limiter.py`, keyed by hostname. `get_bucket(host, rate)` is
+     first-write-wins, lazy.
+  2. Per-host scoping (data-api / gamma-api / clob get separate
+     buckets) so one slow host doesn't starve callers of another.
+  3. `TokenBucket._lock` is lazy — bound to the event loop on first
+     `acquire()` call, recreated if the loop changes (multi-loop test
+     safety).
+  4. `PolymarketClient._bucket_for(url)` uses the registry by default;
+     a `rate_limit_per_second` constructor arg becomes a per-instance
+     override (private bucket) for tests.
+  5. Replaced `wait_exponential(multiplier=0.5, min=0.5, max=8)` with
+     custom `_DecorrelatedJitterWait` (AWS-recommended formula:
+     `min(cap, uniform(base, prev * 3))`). Tighter p99, desynchronizes
+     concurrent retries hitting the same boundary.
+  6. On 429 with `Retry-After` header (numeric or HTTP-date),
+     `_parse_retry_after` extracts seconds (capped 60s); the value is
+     stashed on the exception and `_DecorrelatedJitterWait` honors it
+     instead of jitter on the next attempt.
+  7. Default `rate_limit_per_second` lowered from 10.0 → 8.0 (env-var
+     overridable) so retries have headroom inside Polymarket's per-IP
+     ceiling.
+- **Test**: `scripts/smoke_phase_pass5_rate_limiter.py` (44 assertions
+  across 11 sections: host_for_url, registry sharing, per-host scoping,
+  reset_buckets, lazy lock binding, pacing integration, multi-loop
+  safety, PolymarketClient registry path, per-instance override path,
+  Retry-After parsing edge cases, jitter formula bounds + Retry-After
+  precedence + code-shape regressions).
+- **Live verification**: `scripts/probe_polymarket_endpoints.py` runs
+  cleanly post-fix — 5 rapid CLOB book calls all 200 OK, no 429s. All
+  10 prior smoke suites continue to pass with no regressions.
+- **Total smoke count**: 579 → 623 (44 new R17 tests).
+- **Production impact**: effective outgoing rate is now bounded at the
+  configured 8 r/s **per host**, regardless of how many
+  `PolymarketClient` instances are alive concurrently. Cron-overlap
+  scenarios that previously drove 2-5× rate amplification are
+  structurally fixed. Retries no longer cascade because the shared
+  bucket is the single chokepoint, and `Retry-After` honoring lets the
+  server's own pacing inform our backoff when present.

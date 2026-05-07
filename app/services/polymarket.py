@@ -6,7 +6,11 @@ retried with exponential backoff. Returns typed objects from polymarket_types.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Literal
 
 import httpx
@@ -14,12 +18,12 @@ from tenacity import (
     AsyncRetrying,
     retry_if_exception,
     stop_after_attempt,
-    wait_exponential,
 )
+from tenacity.wait import wait_base
 
 from app.config import settings
 from app.services import health_counters
-from app.services.rate_limiter import TokenBucket
+from app.services.rate_limiter import TokenBucket, get_bucket, host_for_url
 from app.services.polymarket_types import (
     Event,
     LeaderboardEntry,
@@ -63,6 +67,91 @@ def _should_retry(exc: BaseException) -> bool:
         status = exc.response.status_code
         return status == 429 or status >= 500
     return False
+
+
+# ---------------------------------------------------------------------------
+# Pass 5 R17 — retry/backoff helpers
+# ---------------------------------------------------------------------------
+
+# Cap on Retry-After honoring. Pathological values (e.g. server returning
+# Retry-After: 3600 by mistake) are clamped to this so we don't stall a
+# whole cycle. Polymarket has not been observed sending Retry-After above
+# a few seconds in practice.
+RETRY_AFTER_CAP_SECONDS = 60.0
+
+# Decorrelated jitter parameters (AWS Architecture Blog formula).
+# sleep(n) = min(cap, uniform(base, sleep(n-1) * 3))
+# Better p99 than wait_exponential and desynchronizes retries when many
+# concurrent calls 429 at the same boundary.
+_JITTER_BASE_SECONDS = 0.5
+_JITTER_CAP_SECONDS = 8.0
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a Retry-After header value to seconds.
+
+    Supports both numeric ("5") and HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT")
+    formats per RFC 7231. Returns None on parse failure or non-positive.
+    Capped at RETRY_AFTER_CAP_SECONDS to avoid pathological values stalling
+    a cycle.
+    """
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except ValueError:
+        try:
+            target = parsedate_to_datetime(raw)
+        except (TypeError, ValueError):
+            return None
+        if target is None:
+            return None
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        seconds = (target - datetime.now(timezone.utc)).total_seconds()
+    if seconds <= 0:
+        return None
+    return min(seconds, RETRY_AFTER_CAP_SECONDS)
+
+
+class _DecorrelatedJitterWait(wait_base):
+    """tenacity wait strategy: decorrelated jitter (AWS-recommended).
+
+    For attempt N: sleep = min(cap, uniform(base, prev * 3))
+    where prev defaults to base on the first retry.
+
+    Honors a Retry-After value passed via the exception's `_retry_after`
+    attribute (set in `_get_json` when the server includes that header).
+    The Retry-After path takes precedence — server knows when it'll have
+    capacity, we should listen.
+    """
+
+    def __init__(
+        self,
+        base: float = _JITTER_BASE_SECONDS,
+        cap: float = _JITTER_CAP_SECONDS,
+    ) -> None:
+        self.base = base
+        self.cap = cap
+
+    def __call__(self, retry_state: Any) -> float:
+        # Server-suggested Retry-After takes precedence
+        exc = retry_state.outcome.exception() if retry_state.outcome else None
+        if exc is not None:
+            retry_after = getattr(exc, "_retry_after", None)
+            if retry_after is not None:
+                return float(retry_after)
+        # Fall back to decorrelated jitter
+        prev = (
+            retry_state.idle_for
+            if retry_state.idle_for and retry_state.idle_for > 0
+            else self.base
+        )
+        upper = max(self.base, prev * 3)
+        return min(self.cap, random.uniform(self.base, upper))
 
 
 class ResponseShapeError(Exception):
@@ -162,11 +251,31 @@ class PolymarketClient:
         rate_limit_per_second: float | None = None,
         timeout: float | None = None,
     ) -> None:
-        self._limiter = TokenBucket(
-            rate=rate_limit_per_second or settings.rate_limit_per_second
-        )
+        # Pass 5 R17: bucket lives in the module-level registry keyed by
+        # host so concurrent PolymarketClient instances (12 call sites)
+        # share one ceiling per host. Pre-fix every __init__ created its
+        # own bucket → cron-overlap doubled the configured rate, cascading
+        # into 429s.
+        #
+        # The optional `rate_limit_per_second` arg becomes a per-instance
+        # override (used by tests passing a high value to skip pacing,
+        # e.g. rate=1000). When the override is set, the client uses a
+        # private TokenBucket and bypasses the registry entirely. When not
+        # set (production path), every hit goes through `get_bucket(host)`.
+        self._rate_override: float | None = rate_limit_per_second
+        self._private_buckets: dict[str, TokenBucket] = {}
         self._timeout = timeout or settings.http_timeout_seconds
         self._client: httpx.AsyncClient | None = None
+
+    def _bucket_for(self, url: str) -> TokenBucket:
+        host = host_for_url(url)
+        if self._rate_override is not None:
+            bucket = self._private_buckets.get(host)
+            if bucket is None:
+                bucket = TokenBucket(rate=self._rate_override)
+                self._private_buckets[host] = bucket
+            return bucket
+        return get_bucket(host, settings.rate_limit_per_second)
 
     # ---------- lifecycle ----------
 
@@ -191,7 +300,12 @@ class PolymarketClient:
 
         async for attempt in AsyncRetrying(
             stop=stop_after_attempt(4),
-            wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+            # Pass 5 R17: decorrelated jitter (AWS-recommended) replaces
+            # wait_exponential. Tighter p99 than exponential and
+            # desynchronizes retries when many concurrent calls 429 at the
+            # same boundary. Honors Retry-After when the server provides
+            # it (see _DecorrelatedJitterWait.__call__).
+            wait=_DecorrelatedJitterWait(),
             # F14: only retry transient errors. Pre-fix retried every
             # HTTPStatusError including 4xx (terminal: bad params, 401, 404),
             # burning 4 rate-limit tokens on requests that would never succeed.
@@ -205,7 +319,10 @@ class PolymarketClient:
                 # this outside the retry loop meant a 429-then-retry burst
                 # could push effective request rate well past the limit
                 # (one acquire, four sends), causing cascading 429s.
-                await self._limiter.acquire()
+                # Pass 5 R17: bucket is per-host, shared across all live
+                # PolymarketClient instances via the module-level registry.
+                bucket = self._bucket_for(url)
+                await bucket.acquire()
                 r = await self._client.get(url, params=params)
                 # Treat 5xx and 429 as retryable; bubble 4xx as terminal
                 if r.status_code == 429 or r.status_code >= 500:
@@ -218,7 +335,24 @@ class PolymarketClient:
                         record(RATE_LIMIT_HIT)
                     else:
                         record(API_FAILURE)
-                    r.raise_for_status()
+                    # Pass 5 R17: stash any Retry-After value on the
+                    # exception so _DecorrelatedJitterWait honors it on
+                    # the next attempt's sleep. Server knows when it'll
+                    # have capacity; we shouldn't second-guess.
+                    retry_after = (
+                        _parse_retry_after(r.headers.get("Retry-After"))
+                        if r.status_code == 429 else None
+                    )
+                    try:
+                        r.raise_for_status()
+                    except httpx.HTTPStatusError as e:
+                        if retry_after is not None:
+                            e._retry_after = retry_after  # type: ignore[attr-defined]
+                            log.info(
+                                "Retry-After=%.1fs honored on %s",
+                                retry_after, url,
+                            )
+                        raise
                 if r.status_code >= 400:
                     log.error("client error %d on %s: %s", r.status_code, url, r.text[:200])
                     # D5: terminal 4xx counts as API failure
