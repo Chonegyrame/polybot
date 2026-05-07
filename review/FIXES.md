@@ -1065,3 +1065,37 @@ across hundreds of backtest signals, the bias adds up.
   742, +20 new). #9 fixture inserts two synthetic
   `mode='__pass5_9_engine_test'` signal_log rows referencing a real
   open binary market `condition_id`, then cleans up by mode tag.
+
+### Tier C — item #14 — `markets.closed` and `events.closed` monotonic
+
+- **Status**: fixed (commit 6 of the Pass 5 plan).
+- **Source**: `review/PASS5_AUDIT.md` item #14 (Critical). F18
+  acknowledged the risk but didn't address it.
+- **Files**:
+  - `app/db/crud.py` — `upsert_market` and `upsert_event` ON CONFLICT
+    clauses changed `closed = EXCLUDED.closed` to
+    `closed = (markets.closed OR EXCLUDED.closed)` /
+    `closed = (events.closed OR EXCLUDED.closed)`. Two-line behavior
+    change; surrounding code left intact.
+  - `scripts/smoke_phase_pass5_closed_monotonic.py` — 13 new tests:
+    code-shape regression (both upserts use the OR-merge pattern;
+    bare `EXCLUDED.closed` is gone for the closed column), forward
+    direction (`false → true` legitimate close still works for both
+    markets and events), and the actual fix (re-upserting with
+    `closed=false` after a `closed=true` row exists does NOT flip
+    back). Uses unique synthetic `condition_id` and `event_id`
+    (`__pass5_14_test_event__`) for clean tear-down.
+- **Behavioral change**: a transient gamma response with
+  `closed=false` (stale cache during a reorg, brief blip while
+  resolving disputes) used to flip a closed=true row back to false.
+  signal_detector filters `WHERE m.closed = FALSE`, so this would
+  re-admit a resolved market into the live signal pool until the
+  next sync corrected it. Post-fix the flip is impossible by SQL
+  invariant — once true, stays true.
+- **Reverse-flip risk explicitly accepted**: in the rare case gamma
+  incorrectly flags a still-live market as `closed=true`, the manual
+  recovery is one SQL — `UPDATE markets SET closed = FALSE WHERE
+  condition_id = '...'` (or `events`/`id`). Documented in inline SQL
+  comments at both call sites for operator discoverability.
+- **Live verification**: 17 smoke suites — **775/775 passing** (was
+  762, +13 new).

@@ -345,7 +345,13 @@ async def upsert_event(
             category       = EXCLUDED.category,
             tags           = EXCLUDED.tags,
             end_date       = EXCLUDED.end_date,
-            closed         = EXCLUDED.closed,
+            -- Pass 5 #14: monotonic. Once an event is marked closed,
+            -- a later gamma response with closed=false (transient blip
+            -- during reorg / stale cache) cannot flip it back. The
+            -- reverse-flip risk (truly mis-flagged closed=true) is
+            -- accepted as the rarer failure mode; manual recovery is
+            -- one SQL: UPDATE events SET closed = FALSE WHERE id = '...'.
+            closed         = (events.closed OR EXCLUDED.closed),
             last_synced_at = NOW()
         """,
         event_id,
@@ -389,7 +395,15 @@ async def upsert_market(
             clob_token_no    = EXCLUDED.clob_token_no,
             outcomes         = EXCLUDED.outcomes,
             end_date         = EXCLUDED.end_date,
-            closed           = EXCLUDED.closed,
+            -- Pass 5 #14: monotonic. Once a market is marked closed,
+            -- subsequent gamma blips (closed=false during a reorg /
+            -- stale cache) cannot flip it back. signal_detector
+            -- filters m.closed = FALSE, so a brief flip-back would
+            -- erroneously re-promote a resolved market into the live
+            -- pool. Manual recovery for the rare reverse case
+            -- (gamma incorrectly flagged closed=true): one SQL,
+            -- UPDATE markets SET closed = FALSE WHERE condition_id = '...'.
+            closed           = (markets.closed OR EXCLUDED.closed),
             resolved_outcome = COALESCE(EXCLUDED.resolved_outcome, markets.resolved_outcome),
             last_synced_at   = NOW()
         """,
