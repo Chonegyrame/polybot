@@ -2,26 +2,129 @@
 
 > Updated each session. Read this first when resuming work.
 
-**Phase A + Phase B + Pass 1 + Pass 2 all complete. Backend V1 hardened; UI build is next.**
+**Pass 3 implementation complete: Phases 1-7 done. Phase 8 (data wipe) + Phase 9 (first clean cycle) pending. Then UI build.**
 
-437 smoke tests passing across 8 suites. 9 migrations applied to live Supabase (001-009). All 23 review findings addressed and pinned.
+550 smoke tests passing across 10 suites. 17 migrations applied to live Supabase (001-017, no 014). All Pass 3 fixes committed + pushed to GitHub on `pass3-hardening` branch.
 
 ---
 
-## Where to resume — fresh-session verification + UI build
+## Where to resume — Phase 8 (data wipe) then Phase 9
 
-The user is opening a new session to do an independent verification pass before building the UI. A fresh agent should:
+You're paused mid-Pass-3. State right now:
 
-1. **Read these three files in order** — they tell the whole story:
-   - `session-state.md` (this file) — what was done and how to verify
-   - `review/FIXES.md` — every fix with status, error, code change, test name
-   - `review/PROBE_FINDINGS.md` — the live-API probe that uncovered the CLOB auth issue
+- ✅ **Code**: all Pass 3 fixes implemented + tested. 8 commits on `pass3-hardening` branch, all pushed to https://github.com/Chonegyrame/polybot
+- ✅ **Migrations**: 010-013, 015, 016, 017 all applied to live Supabase
+- ✅ **Smoke tests**: 550/550 passing across 10 suites
+- ✅ **Live cycle dry-run**: completed successfully (took ~22 min due to backlog of resolved markets to clean up — will be ~3-5 min after wipe)
+- ⏳ **Phase 8 NEXT**: wipe DB tables (keep schema + _migrations + insider_wallets), then start scheduler fresh
+- ⏳ **Phase 9**: first clean cycle, verify rows appear correctly with new logic
+- ⏳ **Step 10**: UI build per UI-SPEC.md (after wipe + first clean cycle confirmed)
 
-2. **Run the full smoke suite to confirm everything still passes** (commands in "Verification" section below). Expect **437 passing assertions across 8 files**, zero failures.
+### To resume the next session
 
-3. **Optional independent re-audit**: spawn parallel review agents (4-domain split that found the original 26 issues) — see "How the original audit was structured" below. This is what the user did before Pass 1 + 2 and it worked well. Anything those agents flag now should either map to a known fixed item in FIXES.md (regression: investigate) or be a genuinely new finding (triage).
+1. **Checkout the right branch**: `git checkout pass3-hardening`
+2. **Verify smoke tests still pass**: run all 10 suites (should be 550/550). Commands listed in "Verification" section below.
+3. **Read this file + the implementation plan in conversation history** — Phase 8 has explicit safeguards (hardcoded TABLES_TO_WIPE list, hardcoded TABLES_TO_PRESERVE list including _migrations + insider_wallets, single-transaction TRUNCATE with RESTART IDENTITY CASCADE, post-wipe schema verification).
+4. **The wipe script `scripts/wipe_database.py` does NOT exist yet** — it needs to be written as the first step of Phase 8. Plan from the prior conversation:
+   - Hardcoded list of tables to TRUNCATE
+   - Hardcoded list of preserved tables (_migrations, insider_wallets)
+   - Confirmation prompt: must type `WIPE` literally
+   - Post-wipe schema verification (rolls back if _migrations is empty)
+5. **After wipe**: run a single live cycle (`python scripts/run_cycle_once.py`) to confirm rows appear with new logic — contributing_wallets populated, counterparty_count populated, snapshot direction populated, dollar_skew populated, etc.
+6. **Then UI build** per UI-SPEC.md.
 
-After verification, Step 10 is the UI build per UI-SPEC.md. Step 11 is Railway deploy.
+### IMPORTANT — what happened in Phase 7 (live dry-run) that needs to be understood
+
+The Phase 7 live cycle `python scripts/run_cycle_once.py` **completed successfully (exit code 0) but took ~22 minutes** instead of the expected 3-5 min baseline. This is NOT a test failure and NOT a code bug. The full smoke suite (550/550) passed before, during, and after.
+
+**Why the 22 min:** the cycle's auto-close phase (phase 4 of the 4-phase pipeline) was iterating over an accumulated backlog of resolved sports markets from days of test data. The output showed dozens of F15 warnings like:
+```
+WARNING F15: custom-label binary resolution for cid=0xf1...
+  outcomes=['Spurs', 'Warriors'] prices=[1.0, 0.0]
+  winner='spurs' but no yes/no mapping. Marking VOID; backtest will skip.
+```
+These are **informational, not errors** — V1 only handles binary YES/NO markets per CLAUDE.md spec, and the F15 fix correctly marks team-name and Up/Down style markets as VOID. The volume of warnings reflects the database's accumulated state, not a real problem.
+
+**What to verify first thing next session:**
+1. Run smoke suite — confirm 550/550 still passes (no regressions from anything that may have changed overnight)
+2. Optionally re-run `scripts/run_cycle_once.py` — if it still takes 20+ min that's expected (data hasn't been wiped yet)
+3. Then proceed to Phase 8 (the wipe). After wipe, the FIRST clean cycle should be ~2-3 min. Steady state cycles ~3-5 min.
+
+**Do NOT spend time investigating the 22-min cycle.** It's a known artifact of test-data accumulation that the wipe eliminates. If you want to read the captured output, it's in `cycle_log.txt` in the repo root (gitignored).
+
+**Background processes already cleaned up** at end of last session — no leftover Python or bash tasks.
+
+---
+
+## Pass 3 fixes shipped (this session)
+
+**Schema migrations applied to live Supabase:**
+- 010: relax signal_price_snapshots CHECK to allow offsets 5/15 (R1)
+- 011: signal_log.contributing_wallets TEXT[] for cohort-aware exits (R3b)
+- 012: signal_price_snapshots.direction for direction-side token (R8)
+- 013: signal_exits.event_type ('trim'/'exit') two-tier (R3a)
+- 015: signal_log.first_net_dollar_skew + watchlist_signals.dollar_skew (R2)
+- 016: signal_log.counterparty_count INT (R4+R7)
+- 017: traders.dropout_count INT for R13 grace period
+- (no 014 — gap from initial plan)
+
+**Tier 0 fixes (10):**
+- R1: snapshot offsets 5+15 now actually persist (migration + verification)
+- R2: signal eligibility requires BOTH count-skew AND dollar-skew >= 65%
+- R3a: TRIM/EXIT two-tier exit detector (TRIM = 20-50% drop, EXIT = >=50%)
+- R3b: exit detector recomputes against historical contributing_wallets cohort
+- R3c: removed F18 activity guard; signal monitored as long as market open + cohort still positioned
+- R4 + R7: counterparty rewritten positions-based (not fills); requires >=$5k AND >=75% concentration
+- R5: signal_detector latest_pv requires fetched_at >= NOW() - 1h; jobs always writes PV (even when 0)
+- R6: orderbook.compute_book_metrics rejects crossed/locked books
+- R8: signal_price_snapshots use direction-side token; half_life math direction-aware
+- R9: get_session_slice_lookups dedupes by slice_definition (no Bonferroni inflation from refresh)
+- R10: unified close P&L formula in app/services/paper_trade_close.py used by manual + auto-resolved + smart-money-exit paths
+
+**Tier 1 fixes (5):**
+- R11: Hybrid ranker tiebreaker uses roi_rank (not pnl DESC whale bias)
+- R12: log_signals refactored to release DB conn during HTTP (Phase 1/2 split with all_fresh)
+- R13: 3-cycle (30 min) dropout grace via traders.dropout_count before sweeping positions
+- R14: cleanup_watchlist_promoted_to_signal + upsert_watchlist_signal both scoped to last 24h
+- R16: covered by R3b cohort recompute using 30-min TTL
+
+**Design fixes (3):**
+- D1: app/services/fees.py with correct Polymarket formula (stake × rate × (1-price)) per real per-category rates. Old TAKER_FEES dict (Politics 0%, Crypto 1.8% etc.) deleted; backtest engine + paper trade open + all close paths now use compute_taker_fee_usdc.
+- D3: compute_kish_n_eff used for n_eff in CIs + underpowered flag (was distinct-cluster count, overstated power on heterogeneous clusters)
+- D5: app/services/health_counters.py thread-safe in-memory counters; /system/status exposes rate_limit_hits_last_hour, cycle_duration_warnings_last_24h, api_failures_last_hour
+- D4: edge decay rolling 3-vs-3 with min 20% drop threshold + 6-week minimum history (was recent-3-vs-all-time, 4-week min)
+
+**New foundation helpers:**
+- app/services/fees.py — single source of truth for Polymarket fee math
+- app/services/paper_trade_close.py — unified close formula used by all 3 close paths
+- app/services/health_counters.py — operational counters for /system/status
+- app/services/counterparty.py — fully rewritten positions-based with concentration threshold
+- backtest_engine.compute_kish_n_eff — Kish effective sample size
+
+**New migration files:**
+- migrations/010-013, 015-017 (7 new migrations)
+
+**Smoke test additions:**
+- scripts/smoke_phase_pass3_helpers.py: 47 tests for fees + Kish + ResponseShapeError
+- scripts/smoke_phase_pass3_fixes.py: 90 tests for all R-class + D-class fixes
+- Existing suites updated for breaking changes (b1 _classify_drop tuple return, b2 counterparty rewrite, a2 F18 -> R3c repurpose)
+
+---
+
+## After Pass 3 → before UI build
+
+The Phase 8 wipe + Phase 9 first cycle items are still TODO. The remaining production caveats from Pass 1+2 are now obsolete because the wipe will eliminate all data they apply to.
+
+**Pre-Pass-3 caveats now obsolete (will be cleared by Phase 8 wipe):**
+- Pre-Pass-2 counterparty_warning rows (whole table about to be empty)
+- Pre-F6 markets with inverted outcomes (markets table being wiped + JIT will re-discover with R8 + correct token mapping)
+- Pre-F3 portfolio_value_snapshots biased high (whole table empty)
+- Pre-F4 signal_price_snapshots bid-only (whole table empty)
+- Pre-F21 slice_lookups Gaussian-from-CI p (whole table empty)
+
+After Phase 8, the only production caveat to know about is: cluster-bootstrap CIs assume cluster-of-clusters resampling produces an unbiased mean estimator on heterogeneous cluster sizes. With Kish n_eff (D3) the "underpowered" flag is now honest, so the user will see the warning when applicable.
+
+---
 
 ---
 
