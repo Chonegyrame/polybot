@@ -241,12 +241,15 @@ async def _rank_hybrid(
         )
         SELECT
             ROW_NUMBER() OVER (
-                ORDER BY (pnl_rank + roi_rank) ASC, pnl DESC, proxy_wallet ASC
+                -- R11 (Pass 3): tiebreak on roi_rank (skill) instead of
+                -- pnl DESC (whale bias). Pre-fix re-introduced the
+                -- whale-bias that Hybrid mode exists to dampen.
+                ORDER BY (pnl_rank + roi_rank) ASC, roi_rank ASC, proxy_wallet ASC
             ) AS rank,
             proxy_wallet, user_name, verified_badge, pnl, vol, roi,
             pnl_rank, roi_rank
         FROM ranked
-        ORDER BY (pnl_rank + roi_rank) ASC, pnl DESC, proxy_wallet ASC
+        ORDER BY (pnl_rank + roi_rank) ASC, roi_rank ASC, proxy_wallet ASC
         LIMIT $4
         """,
         snapshot_date,
@@ -487,7 +490,8 @@ async def gather_union_top_n_wallets(
         SELECT category, proxy_wallet,
                ROW_NUMBER() OVER (
                    PARTITION BY category
-                   ORDER BY (pnl_rank + roi_rank) ASC, pnl DESC, proxy_wallet ASC
+                   -- R11 (Pass 3): tiebreak on roi_rank (skill) not pnl
+                   ORDER BY (pnl_rank + roi_rank) ASC, roi_rank ASC, proxy_wallet ASC
                ) AS rn
         FROM hybrid_pool
     ),

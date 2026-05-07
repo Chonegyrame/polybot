@@ -363,21 +363,31 @@ async def refresh_top_trader_positions(
                 positions_dropped_unknown_market,
             )
 
-        # Phase 4: drop-out cleanup. Delete positions for wallets no longer
-        # in the tracked top-N (e.g. dropped from leaderboard since last
-        # cycle). Their old positions would otherwise linger forever and
-        # contribute zombie data to signal aggregation. Only runs if we
-        # actually have a wallet list to compare against (defensive — an
-        # empty list would be interpreted as "delete everything").
+        # Phase 4: drop-out cleanup. R13 (Pass 3): now requires N consecutive
+        # cycles of dropout (default 3 = 30 min grace) before sweeping a
+        # wallet's positions. Pre-fix swept on the first dropout cycle, so a
+        # wallet briefly falling from rank 100 to 105 lost its entire
+        # position history -- which combined with R3b caused false exits.
+        # Now: short rank-jiggling at the top-N edge no longer destroys data.
         if wallets:
             try:
                 async with pool.acquire() as conn:
+                    # Step 4a: maintain dropout counters (reset for re-entrants,
+                    # increment for absentees).
+                    resets, increments = await crud.update_wallet_dropout_counters(
+                        conn, wallets,
+                    )
+                    log.info(
+                        "phase 4: dropout counters: %d reset, %d incremented",
+                        resets, increments,
+                    )
+                    # Step 4b: actually sweep wallets past grace window.
                     dropped = await crud.delete_positions_for_dropped_wallets(
-                        conn, wallets
+                        conn, wallets,
                     )
                 if dropped:
                     log.info(
-                        "phase 4: cleaned up %d position(s) from wallets dropped from top-N",
+                        "phase 4: cleaned up %d position(s) from wallets past R13 grace window",
                         dropped,
                     )
             except Exception as e:  # noqa: BLE001
@@ -444,7 +454,7 @@ class LogSignalsResult:
 
 
 async def _capture_book_for_signal(
-    conn: asyncpg.Connection,
+    pool,  # asyncpg.Pool
     pm: PolymarketClient,
     signal: Signal,
     mode: str,
@@ -454,29 +464,39 @@ async def _capture_book_for_signal(
     """Snapshot the CLOB book for a freshly-inserted signal and persist
     entry-pricing fields. Errors mark the row 'unavailable' so backtest
     knows to skip it; never raises out of this function.
-    """
-    sid = await crud.get_signal_log_id(
-        conn, mode, category, top_n, signal.condition_id, signal.direction
-    )
-    if sid is None:
-        return  # row vanished; nothing to do
 
-    yes_token, no_token = await crud.get_market_clob_tokens(conn, signal.condition_id)
+    R12 (Pass 3): now takes a pool instead of a conn. Acquires conn for
+    DB lookups + writes, releases during the HTTP fetch. Pre-fix held one
+    conn across the entire combo loop including HTTP.
+    """
+    # Step 1: short-lived conn for the lookups
+    async with pool.acquire() as conn:
+        sid = await crud.get_signal_log_id(
+            conn, mode, category, top_n, signal.condition_id, signal.direction
+        )
+        if sid is None:
+            return  # row vanished; nothing to do
+
+        yes_token, no_token = await crud.get_market_clob_tokens(conn, signal.condition_id)
+
     token_id = yes_token if signal.direction == "YES" else no_token
     if not token_id:
-        from app.services.orderbook import BookMetrics
-        await crud.persist_book_snapshot_and_pricing(
-            conn, sid, token_id="", side=signal.direction,
-            metrics=BookMetrics(
-                best_bid=None, best_ask=None, mid=None, spread_bps=None,
-                entry_offer=None, liquidity_5c_usdc=None,
-                liquidity_tier="unknown",
-                bids_top20=[], asks_top20=[], raw_response_hash="",
-                available=False,
-            ),
-        )
+        # Step 2 (no-token branch): write unavailable row in a fresh conn
+        async with pool.acquire() as conn:
+            from app.services.orderbook import BookMetrics
+            await crud.persist_book_snapshot_and_pricing(
+                conn, sid, token_id="", side=signal.direction,
+                metrics=BookMetrics(
+                    best_bid=None, best_ask=None, mid=None, spread_bps=None,
+                    entry_offer=None, liquidity_5c_usdc=None,
+                    liquidity_tier="unknown",
+                    bids_top20=[], asks_top20=[], raw_response_hash="",
+                    available=False,
+                ),
+            )
         return
 
+    # Step 3: HTTP outside any conn
     try:
         book = await pm.get_orderbook(token_id)
     except Exception as e:  # noqa: BLE001
@@ -484,9 +504,12 @@ async def _capture_book_for_signal(
         book = None
 
     metrics = compute_book_metrics(book, signal.direction)
-    await crud.persist_book_snapshot_and_pricing(
-        conn, sid, token_id, signal.direction, metrics
-    )
+
+    # Step 4: short-lived conn for the write
+    async with pool.acquire() as conn:
+        await crud.persist_book_snapshot_and_pricing(
+            conn, sid, token_id, signal.direction, metrics
+        )
 
 
 async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
@@ -514,16 +537,16 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
     watchlist_dropped = 0
     counterparty_warnings = 0
 
+    # R12 (Pass 3): release DB connection between combos + during HTTP.
+    # Pre-fix held ONE conn for the entire 21-combo loop INCLUDING the
+    # per-signal book capture (HTTP). Under Railway/Supabase pool limits
+    # (typical: 15-20 conns) that starves the API for ~5 minutes per cycle.
+    # New pattern: short-lived conn per combo for detection+persistence;
+    # release before HTTP; re-acquire briefly per fresh signal for writes.
+
     async with PolymarketClient() as pm:
+        # Phase 0: tracked_pool collection (short-lived conn)
         async with pool.acquire() as conn:
-            # B2/F9: union of all (mode, category, top_n) wallets — the
-            # "tracked pool" for counterparty check. Pre-fix used the calling
-            # `top_n` (=LOG_SIGNALS_TOP_N=50), inconsistent with position-
-            # refresh and exit-detector both using POSITION_REFRESH_TOP_N=100.
-            # Net: a wallet ranked 51-100 was tracked + could fire exits but
-            # never triggered a counterparty warning. Now uses the broadest
-            # depth so the counterparty check sees every tracked wallet.
-            # Computed once per cycle and reused across every fresh signal.
             try:
                 tracked_pool_list = await gather_union_top_n_wallets(
                     conn, top_n=POSITION_REFRESH_TOP_N,
@@ -534,10 +557,15 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
             except Exception as e:  # noqa: BLE001
                 log.warning("counterparty: failed to gather tracked pool: %s", e)
                 tracked_pool = set()
-            for mode in LOG_SIGNALS_MODES:
-                for category in SNAPSHOT_CATEGORIES:
-                    combos_run += 1
-                    label = f"{mode}/{category}/{top_n}"
+
+        # Phase 1: detection + persistence per combo. Each combo's conn is
+        # short-lived; collected fresh_signals bubble up for Phase 2.
+        all_fresh: list[tuple[str, str, int, Signal]] = []  # (mode, cat, top_n, signal)
+        for mode in LOG_SIGNALS_MODES:
+            for category in SNAPSHOT_CATEGORIES:
+                combos_run += 1
+                label = f"{mode}/{category}/{top_n}"
+                async with pool.acquire() as conn:
                     try:
                         det = await detect_signals_and_watchlist(
                             conn, mode=mode, category=category, top_n=top_n
@@ -552,7 +580,6 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
 
                     if not sigs and not watch:
                         log.info("  %-28s -> 0 signals / 0 watchlist", label)
-                        # Still cleanup any stale watchlist rows for this lens.
                         try:
                             dropped = await crud.cleanup_watchlist_dropouts(
                                 conn, mode=mode, category=category, top_n=top_n,
@@ -563,7 +590,7 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                             log.warning("  watchlist cleanup %s: %s", label, e)
                         continue
 
-                    # Phase A: persist the official signals inside a tight transaction.
+                    # Phase 1a: persist official signals inside a tight tx.
                     fresh_signals: list[Signal] = []
                     if sigs:
                         async with conn.transaction():
@@ -592,7 +619,7 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                                 if inserted:
                                     fresh_signals.append(s)
 
-                    # Phase A': persist watchlist candidates + drop stale ones.
+                    # Phase 1b: persist watchlist + cleanup stale.
                     if watch or sigs:
                         try:
                             for w in watch:
@@ -617,62 +644,61 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                             log.warning("  watchlist persistence %s: %s", label, e)
                             failures.append((f"{label}/watchlist", repr(e)))
 
-                    # Phase B: capture orderbook for fresh OFFICIAL signals (outside tx).
-                    # Watchlist rows do NOT trigger book capture — they're not
-                    # eligible for paper trading or backtest, so an executable
-                    # entry price isn't needed and would just waste API calls.
-                    # B2: also run the counterparty check using the same token_id
-                    # we just used for the book lookup.
-                    for s in fresh_signals:
-                        try:
-                            await _capture_book_for_signal(
-                                conn, pm, s, mode, category, top_n
-                            )
-                            books_captured += 1
-                        except Exception as e:  # noqa: BLE001
-                            log.warning(
-                                "  book capture failed for %s/%s: %s",
-                                s.condition_id[:12], s.direction, e,
-                            )
-                            failures.append(
-                                (f"{label}/book/{s.condition_id[:12]}", repr(e))
-                            )
-
-                        # R4+R7 (Pass 3): positions-based counterparty check.
-                        # Replaces the fills-based F12 path. Non-blocking:
-                        # failures leave counterparty_count = 0 (column default).
-                        # The check now requires opposing-side wallets to hold
-                        # >=$5k AND be >=75% concentrated against -- filters out
-                        # partial profit-takers and hedgers that flooded the
-                        # warning under the old logic.
-                        if tracked_pool:
-                            try:
-                                sid = await crud.get_signal_log_id(
-                                    conn, mode, category, top_n,
-                                    s.condition_id, s.direction,
-                                )
-                                if sid is not None:
-                                    cp_count = await check_and_persist_counterparty_count(
-                                        conn,
-                                        signal_log_id=sid,
-                                        condition_id=s.condition_id,
-                                        signal_direction=s.direction,
-                                        tracked_pool=tracked_pool,
-                                    )
-                                    if cp_count > 0:
-                                        counterparty_warnings += 1
-                            except Exception as e:  # noqa: BLE001
-                                log.warning(
-                                    "  counterparty check failed for %s/%s: %s",
-                                    s.condition_id[:12], s.direction, e,
-                                )
-
                     signals_seen += len(sigs)
                     new_signals += len(fresh_signals)
                     watchlist_seen += len(watch)
                     log.info(
                         "  %-28s -> %d signals (%d new) | %d watchlist",
                         label, len(sigs), len(fresh_signals), len(watch),
+                    )
+
+                    # Defer per-signal book + counterparty to Phase 2 so we
+                    # don't hold this conn across HTTP calls.
+                    for s in fresh_signals:
+                        all_fresh.append((mode, category, top_n, s))
+                # conn released here -- before any HTTP
+
+        # Phase 2: book capture + counterparty per fresh signal. Each
+        # signal: HTTP first (no conn held), then short-lived conn for
+        # writes. Total open conn time per signal: ~50 ms.
+        for fresh_mode, fresh_cat, fresh_topn, s in all_fresh:
+            label = f"{fresh_mode}/{fresh_cat}/{fresh_topn}"
+            try:
+                await _capture_book_for_signal(
+                    pool, pm, s, fresh_mode, fresh_cat, fresh_topn,
+                )
+                books_captured += 1
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "  book capture failed for %s/%s: %s",
+                    s.condition_id[:12], s.direction, e,
+                )
+                failures.append(
+                    (f"{label}/book/{s.condition_id[:12]}", repr(e))
+                )
+
+            # R4+R7 counterparty check (positions-based, DB only -- no HTTP).
+            if tracked_pool:
+                try:
+                    async with pool.acquire() as conn:
+                        sid = await crud.get_signal_log_id(
+                            conn, fresh_mode, fresh_cat, fresh_topn,
+                            s.condition_id, s.direction,
+                        )
+                        if sid is not None:
+                            cp_count = await check_and_persist_counterparty_count(
+                                conn,
+                                signal_log_id=sid,
+                                condition_id=s.condition_id,
+                                signal_direction=s.direction,
+                                tracked_pool=tracked_pool,
+                            )
+                            if cp_count > 0:
+                                counterparty_warnings += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "  counterparty check failed for %s/%s: %s",
+                        s.condition_id[:12], s.direction, e,
                     )
 
     if books_captured:

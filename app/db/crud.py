@@ -158,34 +158,89 @@ async def insert_portfolio_value(
 # ---------------------------------------------------------------------------
 
 
+R13_GRACE_CYCLES = 3
+"""R13 (Pass 3): consecutive dropout cycles before a wallet's positions
+get swept. 3 cycles x 10 min/cycle = 30 min grace period. Catches normal
+rank-jiggling around the top-N edge without losing data on bounce-back."""
+
+
+async def update_wallet_dropout_counters(
+    conn: asyncpg.Connection,
+    current_wallets: list[str],
+) -> tuple[int, int]:
+    """R13 (Pass 3): per-cycle dropout-counter maintenance.
+
+    For every tracked wallet:
+      - if in current pool -> dropout_count = 0 (reset)
+      - if NOT in current pool -> dropout_count += 1
+
+    Returns (resets, increments) for logging.
+    """
+    if not current_wallets:
+        return (0, 0)
+    # Reset for re-entrants
+    res_reset = await conn.execute(
+        """
+        UPDATE traders
+        SET dropout_count = 0
+        WHERE proxy_wallet = ANY($1::TEXT[])
+          AND dropout_count > 0
+        """,
+        current_wallets,
+    )
+    # Increment for absentees
+    res_inc = await conn.execute(
+        """
+        UPDATE traders
+        SET dropout_count = dropout_count + 1
+        WHERE proxy_wallet <> ALL($1::TEXT[])
+        """,
+        current_wallets,
+    )
+    def parse_count(r: str) -> int:
+        parts = r.split()
+        return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+    return (parse_count(res_reset), parse_count(res_inc))
+
+
 async def delete_positions_for_dropped_wallets(
     conn: asyncpg.Connection,
     current_wallets: list[str],
+    grace_cycles: int = R13_GRACE_CYCLES,
 ) -> int:
-    """Delete positions for wallets no longer in the tracked top-N pool.
+    """Delete positions for wallets no longer in the tracked top-N pool
+    AND past the dropout-grace period (R13, Pass 3).
 
-    Without this, a wallet that was in top-N last week but dropped out
-    would keep its old positions in the DB indefinitely (per-wallet upsert
-    only runs for wallets currently being refreshed). Combined with the TTL
-    filter in signal_detector, this is belt-and-suspenders against zombie
-    positions inflating signal aggregates.
+    Pre-fix this swept any wallet not in current_wallets immediately --
+    a one-cycle dip out of top-N caused complete position wipe. Now: only
+    wallets with dropout_count >= grace_cycles get swept (default 3 = 30
+    min grace).
 
     Returns count of rows deleted.
     """
     if not current_wallets:
-        # Empty list — caller probably has a problem; safer to no-op than
+        # Empty list -- caller probably has a problem; safer to no-op than
         # delete every position in the table.
         return 0
     row = await conn.fetchrow(
         """
-        WITH deleted AS (
+        WITH dropped_eligible AS (
+            -- R13: only sweep wallets that have been dropped for at least
+            -- `grace_cycles` consecutive cycles. Wallets without a traders
+            -- row (shouldn't happen but defensive) get swept normally.
+            SELECT t.proxy_wallet
+            FROM traders t
+            WHERE t.proxy_wallet <> ALL($1::TEXT[])
+              AND t.dropout_count >= $2
+        ),
+        deleted AS (
             DELETE FROM positions
-            WHERE proxy_wallet NOT IN (SELECT * FROM unnest($1::TEXT[]))
+            WHERE proxy_wallet IN (SELECT proxy_wallet FROM dropped_eligible)
             RETURNING 1
         )
         SELECT COUNT(*) AS n FROM deleted
         """,
-        current_wallets,
+        current_wallets, grace_cycles,
     )
     return int(row["n"]) if row else 0
 
@@ -1848,6 +1903,11 @@ async def upsert_watchlist_signal(
     Returns True if the row was inserted/updated, False if skipped due to
     an existing official signal.
     """
+    # R14 (Pass 3): scope NOT EXISTS to recent signals only (last 24h),
+    # matching the scope cleanup_watchlist_promoted_to_signal uses. Pre-fix
+    # had asymmetric scopes (unscoped here, recency in cleanup), so a
+    # recurring market with an ancient resolved signal_log row would block
+    # the watchlist insert AND not get cleaned up later.
     result = await conn.execute(
         """
         INSERT INTO watchlist_signals (
@@ -1859,6 +1919,7 @@ async def upsert_watchlist_signal(
         WHERE NOT EXISTS (
             SELECT 1 FROM signal_log
             WHERE condition_id = $4 AND direction = $5
+              AND last_seen_at >= NOW() - INTERVAL '24 hours'
         )
         ON CONFLICT (mode, category, top_n, condition_id, direction) DO UPDATE SET
             trader_count           = EXCLUDED.trader_count,
@@ -1881,10 +1942,20 @@ async def upsert_watchlist_signal(
 async def cleanup_watchlist_promoted_to_signal(
     conn: asyncpg.Connection,
 ) -> int:
-    """F10: Remove any watchlist row whose (condition_id, direction) has
-    since been promoted to an official signal in any lens. Returns count
-    deleted. Run once per cycle after signal-detection writes are done so
-    cross-lens mutual exclusion is enforced.
+    """F10 + R14 (Pass 3): Remove any watchlist row whose (condition_id, direction)
+    has been promoted to an OFFICIAL signal that's still active.
+
+    Pre-fix the EXISTS subquery checked against ALL signal_log rows ever,
+    including months-old resolved markets. For recurring markets (e.g.
+    "will X happen this week" reposted weekly) this silently nuked the
+    fresh watchlist row whenever an old resolved version existed.
+
+    R14: scope to last 24h (signals are considered "active" if last_seen_at
+    refreshed in that window). Anything older is treated as historical and
+    doesn't suppress new watchlist entries.
+
+    Returns count deleted. Run once per cycle after signal-detection writes
+    are done so cross-lens mutual exclusion is enforced.
     """
     result = await conn.execute(
         """
@@ -1893,6 +1964,7 @@ async def cleanup_watchlist_promoted_to_signal(
             SELECT 1 FROM signal_log s
             WHERE s.condition_id = w.condition_id
               AND s.direction = w.direction
+              AND s.last_seen_at >= NOW() - INTERVAL '24 hours'
         )
         """,
     )

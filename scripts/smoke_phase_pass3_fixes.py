@@ -1176,6 +1176,152 @@ asyncio.run(test_r3b_r3c_db())
 
 
 # ---------------------------------------------------------------------------
+# R11 -- Hybrid tiebreaker uses roi_rank instead of pnl DESC
+# ---------------------------------------------------------------------------
+
+section("R11 -- trader_ranker hybrid tiebreaker")
+
+
+def test_r11_source() -> None:
+    src = (ROOT / "app" / "services" / "trader_ranker.py").read_text(encoding="utf-8")
+    # Old: 'ORDER BY (pnl_rank + roi_rank) ASC, pnl DESC, proxy_wallet ASC'
+    # New: 'ORDER BY (pnl_rank + roi_rank) ASC, roi_rank ASC, proxy_wallet ASC'
+    check("R11: hybrid tiebreaker uses roi_rank (not pnl DESC)",
+          "(pnl_rank + roi_rank) ASC, roi_rank ASC" in src
+          and "(pnl_rank + roi_rank) ASC, pnl DESC" not in src,
+          "tiebreaker still uses pnl DESC -- R11 didn't take effect")
+
+
+test_r11_source()
+
+
+# ---------------------------------------------------------------------------
+# R12 -- log_signals releases conn during HTTP
+# ---------------------------------------------------------------------------
+
+section("R12 -- log_signals connection scope")
+
+
+def test_r12_source() -> None:
+    src = (ROOT / "app" / "scheduler" / "jobs.py").read_text(encoding="utf-8")
+    # Marker: _capture_book_for_signal now takes pool, not conn
+    check("R12: _capture_book_for_signal signature takes pool",
+          "async def _capture_book_for_signal(\n    pool," in src,
+          "signature didn't change -- R12 refactor incomplete")
+    check("R12: log_signals uses Phase 1/Phase 2 split with all_fresh",
+          "all_fresh: list[tuple[str, str, int, Signal]]" in src,
+          "Phase 1/2 split missing -- conn still held across HTTP")
+
+
+test_r12_source()
+
+
+# ---------------------------------------------------------------------------
+# R13 -- dropout grace via traders.dropout_count
+# ---------------------------------------------------------------------------
+
+section("R13 -- 3-cycle dropout grace")
+
+
+async def test_r13_db() -> None:
+    from app.db.connection import init_pool, close_pool
+    from app.db import crud
+
+    pool = await init_pool(min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            check("R13: R13_GRACE_CYCLES == 3", crud.R13_GRACE_CYCLES == 3,
+                  f"got {crud.R13_GRACE_CYCLES}")
+
+            # Pick two real traders
+            wallets = await conn.fetch("SELECT proxy_wallet FROM traders LIMIT 2")
+            if len(wallets) < 2:
+                check("R13: skipped (need 2 traders)", True)
+                return
+            w_present = wallets[0]["proxy_wallet"]
+            w_absent = wallets[1]["proxy_wallet"]
+
+            # Snapshot existing dropout_count to restore later
+            existing = await conn.fetch(
+                "SELECT proxy_wallet, dropout_count FROM traders WHERE proxy_wallet = ANY($1::TEXT[])",
+                [w_present, w_absent],
+            )
+
+            # Reset both to 0
+            await conn.execute(
+                "UPDATE traders SET dropout_count = 0 WHERE proxy_wallet = ANY($1::TEXT[])",
+                [w_present, w_absent],
+            )
+
+            # Run counter update with only w_present in current pool.
+            # Expectation: w_present stays 0 (or re-resets), w_absent +1.
+            resets, increments = await crud.update_wallet_dropout_counters(
+                conn, [w_present],
+            )
+            # Note: increments will include EVERY wallet not in the pool, not
+            # just w_absent -- so we can't assert exact count. Just check
+            # w_absent specifically.
+            row = await conn.fetchrow(
+                "SELECT dropout_count FROM traders WHERE proxy_wallet = $1",
+                w_absent,
+            )
+            check("R13: absent wallet's dropout_count incremented to 1",
+                  row["dropout_count"] == 1, f"got {row['dropout_count']}")
+
+            row = await conn.fetchrow(
+                "SELECT dropout_count FROM traders WHERE proxy_wallet = $1",
+                w_present,
+            )
+            check("R13: present wallet's dropout_count stays 0",
+                  row["dropout_count"] == 0, f"got {row['dropout_count']}")
+
+            # Restore originals
+            for er in existing:
+                await conn.execute(
+                    "UPDATE traders SET dropout_count = $1 WHERE proxy_wallet = $2",
+                    er["dropout_count"], er["proxy_wallet"],
+                )
+            # Reset other wallets we incremented (the broad UPDATE)
+            # Just decrement them all by 1 to undo (best-effort cleanup)
+            await conn.execute(
+                """
+                UPDATE traders
+                SET dropout_count = GREATEST(dropout_count - 1, 0)
+                WHERE proxy_wallet <> ALL($1::TEXT[])
+                  AND dropout_count > 0
+                """,
+                [w_present],
+            )
+    finally:
+        await close_pool()
+
+
+asyncio.run(test_r13_db())
+
+
+# ---------------------------------------------------------------------------
+# R14 -- watchlist cleanup scoped to last 24h
+# ---------------------------------------------------------------------------
+
+section("R14 -- cleanup_watchlist_promoted_to_signal scoped to recent")
+
+
+def test_r14_source() -> None:
+    src = (ROOT / "app" / "db" / "crud.py").read_text(encoding="utf-8")
+    # Find the function and check it has the recency clause
+    assert "async def cleanup_watchlist_promoted_to_signal(" in src
+    fn_start = src.index("async def cleanup_watchlist_promoted_to_signal(")
+    fn_end = src.index("\nasync def ", fn_start + 1)
+    fn_body = src[fn_start:fn_end]
+    check("R14: cleanup function scopes EXISTS to last 24h",
+          "s.last_seen_at >= NOW() - INTERVAL '24 hours'" in fn_body,
+          "recency filter missing in cleanup_watchlist_promoted_to_signal")
+
+
+test_r14_source()
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

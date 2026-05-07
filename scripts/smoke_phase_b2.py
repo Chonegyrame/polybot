@@ -295,20 +295,44 @@ async def test_f10_watchlist_skips_when_official_signal_exists() -> None:
 
     See review/FIXES.md F10.
     """
-    section("F10: watchlist mutual exclusion across all lenses")
+    section("F10 + R14: watchlist mutual exclusion (scoped to recent signals)")
     pool = await init_pool()
     async with pool.acquire() as conn:
-        # Find a real (cid, direction) that exists in signal_log so the
-        # NOT-EXISTS check has something to match against.
+        # R14 (Pass 3): the F10 cleanup + upsert NOT EXISTS check are now
+        # scoped to last 24h. Find a real (cid, direction) that's RECENT
+        # (last_seen_at within window). Failing that, bump one for the test.
         official_row = await conn.fetchrow(
-            "SELECT condition_id, direction FROM signal_log "
-            "WHERE direction IN ('YES', 'NO') LIMIT 1"
+            """
+            SELECT condition_id, direction FROM signal_log
+            WHERE direction IN ('YES', 'NO')
+              AND last_seen_at >= NOW() - INTERVAL '24 hours'
+            LIMIT 1
+            """
         )
         if official_row is None:
-            check("(skipped — no signal_log rows to test against)", True)
-            return
-        official_cid = official_row["condition_id"]
-        official_dir = official_row["direction"]
+            # Bump the first signal_log row's last_seen_at to NOW so we have
+            # something to test against. (Test is read-only on production
+            # data otherwise; this is a controlled mutation we restore below.)
+            any_row = await conn.fetchrow(
+                "SELECT id, condition_id, direction, last_seen_at FROM signal_log "
+                "WHERE direction IN ('YES', 'NO') LIMIT 1"
+            )
+            if any_row is None:
+                check("(skipped -- no signal_log rows at all)", True)
+                return
+            await conn.execute(
+                "UPDATE signal_log SET last_seen_at = NOW() WHERE id = $1",
+                any_row["id"],
+            )
+            official_cid = any_row["condition_id"]
+            official_dir = any_row["direction"]
+            _restore_last_seen_id = any_row["id"]
+            _restore_last_seen_at = any_row["last_seen_at"]
+        else:
+            official_cid = official_row["condition_id"]
+            official_dir = official_row["direction"]
+            _restore_last_seen_id = None
+            _restore_last_seen_at = None
 
         test_mode = "smoke_f10_test_mode"
         try:
@@ -401,6 +425,12 @@ async def test_f10_watchlist_skips_when_official_signal_exists() -> None:
             await conn.execute(
                 "DELETE FROM watchlist_signals WHERE mode = $1", test_mode,
             )
+            # R14: restore signal_log.last_seen_at if we bumped it
+            if _restore_last_seen_id is not None:
+                await conn.execute(
+                    "UPDATE signal_log SET last_seen_at = $1 WHERE id = $2",
+                    _restore_last_seen_at, _restore_last_seen_id,
+                )
 
 
 # ===========================================================================
