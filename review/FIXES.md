@@ -989,3 +989,79 @@ it and the test that prevents regression.
   723, +19 new). DB round-trip uses a unique
   `_pass5_8_test_roundtrip` slice_definition tag with cleanup; no
   pollution of real session data.
+
+### Tier B — items #9 + #10 — engine integration (dedup view + exit slippage)
+
+- **Status**: fixed (commit 5 of the Pass 5 plan; bundles two related
+  engine-layer fixes).
+- **Source**: `review/PASS5_AUDIT.md` items #9 (Critical) and
+  #10 (Critical). Bundled because both are engine-layer fixes
+  in `app/services/backtest_engine.py` and the smoke for #9 is the
+  engine-consumer integration test that the migration-only smoke
+  in commit 1 didn't cover.
+
+**#9 — dedup view skips unavailable first-fires**
+
+- The migration (019) was applied in commit 1 (Tier A) and the view
+  is fully fixed structurally. This commit adds the engine-layer
+  integration test that proves `_fetch_signals(dedup=True)` returns
+  the clean row from a (cid, direction) pair where an earlier fire
+  had `signal_entry_source='unavailable'`. Three call paths verified:
+  - `dedup=True`: view filters before DISTINCT ON; engine sees clean.
+  - `dedup=False, include_pre_fix=False`: view irrelevant; the
+    engine's own `WHERE signal_entry_source != 'unavailable'` filter
+    on `signal_log` is load-bearing and drops the unavailable row.
+  - `dedup=False, include_pre_fix=True`: filter disabled; both rows
+    visible.
+- **Engine code change**: none. The redundant
+  `signal_entry_source != 'unavailable'` filter in `_fetch_signals`
+  (`backtest_engine.py:671`) is left in place — it's a no-op on the
+  dedup path but load-bearing on the non-dedup path. Removing it
+  would have complicated the conditional for no real win.
+
+**#10 — symmetric exit-side slippage in compute_pnl_per_dollar_exit**
+
+- `app/services/backtest_engine.py:469-525` (`compute_pnl_per_dollar_exit`)
+  now applies the slippage symmetrically:
+  - `effective_entry = min(0.999, entry_price + slip)` (unchanged)
+  - **`effective_exit = max(0.001, exit_bid_price - slip)` (NEW)**
+  - Revenue is `effective_exit / effective_entry` (was raw
+    `exit_bid_price / effective_entry`).
+  - `exit_fee` runs over `effective_exit` (the price actually
+    received) — was `exit_bid_price` (the displayed bid).
+- The clamp `max(0.001, ...)` prevents division-blowup when the slip
+  exceeds the bid (extreme-illiquidity edge case; tested explicitly).
+- Resolution-path P&L (`compute_pnl_per_dollar`, used when a market
+  has settled at $1/$0) is unaffected — settlement is at fixed $1,
+  not on a book.
+
+**Behavioral change on plan's worked examples (`Politics`, rate=0.04):**
+
+| Scenario | trade | liquidity | entry | exit_bid | Pre-fix P&L | Post-fix P&L | Diff |
+|---|---|---|---|---|---|---|---|
+| Thick book | $100 | $50k | 0.40 | 0.55 | 0.32328 | 0.32104 | -0.00223 |
+| Thin book | $100 | $5k | 0.40 | 0.55 | 0.31689 | 0.30984 | -0.00705 |
+
+The post-fix P&L is always lower than pre-fix (slippage on the way
+out is real cost we weren't counting). On a $100 trade per signal,
+the thick-book bias is ~$0.22; thin-book is ~$0.71. Aggregated
+across hundreds of backtest signals, the bias adds up.
+
+- **Files**:
+  - `app/services/backtest_engine.py` — `compute_pnl_per_dollar_exit`
+    rewritten with `effective_exit` + post-slippage fee curve.
+  - `scripts/smoke_phase_pass5_engine.py` — 20 new tests:
+    code-shape regressions (effective_exit + post-slippage fee
+    used; resolution path doesn't reference effective_exit), the
+    two plan worked examples (thick + thin book; analytical
+    expectations within 1e-6 tolerance; pre/post diff matches plan
+    targets ~0.0022 and ~0.007), invalid-input regressions
+    (entry<=0, entry>=1, exit<=0 → None), the `max(0.001, ...)`
+    clamp on extreme illiquidity, resolution-path determinism, and
+    the #9 engine-consumer integration test (4 sub-checks across
+    view, dedup-path engine, non-dedup-path engine, include_pre_fix
+    restoration).
+- **Live verification**: 16 smoke suites — **762/762 passing** (was
+  742, +20 new). #9 fixture inserts two synthetic
+  `mode='__pass5_9_engine_test'` signal_log rows referencing a real
+  open binary market `condition_id`, then cleans up by mode tag.

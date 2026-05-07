@@ -479,15 +479,28 @@ def compute_pnl_per_dollar_exit(
     R10 + D1 (Pass 3): correct Polymarket fee formula. Per $1 stake:
       shares      = 1 / effective_entry
       entry_fee   = rate x (1 - effective_entry)            [USDC, paid up-front]
-      revenue     = shares x exit_bid_price = exit / entry  [USDC, on sale]
-      exit_fee    = shares x rate x exit x (1 - exit)
-                  = (rate x exit x (1 - exit)) / effective_entry  [USDC]
+      revenue     = shares x effective_exit                 [USDC, on sale]
+      exit_fee    = shares x rate x effective_exit x (1 - effective_exit)
+                  = (rate x effective_exit x (1 - effective_exit)) / effective_entry  [USDC]
       P&L         = revenue - 1 - entry_fee - exit_fee
 
     Pre-fix used `gross x (1 - rate) - 1` -- a flat-percentage-of-payout
     model that's mathematically the wrong shape. It also under-charged
     fees because the placeholder rates (1.2-1.8%) were ~half of real
     Polymarket rates (3-7%).
+
+    Pass 5 #10: symmetric exit-side slippage. Selling shares back into
+    the book pushes the price DOWN by the same impact factor as buying
+    pushes it up. Pre-fix the entry was adjusted (`effective_entry =
+    entry + slip`) but the exit was not (`revenue = exit_bid_price /
+    effective_entry`), so a $100 trade on a $50k-deep book overstated
+    P&L by ~0.0022 per dollar (~0.07pp on a 30%-return signal). The
+    fee curve also runs over the post-slippage exit price now -- the
+    fee is paid on what we actually receive, not the displayed bid.
+
+    Resolution-path P&L (`compute_pnl_per_dollar`) is unaffected: it
+    settles at $1 / $0, not on an order book, so there's no exit-side
+    slippage to apply.
 
     Returns None for invalid inputs.
     """
@@ -504,16 +517,22 @@ def compute_pnl_per_dollar_exit(
     if exit_bid_price is None or exit_bid_price <= 0:
         return None
 
+    # Same slip value applies to both sides -- same trade size, same book
+    # depth, symmetric square-root impact. The plan's pseudocode called
+    # `_slippage_per_dollar` twice with identical arguments; we compute
+    # once and reuse.
     slip = _slippage_per_dollar(
         trade_size_usdc, liquidity_at_signal, median_liquidity_fallback,
     )
     effective_entry = min(0.999, entry_price + slip)
+    effective_exit = max(0.001, exit_bid_price - slip)
     rate = _resolve_rate(category)
 
-    revenue_per_dollar = exit_bid_price / effective_entry
+    revenue_per_dollar = effective_exit / effective_entry
     entry_fee = rate * (1.0 - effective_entry)
-    # exit_bid_price is clamped to (0, 1) above; use it directly for fee curve
-    exit_fee = (rate * exit_bid_price * (1.0 - exit_bid_price)) / effective_entry
+    # Pass 5 #10: fee runs over the post-slippage exit price (the price
+    # we actually received), not the displayed bid.
+    exit_fee = (rate * effective_exit * (1.0 - effective_exit)) / effective_entry
     return revenue_per_dollar - 1.0 - entry_fee - exit_fee
 
 
