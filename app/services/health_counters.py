@@ -29,11 +29,24 @@ RATE_LIMIT_HIT: Final[str] = "rate_limit_hit"
 CYCLE_DURATION_WARNING: Final[str] = "cycle_duration_warning"
 API_FAILURE: Final[str] = "api_failure"
 
+# Zombie/dust drop counters -- per-reason attribution from
+# Position.drop_reason(). 24h retention so the operator can see daily
+# patterns and detect upstream API drift (e.g., if the redeemable bucket
+# suddenly drops to 0 the field has likely been renamed).
+ZOMBIE_DROP_REDEEMABLE: Final[str] = "zombie_drop_redeemable"
+ZOMBIE_DROP_MARKET_CLOSED: Final[str] = "zombie_drop_market_closed"
+ZOMBIE_DROP_DUST_SIZE: Final[str] = "zombie_drop_dust_size"
+ZOMBIE_DROP_RESOLVED_PRICE_PAST: Final[str] = "zombie_drop_resolved_price_past"
+
 # How long to keep each event class. Events older than this get pruned.
 _RETENTION: dict[str, timedelta] = {
     RATE_LIMIT_HIT: timedelta(hours=1),
     CYCLE_DURATION_WARNING: timedelta(hours=24),
     API_FAILURE: timedelta(hours=1),
+    ZOMBIE_DROP_REDEEMABLE: timedelta(hours=24),
+    ZOMBIE_DROP_MARKET_CLOSED: timedelta(hours=24),
+    ZOMBIE_DROP_DUST_SIZE: timedelta(hours=24),
+    ZOMBIE_DROP_RESOLVED_PRICE_PAST: timedelta(hours=24),
 }
 
 
@@ -65,7 +78,16 @@ def snapshot() -> dict[str, int]:
     """Return a dict of {counter_name: count_within_retention_window}."""
     now = datetime.now(timezone.utc)
     out: dict[str, int] = {}
-    for name in (RATE_LIMIT_HIT, CYCLE_DURATION_WARNING, API_FAILURE):
+    counters = (
+        RATE_LIMIT_HIT,
+        CYCLE_DURATION_WARNING,
+        API_FAILURE,
+        ZOMBIE_DROP_REDEEMABLE,
+        ZOMBIE_DROP_MARKET_CLOSED,
+        ZOMBIE_DROP_DUST_SIZE,
+        ZOMBIE_DROP_RESOLVED_PRICE_PAST,
+    )
+    for name in counters:
         retention = _RETENTION.get(name, timedelta(hours=1))
         out[name] = count_since(name, now - retention)
     return out

@@ -45,6 +45,15 @@ def _parse_json_string_list(raw: Any) -> list[Any]:
     return []
 
 
+# ------------------------- Zombie/dust filter constants -------------------------
+# Used by Position.drop_reason() to identify positions that should be discarded
+# at the API boundary instead of being persisted. See drop_reason() for the
+# full multi-signal predicate and per-component justifications.
+
+DUST_SIZE_THRESHOLD = 1.0       # <= 1 share is rounding noise (max $1 value on Polymarket)
+RESOLVED_PRICES = {0.0, 1.0}    # final settlement prices on a binary market
+
+
 # ------------------------- Leaderboard -------------------------
 
 
@@ -108,6 +117,7 @@ class Position:
     slug: str | None
     icon: str | None
     end_date: str | None
+    redeemable: bool = False
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -129,8 +139,72 @@ class Position:
             slug=d.get("slug"),
             icon=d.get("icon"),
             end_date=d.get("endDate"),
+            redeemable=bool(d.get("redeemable", False)),
             raw=d,
         )
+
+    def _end_date_in_past(self) -> bool:
+        if not self.end_date:
+            return False
+        try:
+            ed = datetime.fromisoformat(self.end_date.replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError):
+            return False
+        return ed < datetime.now(timezone.utc)
+
+    def drop_reason(self) -> str | None:
+        """Return None to keep this position, or a string reason to drop it.
+
+        Multi-signal predicate applied at the API boundary
+        (PolymarketClient.get_positions) so zombie/dust positions never reach
+        the markets/positions tables. Order matters: first match wins so the
+        per-reason health counter accurately attributes WHY each row was
+        dropped.
+
+        Reasons:
+          'redeemable'           -- Polymarket flagged this position as
+                                    resolved-and-claimable (the trader can
+                                    click Redeem to convert tokens to USDC).
+                                    Authoritative; the cleanest signal.
+          'market_closed'        -- raw['closed'] is True (the embedded
+                                    market record from /positions says the
+                                    market is no longer open for trading).
+                                    Catches resolved markets where
+                                    'redeemable' hasn't propagated yet, plus
+                                    UMA-disputed markets briefly. If a
+                                    disputed market reopens we re-ingest it
+                                    on the next cycle, so dropping here is
+                                    safe.
+          'dust_size'            -- size <= DUST_SIZE_THRESHOLD (1 share).
+                                    On Polymarket each share pays out at
+                                    most $1, so a 1-share position is at
+                                    most $1 in value -- never a smart-money
+                                    signal. Catches rounding noise and
+                                    leftover after partial sells.
+          'resolved_price_past'  -- cur_price is exactly 0.0 or 1.0 AND the
+                                    market's end_date is in the past. The
+                                    AND-clause prevents false-positive on a
+                                    live market temporarily pricing at an
+                                    extreme; a past-end_date plus a
+                                    settlement price is mathematically
+                                    indistinguishable from a resolved
+                                    zombie. Defensive backup if 'redeemable'
+                                    ever drifts.
+
+        Fail-open default: missing/None redeemable in the API response
+        defaults to False (keep). The other three predicates serve as the
+        safety net. Reasoning: a false negative costs only API budget; a
+        false positive drops a real smart-money signal.
+        """
+        if self.redeemable:
+            return "redeemable"
+        if self.raw and self.raw.get("closed") is True:
+            return "market_closed"
+        if self.size is not None and 0 < self.size <= DUST_SIZE_THRESHOLD:
+            return "dust_size"
+        if self.cur_price in RESOLVED_PRICES and self._end_date_in_past():
+            return "resolved_price_past"
+        return None
 
 
 @dataclass(frozen=True)

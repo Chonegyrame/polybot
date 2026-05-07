@@ -24,9 +24,15 @@ from app.services.fees import (  # noqa: E402
 )
 from app.services.backtest_engine import compute_kish_n_eff  # noqa: E402
 from app.services.polymarket import (  # noqa: E402
+    PolymarketClient,
     ResponseShapeError,
     _safe_list_from_response,
     _safe_list_or_empty,
+)
+from app.services import health_counters  # noqa: E402
+from app.services.polymarket_types import (  # noqa: E402
+    DUST_SIZE_THRESHOLD,
+    Position,
 )
 
 
@@ -245,6 +251,214 @@ check("Silent wrapper returns [] on shape error (no exception)", result == [])
 # Non-list, non-dict -> silent empty
 result = _safe_list_or_empty(None, "test")
 check("Silent wrapper returns [] on None", result == [])
+
+
+# ---------------------------------------------------------------------------
+# Zombie/dust position filter — Position.from_dict + drop_reason()
+# ---------------------------------------------------------------------------
+
+section("Position.from_dict — redeemable parsing")
+
+
+def _position_dict(**overrides):
+    """Minimal valid /positions API row. Override fields as needed."""
+    base = {
+        "proxyWallet": "0xabc",
+        "conditionId": "0xcid_default",
+        "asset": "asset_default",
+        "outcome": "Yes",
+        "size": 100.0,
+        "avgPrice": 0.45,
+        "curPrice": 0.55,
+        "currentValue": 55.0,
+    }
+    base.update(overrides)
+    return base
+
+
+# Parsing — redeemable=True
+p = Position.from_dict(_position_dict(redeemable=True))
+check("from_dict parses redeemable=True", p.redeemable is True)
+
+# Parsing — redeemable=False explicit
+p = Position.from_dict(_position_dict(redeemable=False))
+check("from_dict parses redeemable=False explicit", p.redeemable is False)
+
+# Parsing — redeemable missing -> default False (fail-open)
+p = Position.from_dict(_position_dict())
+check("from_dict redeemable defaults to False when key missing", p.redeemable is False)
+
+# Parsing — redeemable=None -> bool(None) = False
+p = Position.from_dict(_position_dict(redeemable=None))
+check("from_dict redeemable=None coerces to False", p.redeemable is False)
+
+
+section("Position.drop_reason — multi-signal predicate")
+
+# Reason 1: redeemable=True wins (highest priority)
+p = Position.from_dict(_position_dict(redeemable=True, size=100.0, curPrice=0.5))
+check("drop_reason: redeemable=True returns 'redeemable'",
+      p.drop_reason() == "redeemable")
+
+# Reason 2: market_closed via raw['closed']=True
+p = Position.from_dict(_position_dict(closed=True))
+check("drop_reason: raw.closed=True returns 'market_closed'",
+      p.drop_reason() == "market_closed")
+
+# Reason 3: dust_size at exactly the threshold (1.0)
+p = Position.from_dict(_position_dict(size=1.0))
+check("drop_reason: size=1.0 (at threshold) returns 'dust_size'",
+      p.drop_reason() == "dust_size")
+
+# Reason 3: dust_size below threshold (0.5)
+p = Position.from_dict(_position_dict(size=0.5))
+check("drop_reason: size=0.5 (below threshold) returns 'dust_size'",
+      p.drop_reason() == "dust_size")
+
+# Reason 3: just above the threshold -> kept
+p = Position.from_dict(_position_dict(size=1.01))
+check("drop_reason: size=1.01 (just above threshold) returns None (kept)",
+      p.drop_reason() is None)
+
+# Reason 4: extreme price + past end_date -> resolved_price_past
+past_date = "2020-01-01T00:00:00Z"
+p = Position.from_dict(_position_dict(size=100, curPrice=1.0, endDate=past_date))
+check("drop_reason: cur_price=1.0 + past end_date returns 'resolved_price_past'",
+      p.drop_reason() == "resolved_price_past")
+
+# Reason 4: extreme price BUT future end_date -> kept (live market just at extreme)
+future_date = "2099-01-01T00:00:00Z"
+p = Position.from_dict(_position_dict(size=100, curPrice=0.99, endDate=future_date))
+check("drop_reason: cur_price=0.99 + future end_date returns None (live market)",
+      p.drop_reason() is None)
+
+# Reason 4: cur_price at 1.0 + future end_date -> kept (heavy favorite, live)
+p = Position.from_dict(_position_dict(size=100, curPrice=1.0, endDate=future_date))
+check("drop_reason: cur_price=1.0 + future end_date returns None (live extreme)",
+      p.drop_reason() is None)
+
+# Normal live position -> kept
+p = Position.from_dict(_position_dict(size=100, curPrice=0.45))
+check("drop_reason: normal position (size=100, mid-price) returns None",
+      p.drop_reason() is None)
+
+# Priority: redeemable beats every other signal (so the counter attributes correctly)
+p = Position.from_dict(_position_dict(
+    redeemable=True, closed=True, size=0.5, curPrice=1.0, endDate=past_date,
+))
+check("drop_reason: priority order -> redeemable wins over closed+dust+price",
+      p.drop_reason() == "redeemable")
+
+# Priority: market_closed beats dust + price-past (when redeemable False)
+p = Position.from_dict(_position_dict(
+    closed=True, size=0.5, curPrice=1.0, endDate=past_date,
+))
+check("drop_reason: priority order -> market_closed wins over dust + price-past",
+      p.drop_reason() == "market_closed")
+
+
+section("Position._end_date_in_past — date parsing edge cases")
+
+p_past = Position.from_dict(_position_dict(endDate="2020-01-01T00:00:00Z"))
+check("_end_date_in_past: 2020 is past", p_past._end_date_in_past() is True)
+
+p_future = Position.from_dict(_position_dict(endDate="2099-01-01T00:00:00Z"))
+check("_end_date_in_past: 2099 is future", p_future._end_date_in_past() is False)
+
+p_none = Position.from_dict(_position_dict())  # no endDate key -> None
+check("_end_date_in_past: None end_date returns False",
+      p_none._end_date_in_past() is False)
+
+p_malformed = Position.from_dict(_position_dict(endDate="not-a-date"))
+check("_end_date_in_past: malformed string returns False (no crash)",
+      p_malformed._end_date_in_past() is False)
+
+
+# ---------------------------------------------------------------------------
+# get_positions integration: filter applied at the API seam
+# ---------------------------------------------------------------------------
+
+section("PolymarketClient.get_positions — zombie filter at API boundary")
+
+
+class _StubClient(PolymarketClient):
+    """PolymarketClient with _get_json overridden to return canned data.
+
+    Bypasses httpx + rate limiter so we can test the filter logic in
+    isolation. Required: `await client.__aenter__()` is NOT called, so
+    the rate limiter / httpx client never touch the network.
+    """
+
+    def __init__(self, canned_response):
+        super().__init__()
+        self._canned = canned_response
+
+    async def _get_json(self, url, params=None):
+        return self._canned
+
+
+import asyncio  # noqa: E402
+
+# Reset counters so we can assert exact deltas
+health_counters.reset()
+
+# Canned API response: 5 rows, 4 should drop, 1 should survive
+mixed_response = [
+    _position_dict(conditionId="0xc1_redeemable", redeemable=True),
+    _position_dict(conditionId="0xc2_closed", closed=True),
+    _position_dict(conditionId="0xc3_dust", size=0.5),
+    _position_dict(conditionId="0xc4_resolved_price",
+                   curPrice=1.0, endDate="2020-01-01T00:00:00Z"),
+    _position_dict(conditionId="0xc5_live", size=100, curPrice=0.5),
+]
+
+stub = _StubClient(canned_response=mixed_response)
+result = asyncio.run(stub.get_positions("0xabc"))
+
+check("get_positions default filters zombies/dust (5 in -> 1 out)",
+      len(result) == 1, f"got {len(result)} positions")
+check("get_positions: surviving position is the live one",
+      len(result) == 1 and result[0].condition_id == "0xc5_live")
+
+# Counters should reflect 1 of each reason
+snap = health_counters.snapshot()
+check("counter incremented: zombie_drop_redeemable=1",
+      snap["zombie_drop_redeemable"] == 1, f"got {snap['zombie_drop_redeemable']}")
+check("counter incremented: zombie_drop_market_closed=1",
+      snap["zombie_drop_market_closed"] == 1, f"got {snap['zombie_drop_market_closed']}")
+check("counter incremented: zombie_drop_dust_size=1",
+      snap["zombie_drop_dust_size"] == 1, f"got {snap['zombie_drop_dust_size']}")
+check("counter incremented: zombie_drop_resolved_price_past=1",
+      snap["zombie_drop_resolved_price_past"] == 1,
+      f"got {snap['zombie_drop_resolved_price_past']}")
+
+# include_resolved=True bypasses the filter entirely
+health_counters.reset()
+stub = _StubClient(canned_response=mixed_response)
+result_unfiltered = asyncio.run(stub.get_positions("0xabc", include_resolved=True))
+check("get_positions(include_resolved=True) returns ALL rows (5 in -> 5 out)",
+      len(result_unfiltered) == 5)
+
+# include_resolved=True must NOT increment counters (no filter ran)
+snap = health_counters.snapshot()
+total_zombie_drops = (
+    snap["zombie_drop_redeemable"]
+    + snap["zombie_drop_market_closed"]
+    + snap["zombie_drop_dust_size"]
+    + snap["zombie_drop_resolved_price_past"]
+)
+check("include_resolved=True does NOT increment zombie counters",
+      total_zombie_drops == 0, f"got {total_zombie_drops}")
+
+# Empty response -> empty list, no counter increments
+health_counters.reset()
+stub = _StubClient(canned_response=[])
+result_empty = asyncio.run(stub.get_positions("0xabc"))
+check("get_positions on empty response returns []", result_empty == [])
+snap = health_counters.snapshot()
+check("empty response increments no counters",
+      snap["zombie_drop_redeemable"] == 0
+      and snap["zombie_drop_market_closed"] == 0)
 
 
 # ---------------------------------------------------------------------------

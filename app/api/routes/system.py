@@ -158,6 +158,21 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
             "rate_limit_hits_last_hour": counters["rate_limit_hit"],
             "cycle_duration_warnings_last_24h": counters["cycle_duration_warning"],
             "api_failures_last_hour": counters["api_failure"],
+            # Zombie/dust position drops at the API boundary (24h windows).
+            # If `redeemable` suddenly drops to ~0 with the others unchanged,
+            # Polymarket has likely renamed the field -- investigate.
+            "zombie_drops_last_24h": {
+                "redeemable": counters["zombie_drop_redeemable"],
+                "market_closed": counters["zombie_drop_market_closed"],
+                "dust_size": counters["zombie_drop_dust_size"],
+                "resolved_price_past": counters["zombie_drop_resolved_price_past"],
+                "total": (
+                    counters["zombie_drop_redeemable"]
+                    + counters["zombie_drop_market_closed"]
+                    + counters["zombie_drop_dust_size"]
+                    + counters["zombie_drop_resolved_price_past"]
+                ),
+            },
         },
         # Back-compat fields -- earlier UI builds read these flat. Keep until
         # the UI has migrated to `components.*`.

@@ -18,6 +18,7 @@ from tenacity import (
 )
 
 from app.config import settings
+from app.services import health_counters
 from app.services.rate_limiter import TokenBucket
 from app.services.polymarket_types import (
     Event,
@@ -28,6 +29,16 @@ from app.services.polymarket_types import (
     PricePoint,
     Trade,
 )
+
+# Maps Position.drop_reason() string -> health_counters constant.
+# Lookup is exhaustive: any reason returned by drop_reason() must have a
+# counter, otherwise we'd silently lose attribution.
+_ZOMBIE_DROP_COUNTERS: dict[str, str] = {
+    "redeemable": health_counters.ZOMBIE_DROP_REDEEMABLE,
+    "market_closed": health_counters.ZOMBIE_DROP_MARKET_CLOSED,
+    "dust_size": health_counters.ZOMBIE_DROP_DUST_SIZE,
+    "resolved_price_past": health_counters.ZOMBIE_DROP_RESOLVED_PRICE_PAST,
+}
 
 log = logging.getLogger(__name__)
 
@@ -301,11 +312,68 @@ class PolymarketClient:
 
     # ---------- per-user ----------
 
-    async def get_positions(self, proxy_wallet: str, limit: int = 500) -> list[Position]:
+    async def get_positions(
+        self,
+        proxy_wallet: str,
+        limit: int = 500,
+        include_resolved: bool = False,
+    ) -> list[Position]:
+        """Fetch positions for a wallet from data-api.polymarket.com/positions.
+
+        By default (include_resolved=False) drops zombie/dust positions at the
+        API boundary so they never reach downstream consumers (signal
+        detector, market-sync metadata fetch, persistence). See
+        Position.drop_reason() for the multi-signal predicate.
+
+        Why filter here: this module is the single seam through which all
+        Polymarket calls flow (project rule). Filtering at the seam means
+        every consumer (refresh job, diagnostic scripts, future paper-trade
+        sync) inherits the filter without duplicating logic, and the 25k
+        condition_ids per cycle drops to ~3-5k -- collapsing Phase 2's
+        market-metadata fetch from ~15min to ~30sec.
+
+        Set include_resolved=True for diagnostic scripts that legitimately
+        need the raw API response unfiltered (e.g., scripts that audit
+        zombie accumulation per wallet). Production code should leave the
+        default.
+        """
         url = f"{settings.data_api_base}/positions"
         data = await self._get_json(url, params={"user": proxy_wallet, "limit": limit})
         items = _safe_list_or_empty(data, "data-api/positions")
-        return [Position.from_dict(d) for d in items]
+        parsed = [Position.from_dict(d) for d in items]
+
+        if include_resolved:
+            return parsed
+
+        kept: list[Position] = []
+        dropped_by_reason: dict[str, int] = {}
+        for p in parsed:
+            reason = p.drop_reason()
+            if reason is None:
+                kept.append(p)
+                continue
+            counter = _ZOMBIE_DROP_COUNTERS.get(reason)
+            if counter is None:
+                # Defensive: drop_reason() returned a label we don't have a
+                # counter for. Keep the position rather than lose it silently
+                # and log loudly so the operator sees the mismatch.
+                log.warning(
+                    "zombie filter: unknown drop_reason=%r for wallet=%s cid=%s "
+                    "-- KEEPING the position (fail-open)",
+                    reason, proxy_wallet[:12], p.condition_id[:12],
+                )
+                kept.append(p)
+                continue
+            health_counters.record(counter)
+            dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + 1
+
+        if dropped_by_reason:
+            log.debug(
+                "positions filter: wallet=%s kept=%d dropped=%d (%s)",
+                proxy_wallet[:12], len(kept), sum(dropped_by_reason.values()),
+                ", ".join(f"{k}={v}" for k, v in sorted(dropped_by_reason.items())),
+            )
+        return kept
 
     async def get_trades(
         self, proxy_wallet: str, limit: int = 500, offset: int = 0
