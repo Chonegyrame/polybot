@@ -230,12 +230,17 @@ async def get_summary(
         # rows fell back to the optimistic baseline (signals predate F7
         # snapshot offsets, or pool is too thin at the chosen profile's
         # window).
+        # Pass 5 #12: surface n_adjusted + n_fallback explicitly so the UI
+        # can display "X of Y rows fell back to fire-time pricing". Also
+        # use the lowered threshold (0.20) for `latency_unavailable` --
+        # `latency_unavailable` itself reads `LATENCY_FALLBACK_WARN_FRACTION`.
+        n_adj = latency_stats.get("adjusted", 0)
+        n_fb = latency_stats.get("fallback", 0)
         latency_stats = {
             **latency_stats,
-            "latency_unavailable": latency_unavailable(
-                latency_stats.get("adjusted", 0),
-                latency_stats.get("fallback", 0),
-            ),
+            "n_adjusted": n_adj,
+            "n_fallback": n_fb,
+            "latency_unavailable": latency_unavailable(n_adj, n_fb),
         }
         resp["latency_stats"] = latency_stats
 

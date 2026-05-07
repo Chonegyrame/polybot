@@ -961,7 +961,9 @@ def test_r3a_pure() -> None:
         _classify_drop, TRIM_THRESHOLD, EXIT_THRESHOLD,
     )
 
-    check("R3a: TRIM_THRESHOLD == 0.20", TRIM_THRESHOLD == 0.20,
+    # Pass 5 #4 raised TRIM_THRESHOLD 0.20 -> 0.25 (one-wallet noise
+    # buffer at the n=5 cohort floor).
+    check("R3a + Pass 5 #4: TRIM_THRESHOLD == 0.25", TRIM_THRESHOLD == 0.25,
           f"got {TRIM_THRESHOLD}")
     check("R3a: EXIT_THRESHOLD == 0.50", EXIT_THRESHOLD == 0.50,
           f"got {EXIT_THRESHOLD}")
@@ -969,6 +971,16 @@ def test_r3a_pure() -> None:
     # Returns tuple now
     res = _classify_drop(7, 10, 100_000, 100_000)  # 30% trader drop
     check("R3a: 30% trader drop returns trim tier",
+          res == ("trader_count", "trim"), f"got {res}")
+
+    # Pass 5 #4: 20% drop is now BELOW threshold (was: TRIM fired pre-fix)
+    res = _classify_drop(8, 10, 100_000, 100_000)  # 20% trader drop
+    check("R3a + Pass 5 #4: 20% trader drop returns None (below 25% threshold)",
+          res is None, f"got {res}")
+
+    # 25% drop boundary: hits threshold (>= comparison)
+    res = _classify_drop(75, 100, 100_000, 100_000)  # exactly 25%
+    check("R3a + Pass 5 #4: exactly 25% trader drop hits trim threshold",
           res == ("trader_count", "trim"), f"got {res}")
 
     res = _classify_drop(4, 10, 100_000, 100_000)  # 60% trader drop
@@ -1101,9 +1113,13 @@ async def test_r3b_r3c_db() -> None:
                 cid, cohort,
             )
 
-            # SCENARIO B: 7 of 8 still hold YES at $9k each = 7 traders, $63k
-            # Drop: 8->7 = 12.5% (below TRIM), $80k->$63k = 21% (TRIM threshold)
+            # SCENARIO B: 7 of 8 still hold YES at $7.5k each = 7 traders, $52.5k
+            # Drop: 8->7 = 12.5% (below TRIM), $80k->$52.5k = 34% (TRIM threshold)
             # Expected: TRIM event
+            # Pass 5 #4: TRIM_THRESHOLD raised to 0.25 -- pre-Pass-5 this
+            # scenario used $63k current (21% drop) which now sits below
+            # the new threshold. Lowered per-wallet value to $7.5k so the
+            # aggregate drop clears the new floor.
             sid2 = await conn.fetchval(
                 """
                 INSERT INTO signal_log
@@ -1129,14 +1145,14 @@ async def test_r3b_r3c_db() -> None:
                       (proxy_wallet, condition_id, asset, outcome, size,
                        cur_price, current_value, avg_price, first_seen_at,
                        last_updated_at)
-                    VALUES ($1, $2, 'TEST_TOKEN', 'Yes', 18000, 0.50, 9000.0, 0.40,
+                    VALUES ($1, $2, 'TEST_TOKEN', 'Yes', 15000, 0.50, 7500.0, 0.40,
                             NOW(), NOW())
                     """,
                     w, cid,
                 )
             events = await detect_exits(conn)
             our_events = [e for e in events if e.signal_log_id == sid2]
-            check("R3a: 21% drop fires TRIM event (not EXIT, not None)",
+            check("R3a + Pass 5 #4: 34% aggregate drop fires TRIM event",
                   len(our_events) == 1
                   and our_events[0].event_type == "trim",
                   f"events={[(e.event_type, e.drop_reason) for e in our_events]}")
@@ -1368,9 +1384,12 @@ def test_d3_kish_in_summarize() -> None:
     check("D3: underpowered=True (was False with old method)",
           result.underpowered,
           f"got underpowered={result.underpowered}")
-    # Sanity check: Kish n_eff for 1 cluster of 200 + 50 singletons is ~1.56
-    check("D3: n_eff ~1.56 (Kish formula on Trump example)",
-          abs(result.n_eff - 1.56) < 0.05,
+    # Pass 5 #11: NULL cluster_ids collapse to one shared cluster.
+    # Sizes [200, 50] (was [200, 1, 1, ..., 1] pre-fix). n_eff = 250^2 /
+    # (200^2 + 50^2) = 62500 / 42500 = 1.4706. Pre-fix this was 1.56
+    # (one cluster of 200 + 50 singleton _solo_{i} clusters).
+    check("D3 + Pass 5 #11: n_eff ~1.47 (NULL cluster collapse)",
+          abs(result.n_eff - 1.4706) < 0.01,
           f"got {result.n_eff:.4f}")
 
     # Balanced case: 50 clusters of 5 each. Kish n_eff = 250^2 / (50*25) = 50.

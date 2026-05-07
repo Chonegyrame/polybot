@@ -71,7 +71,12 @@ LATENCY_OFFSET_TOLERANCE_MIN = 5.0  # ±tolerance for "matches a canonical offse
 # F7: when fallback rate exceeds this fraction, the response carries
 # latency_unavailable=True so the UI can warn "this profile has insufficient
 # snapshot coverage" rather than silently showing un-adjusted numbers.
-LATENCY_FALLBACK_WARN_FRACTION = 0.5
+LATENCY_FALLBACK_WARN_FRACTION = 0.20  # Pass 5 #12: lowered 0.50 -> 0.20.
+# At 50% the warning only triggered when fallback DOMINATED, missing the
+# "this profile is mostly honored but not really" middle ground. 20% is
+# the right sensitivity: a backtest where 1 in 5 rows fell back to the
+# optimistic baseline already isn't honoring the chosen profile faithfully
+# enough to trust the headline P&L number.
 SLIPPAGE_K = 0.02   # square-root impact coefficient; calibrate empirically
 
 # Pass 3 / D1: per-category taker fees moved to app.services.fees with
@@ -349,13 +354,21 @@ def compute_kish_n_eff(cluster_keys: list[str | None]) -> float:
       - Single big cluster of n → n_eff = 1
       - Mixed → between the two
 
-    None keys are treated as singleton clusters (one per observation).
+    Pass 5 #11: NULL cluster_id observations are treated as ONE shared
+    cluster (worst-case correlation), not distinct singletons. Pre-fix
+    every NULL became `_solo_{i}` -- each was its own cluster of size 1
+    so 30 NULLs gave n_eff = 30, claiming "fully independent." NULL
+    cluster_id usually means gamma's event_id was missing at sync time
+    (uncategorized event); those rows are likely correlated, not
+    independent. Conservative collapse to one shared cluster prevents
+    overstating power on data we couldn't confidently categorize.
     """
     if not cluster_keys:
         return 0.0
     by_cluster: dict[str, int] = {}
-    for i, k in enumerate(cluster_keys):
-        key = k if k is not None else f"_solo_{i}"
+    for k in cluster_keys:
+        # Pass 5 #11: __null__ collapses all None keys to one shared cluster.
+        key = k if k is not None else "__null__"
         by_cluster[key] = by_cluster.get(key, 0) + 1
     sizes = list(by_cluster.values())
     total = sum(sizes)
@@ -406,8 +419,12 @@ def cluster_bootstrap_mean_with_p(
         return (0.0, 0.0, 0.0, 1.0)
 
     by_cluster: dict[str, list[float]] = {}
-    for i, (v, k) in enumerate(zip(values, cluster_keys)):
-        key = k if k is not None else f"_solo_{i}"
+    for v, k in zip(values, cluster_keys):
+        # Pass 5 #11: align with compute_kish_n_eff. NULL keys collapse to
+        # one shared cluster so the bootstrap resampling pulls all
+        # uncategorized rows together (correlated assumption) instead of
+        # treating each as independent.
+        key = k if k is not None else "__null__"
         by_cluster.setdefault(key, []).append(v)
 
     keys = list(by_cluster.keys())
@@ -421,9 +438,24 @@ def cluster_bootstrap_mean_with_p(
             estimates.append(sum(sample) / len(sample))
 
     estimates.sort()
-    point = sum(values) / len(values)
-    lo = estimates[int(0.025 * n_iter)]
-    hi = estimates[int(0.975 * n_iter)]
+    # Pass 5 #13: point estimate is now the median of the bootstrap
+    # distribution, not `sum(values)/len(values)` (count-weighted unweighted
+    # mean). The displayed point now lives at the natural center of the
+    # cluster-weighted percentile CI -- pre-fix the headline number disagreed
+    # with its own confidence interval on cluster-correlated data because
+    # `sum/len` ignored the cluster weighting that the CI used. The median
+    # of the resampled distribution is robust and matches the symmetric
+    # percentile CI center.
+    if not estimates:
+        # Defensive: if every bootstrap sample was empty (shouldn't happen
+        # with at least one cluster), fall back to the unweighted mean.
+        point = sum(values) / len(values)
+        lo = 0.0
+        hi = 0.0
+    else:
+        point = estimates[len(estimates) // 2]
+        lo = estimates[int(0.025 * n_iter)]
+        hi = estimates[int(0.975 * n_iter)]
 
     # F21: empirical two-sided p vs H0: mean = 0. Fraction of resamples
     # at or below 0; p_two_sided = 2 × min(p_below, 1 - p_below) clamped
@@ -843,14 +875,25 @@ def summarize_rows(
     # win indicators with the same cluster_keys gives a CI that reflects
     # between-cluster variability honestly.
     win_indicators = [1.0 if p > 0 else 0.0 for _, p in pnl_pairs]
-    _wr_point, wr_lo_raw, wr_hi_raw = cluster_bootstrap_mean(
+    wr_point_raw, wr_lo_raw, wr_hi_raw = cluster_bootstrap_mean(
         win_indicators, cluster_keys,
     )
-    wr = wins / len(pnl_pairs)  # exact rate; bootstrap point is approx the same
-    # Bootstrap quantiles can drift fractionally outside [0, 1] with skewed
-    # cluster sizes; clamp.
+    # Pass 5 #13: align win-rate point estimate with the cluster-weighted
+    # CI. Pre-fix `wr = wins / len(pnl_pairs)` was count-weighted (every
+    # row contributing equally) while the CI bootstrapped clusters. On a
+    # 70-row cluster of 50% winners + 30 singletons of 80% winners the
+    # count-weighted point was ~0.59 while the cluster-weighted CI center
+    # was ~0.65 -- the displayed number didn't match its own interval.
+    # Now: use the bootstrap median (the point estimate from
+    # cluster_bootstrap_mean is now bootstrap-derived per Pass 5 #13's
+    # change to cluster_bootstrap_mean_with_p). Clamp to [0, 1] because
+    # the bootstrap of a binary indicator can drift fractionally outside.
+    wr = max(0.0, min(1.0, wr_point_raw))
     wr_lo = max(0.0, wr_lo_raw)
     wr_hi = min(1.0, wr_hi_raw)
+    # `wins` is computed above (exact count); kept for compatibility with
+    # any downstream profile-factor / drawdown logic that may want it.
+    _ = wins
 
     gross_wins = sum(p for p in values if p > 0)
     gross_losses = -sum(p for p in values if p < 0)

@@ -179,13 +179,15 @@ for c in range(50):
 neff = compute_kish_n_eff(keys_balanced)
 check("50 balanced clusters of 5 -> n_eff = 50", abs(neff - 50.0) < 0.01, f"got {neff:.2f}")
 
-# None keys count as singletons (one per observation, distinct)
+# Pass 5 #11: None keys collapse to ONE shared cluster (worst-case
+# correlation), not distinct singletons. Pre-fix gave n_eff = 25/7 ~ 3.57
+# (3 singletons + 1 cluster of 2). Post-fix: 1 shared NULL cluster of 3
+# + 1 cluster of 2 -> sizes [3, 2], total=5, sum_sq=9+4=13, n_eff = 25/13.
 keys_with_none = [None, None, None, "A", "A"]
 neff = compute_kish_n_eff(keys_with_none)
-# 5 distinct (3 singletons + 1 cluster of 2): sizes [1,1,1,2], n=5, sum_sq=1+1+1+4=7
-# n_eff = 25/7 ~ 3.57
-expected = 25.0 / 7
-check("None keys treated as singletons", abs(neff - expected) < 0.01,
+expected = 25.0 / 13.0
+check("None keys collapse to one shared cluster (Pass 5 #11)",
+      abs(neff - expected) < 0.01,
       f"got {neff:.4f} expected {expected:.4f}")
 
 # Empty input

@@ -53,8 +53,14 @@ log = logging.getLogger(__name__)
 EXIT_WINDOW_HOURS = 24
 
 # R3a thresholds. TRIM applies on either metric in [TRIM_THRESHOLD, EXIT_THRESHOLD).
+# Pass 5 #4: raised 0.20 -> 0.25 to leave a one-wallet noise buffer at n=5
+# (the cohort floor for an official signal). Pre-fix a 5-wallet cohort
+# would fire TRIM on a single wallet aging past the 30-min TTL during a
+# transient API blip -- a 20% drop on trader_count looked like
+# "smart money trimming" but no real exit had happened. 25% requires
+# at least 2 of 5 wallets to actually go flat before TRIM fires.
 # EXIT applies on either metric >= EXIT_THRESHOLD.
-TRIM_THRESHOLD = 0.20
+TRIM_THRESHOLD = 0.25
 EXIT_THRESHOLD = 0.50
 
 DropReason = Literal["trader_count", "aggregate", "both"]

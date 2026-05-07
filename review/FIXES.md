@@ -1236,3 +1236,91 @@ across hundreds of backtest signals, the bias adds up.
   let the metadata go cold get dropped.
 - **Live verification**: 19 smoke suites — **831/831 passing** (was
   811, +20 new).
+
+### Tier D — items #4 + #11 + #12 + #13 — math correctness bundle
+
+- **Status**: fixed (commit 9 of the Pass 5 plan; bundles four small
+  independent math/correctness fixes per the plan's commit grouping).
+
+**#4 — `TRIM_THRESHOLD` raised 0.20 → 0.25**
+
+- `app/services/exit_detector.py` — one-line constant change. At the
+  n=5 cohort floor (the minimum for an official signal), losing one
+  wallet to a transient API blip is a 20% drop on `trader_count`,
+  pre-fix firing a TRIM event with no real exit. The 25% threshold
+  needs at least 2 of 5 wallets to actually go flat before TRIM
+  fires. Updated existing R3a test in `smoke_phase_pass3_fixes.py`
+  (the 21% scenario was rewritten to a 34% scenario so it still
+  exercises TRIM behavior post-fix).
+
+**#11 — NULL `cluster_id` collapses to one shared cluster**
+
+- `app/services/backtest_engine.py:compute_kish_n_eff` — replaced
+  `key = k if k is not None else f"_solo_{i}"` with
+  `key = k if k is not None else "__null__"`. NULL `cluster_id`
+  observations no longer get distinct singleton clusters; they all
+  collapse into one shared cluster (worst-case correlation). On a
+  scenario of 70 cluster-A rows + 30 NULL rows, n_eff drops from
+  ~2.03 to ~1.72 — the conservative direction (we don't claim power
+  we can't justify).
+- Same change applied to `cluster_bootstrap_mean_with_p` so the
+  resampling pulls all NULL-keyed rows together (correlated
+  assumption).
+- Updated existing assertions in `smoke_phase_pass3_helpers.py` and
+  `smoke_phase_pass3_fixes.py` (both had hard-coded the old value).
+
+**#12 — Lower latency-fallback warning threshold + expose counts**
+
+- `app/services/backtest_engine.py:LATENCY_FALLBACK_WARN_FRACTION`
+  lowered 0.50 → 0.20. Pre-fix the warning only triggered when
+  fallback DOMINATED; now it fires when 1-in-5 rows fell back, which
+  is the right sensitivity for an "honored vs. mostly-honored"
+  signal.
+- `app/api/routes/backtest.py:get_summary` — `latency_stats` payload
+  now exposes `n_adjusted` and `n_fallback` explicitly alongside the
+  existing `adjusted` / `fallback` fields (back-compat). UI can show
+  "X of Y rows fell back to fire-time pricing."
+
+**#13 — Win-rate / mean point estimate uses bootstrap median**
+
+- `app/services/backtest_engine.py:cluster_bootstrap_mean_with_p` —
+  the returned `point` is now `estimates[len(estimates) // 2]`
+  (median of the cluster-resampled distribution) instead of
+  `sum(values) / len(values)` (count-weighted unweighted mean).
+  The displayed point now lives at the natural center of the
+  cluster-weighted percentile CI; pre-fix the headline disagreed
+  with its own confidence interval on cluster-correlated data.
+- `app/services/backtest_engine.py:summarize_rows` — `wr` is now
+  `max(0.0, min(1.0, wr_point_raw))` where `wr_point_raw` is the
+  bootstrap point from `cluster_bootstrap_mean`. Was: `wins /
+  len(pnl_pairs)` (count-weighted exact rate).
+- Honest call-out: the audit's quantitative claim ("wr ~0.59 →
+  ~0.65 on the synthetic scenario") overstated the magnitude. The
+  bootstrap of mean-by-cluster is unbiased for the population mean
+  in expectation, so for typical mixed scenarios the shift is
+  smaller than the audit predicted (~0.01 on the 70-cluster + 30-
+  singleton scenario, not ~0.06). The structural fix is correct
+  (point now aligns with CI weighting); the magnitude effect is
+  modest.
+
+**Tests**:
+
+- `scripts/smoke_phase_pass5_math_correctness.py` — 29 new tests:
+  - #4: TRIM_THRESHOLD constant value, boundary cases on
+    `_classify_drop` (5→4 wallet 20% no longer fires; 5→3 wallet
+    40% still fires; exact 25% boundary fires; 24% does not).
+  - #11: 30 NULLs → n_eff = 1.0; 70+30 mixed → n_eff ~= 1.72;
+    pure non-null unchanged; bootstrap source uses `__null__` (not
+    `_solo_`); behavioral check that 30 NULL keys with constant
+    value give a degenerate CI (one shared cluster).
+  - #12: constant value 0.20; 25/100 fallback fires; 19/100 does
+    not; exact 20% does not (strict > comparison); 21% fires;
+    `n_adjusted` and `n_fallback` present in route source.
+  - #13: bootstrap median used in source; pure singletons give
+    point ~ unweighted mean; cluster-correlated point falls within
+    [0.45, 0.85]; deterministic per seed; `summarize_rows` has
+    exactly one live `wr = ...` assignment, the bootstrap-clamped
+    one.
+- All 20 smoke suites pass: **862/862** (was 831, +31 new — 29 new
+  in the bundle file plus 2 added to existing pass3_fixes for the
+  #4 + #11 boundary updates).
