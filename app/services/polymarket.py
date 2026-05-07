@@ -54,28 +54,53 @@ def _should_retry(exc: BaseException) -> bool:
     return False
 
 
+class ResponseShapeError(Exception):
+    """R15 (Pass 3): API returned a parseable JSON body but not in the
+    expected list/wrapped-list shape. Distinct from "real empty result."
+
+    Pre-fix `_safe_list_from_response` returned `[]` for both:
+      - "API legitimately returned an empty list" (end of pagination)
+      - "API returned a dict because of an error/overload, couldn't unwrap"
+
+    Paginators (e.g. `get_leaderboard`) need to distinguish these — silent
+    `break` on the second case caused leaderboard truncation when
+    Polymarket had a hiccup. Now the helper raises this exception on the
+    "couldn't parse" path, paginators catch + fail loudly, single-shot
+    callers catch + return [] (preserves their previous behavior).
+    """
+    def __init__(self, endpoint: str, payload_preview: str):
+        self.endpoint = endpoint
+        self.payload_preview = payload_preview
+        super().__init__(
+            f"R15: {endpoint} returned unparseable shape — preview={payload_preview!r}"
+        )
+
+
 def _safe_list_from_response(
     data: Any,
     endpoint: str,
     list_keys: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
-    """F13: Coerce an API response to a list of dicts; log loudly on suspicious shape.
+    """F13 + R15: Coerce an API response to a list of dicts.
 
-    Pre-fix code had `if not isinstance(data, list): return []` everywhere,
-    which silently masked API errors (e.g. Polymarket sometimes returns a
-    JSON-wrapped error object instead of a list during overload). The probe
-    found this is exactly what was happening for the CLOB /trades endpoint.
+    Behavior:
+      - Real list → return list of dicts (legit, silent)
+      - Wrapped list ({"data": [...]}, etc.) → unwrap + return
+      - Dict with no expected wrapper key → log WARN, raise ResponseShapeError
+      - Anything else (None, str, int, etc.) → log WARN, raise ResponseShapeError
 
-    This helper distinguishes:
-      - Real empty list (return [], silent)        — legit "no results"
-      - Wrapped list ({"data": [...]}, etc.)       — unwrap, return inner list
-      - Dict with no expected wrapper key          — log WARN, return []
-      - Anything else (None, str, int, etc.)       — log WARN, return []
+    Callers that don't care about distinguishing error-from-empty (most
+    single-shot callers) should wrap in try/except ResponseShapeError and
+    return []. Paginators MUST catch it and either retry or fail loudly,
+    not treat as end-of-pages.
 
     Args:
       data: The parsed JSON body.
       endpoint: A short label for log context (e.g. "data-api/positions").
       list_keys: Dict-keys that may wrap a list response. Tried in order.
+
+    Raises:
+      ResponseShapeError: when the payload can't be coerced to a list.
     """
     if isinstance(data, list):
         return [d for d in data if isinstance(d, dict)]
@@ -84,17 +109,33 @@ def _safe_list_from_response(
             inner = data.get(key)
             if isinstance(inner, list):
                 return [d for d in inner if isinstance(d, dict)]
+        preview = f"keys={sorted(data.keys())[:8]}"
         log.warning(
-            "F13: %s returned dict instead of list (likely API error). "
-            "Top-level keys=%s",
-            endpoint, sorted(data.keys())[:8],
+            "R15: %s returned dict instead of list (likely API error). %s",
+            endpoint, preview,
         )
+        raise ResponseShapeError(endpoint, preview)
+    preview = f"type={type(data).__name__} body={str(data)[:120]!r}"
+    log.warning("R15: %s returned %s instead of list.", endpoint, preview)
+    raise ResponseShapeError(endpoint, preview)
+
+
+def _safe_list_or_empty(
+    data: Any,
+    endpoint: str,
+    list_keys: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Wrapper around _safe_list_from_response for non-paginator callers
+    that want the pre-R15 behavior of "treat unparseable as empty."
+
+    The paginators (currently just `get_leaderboard`) call
+    `_safe_list_from_response` directly so they can react to
+    ResponseShapeError.
+    """
+    try:
+        return _safe_list_from_response(data, endpoint, list_keys)
+    except ResponseShapeError:
         return []
-    log.warning(
-        "F13: %s returned %s instead of list. Body preview=%r",
-        endpoint, type(data).__name__, str(data)[:120],
-    )
-    return []
 
 
 class PolymarketClient:
@@ -190,7 +231,7 @@ class PolymarketClient:
                 "category": category,
             },
         )
-        items = _safe_list_from_response(data, "data-api/leaderboard")
+        items = _safe_list_or_empty(data, "data-api/leaderboard")
         return [LeaderboardEntry.from_dict(d) for d in items]
 
     async def get_leaderboard(
@@ -200,19 +241,47 @@ class PolymarketClient:
         category: LeaderboardCategory = "overall",
         depth: int = 100,
     ) -> list[LeaderboardEntry]:
-        """Fetch the leaderboard up to `depth` ranks, paging in 50s as needed."""
+        """Fetch the leaderboard up to `depth` ranks, paging in 50s as needed.
+
+        R15 (Pass 3): paginates with the LOUD helper so an API error
+        returning a non-list shape is distinguishable from a legit empty
+        page. Pre-fix used the silent helper, meaning Polymarket's overload
+        responses (200 OK with garbage body) were treated as "end of list"
+        and silently truncated the leaderboard. The daily snapshot would
+        then have half the wallets it should have, with no warning.
+
+        Now: on a shape error we log loudly and abort the pagination —
+        better to fail loudly than to write a half-broken snapshot.
+        """
+        url = f"{settings.data_api_base}/v1/leaderboard"
         out: list[LeaderboardEntry] = []
         offset = 0
         while len(out) < depth:
-            page = await self.get_leaderboard_page(
-                order_by=order_by,
-                time_period=time_period,
-                category=category,
-                offset=offset,
-                limit=LEADERBOARD_PAGE_SIZE,
+            data = await self._get_json(
+                url,
+                params={
+                    "timePeriod": time_period,
+                    "orderBy": order_by,
+                    "limit": LEADERBOARD_PAGE_SIZE,
+                    "offset": offset,
+                    "category": category,
+                },
             )
-            if not page:
+            try:
+                items = _safe_list_from_response(data, "data-api/leaderboard")
+            except ResponseShapeError as e:
+                # Loud failure — better to error out than to write a
+                # silently-truncated leaderboard snapshot.
+                log.error(
+                    "R15: leaderboard pagination aborted at offset=%d due to "
+                    "unparseable response shape — got %d entries so far. %s",
+                    offset, len(out), e,
+                )
+                raise
+            if not items:
+                # Real empty page — legit end of leaderboard.
                 break
+            page = [LeaderboardEntry.from_dict(d) for d in items]
             out.extend(page)
             if len(page) < LEADERBOARD_PAGE_SIZE:
                 break
@@ -224,7 +293,7 @@ class PolymarketClient:
     async def get_positions(self, proxy_wallet: str, limit: int = 500) -> list[Position]:
         url = f"{settings.data_api_base}/positions"
         data = await self._get_json(url, params={"user": proxy_wallet, "limit": limit})
-        items = _safe_list_from_response(data, "data-api/positions")
+        items = _safe_list_or_empty(data, "data-api/positions")
         return [Position.from_dict(d) for d in items]
 
     async def get_trades(
@@ -235,7 +304,7 @@ class PolymarketClient:
         data = await self._get_json(
             url, params={"user": proxy_wallet, "limit": limit, "offset": offset}
         )
-        items = _safe_list_from_response(data, "data-api/trades?user")
+        items = _safe_list_or_empty(data, "data-api/trades?user")
         return [Trade.from_dict(d) for d in items]
 
     async def iter_trades(
@@ -281,7 +350,7 @@ class PolymarketClient:
         if ascending is not None:
             params["ascending"] = "true" if ascending else "false"
         data = await self._get_json(url, params=params)
-        items = _safe_list_from_response(data, "gamma-api/events")
+        items = _safe_list_or_empty(data, "gamma-api/events")
         return [Event.from_dict(d) for d in items]
 
     async def get_markets(
@@ -295,7 +364,7 @@ class PolymarketClient:
         if closed is not None:
             params["closed"] = "true" if closed else "false"
         data = await self._get_json(url, params=params)
-        items = _safe_list_from_response(data, "gamma-api/markets")
+        items = _safe_list_or_empty(data, "gamma-api/markets")
         return [Market.from_dict(d) for d in items]
 
     async def get_markets_by_condition_ids(
@@ -329,7 +398,7 @@ class PolymarketClient:
             if closed is not None:
                 params.append(("closed", "true" if closed else "false"))
             data = await self._get_json(url, params=params)
-            items = _safe_list_from_response(data, "gamma-api/markets?condition_ids")
+            items = _safe_list_or_empty(data, "gamma-api/markets?condition_ids")
             out.extend(Market.from_dict(d) for d in items)
         return out
 
@@ -350,7 +419,7 @@ class PolymarketClient:
             params: list[tuple[str, Any]] = [("id", e) for e in chunk]
             params.append(("limit", len(chunk)))
             data = await self._get_json(url, params=params)
-            items = _safe_list_from_response(data, "gamma-api/events?id")
+            items = _safe_list_or_empty(data, "gamma-api/events?id")
             out.extend(Event.from_dict(d) for d in items)
         return out
 
@@ -431,7 +500,7 @@ class PolymarketClient:
                 getattr(e.response, "text", "")[:200],
             )
             return []
-        return _safe_list_from_response(
+        return _safe_list_or_empty(
             data, "data-api/trades?market", list_keys=("data", "trades"),
         )
 

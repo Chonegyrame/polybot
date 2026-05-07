@@ -336,6 +336,37 @@ def wilson_ci(wins: int, n: int, alpha: float = 0.05) -> tuple[float, float]:
     return (max(0.0, center - spread), min(1.0, center + spread))
 
 
+def compute_kish_n_eff(cluster_keys: list[str | None]) -> float:
+    """Kish effective sample size for clustered observations (D3, Pass 3).
+
+    Formula: n_eff = (sum of cluster sizes)² / sum of (cluster sizes squared)
+
+    Pre-fix used `n_eff = distinct_clusters` which ignored within-cluster
+    correlation. With one big Trump-2024 cluster of 200 markets + 50
+    singletons, distinct_clusters=51 (looks "powered" at MIN_SAMPLE_SIZE=30)
+    while Kish n_eff = 250² / (200² + 50) = 1.56 (truly underpowered).
+
+    Behavior:
+      - All singletons (n unique items) → n_eff = n (no clustering penalty)
+      - Single big cluster of n → n_eff = 1
+      - Mixed → between the two
+
+    None keys are treated as singleton clusters (one per observation).
+    """
+    if not cluster_keys:
+        return 0.0
+    by_cluster: dict[str, int] = {}
+    for i, k in enumerate(cluster_keys):
+        key = k if k is not None else f"_solo_{i}"
+        by_cluster[key] = by_cluster.get(key, 0) + 1
+    sizes = list(by_cluster.values())
+    total = sum(sizes)
+    if total == 0:
+        return 0.0
+    sum_sq = sum(s * s for s in sizes)
+    return (total * total) / sum_sq
+
+
 def cluster_bootstrap_mean(
     values: list[float],
     cluster_keys: list[str | None],

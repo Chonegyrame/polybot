@@ -269,9 +269,17 @@ def test_f13_safe_list_from_response() -> None:
 
     See review/PROBE_FINDINGS.md, review/FIXES.md F13.
     """
-    section("F13: _safe_list_from_response distinguishes empty from error")
+    section("F13/R15: _safe_list_from_response distinguishes empty from error")
 
-    from app.services.polymarket import _safe_list_from_response
+    # R15 (Pass 3): _safe_list_from_response now RAISES ResponseShapeError on
+    # un-parseable input (paginators catch + fail loudly). The silent
+    # "returns []" semantic is preserved via _safe_list_or_empty for
+    # single-shot callers. We test BOTH below.
+    from app.services.polymarket import (
+        ResponseShapeError,
+        _safe_list_from_response,
+        _safe_list_or_empty,
+    )
 
     # Real empty list -> return [] silently
     out = _safe_list_from_response([], "test-endpoint")
@@ -312,42 +320,56 @@ def test_f13_safe_list_from_response() -> None:
         f"got {out}",
     )
 
-    # Dict with no expected list-key -> returns [] AND should log warning
-    # (we don't capture log here — verified manually via probe; this just
-    # confirms the return value is [] not an exception)
-    out = _safe_list_from_response(
-        {"error": "Unauthorized", "code": 401},
-        "test-endpoint",
-        list_keys=("data",),
-    )
-    check(
-        "F13: error-shaped dict -> returns [] (and logs WARN -- check stderr)",
-        out == [],
-        f"got {out}",
-    )
+    # R15: dict with no expected list-key -> RAISES ResponseShapeError
+    # (paginators catch this and fail loudly instead of treating as end-of-pages)
+    raised = False
+    try:
+        _safe_list_from_response(
+            {"error": "Unauthorized", "code": 401},
+            "test-endpoint",
+            list_keys=("data",),
+        )
+    except ResponseShapeError:
+        raised = True
+    check("R15: error-shaped dict raises ResponseShapeError", raised)
 
-    # None -> returns [] AND warns
-    out = _safe_list_from_response(None, "test-endpoint")
-    check(
-        "F13: None -> returns [] (and logs WARN)",
-        out == [],
-        f"got {out}",
-    )
+    # R15: None -> RAISES
+    raised = False
+    try:
+        _safe_list_from_response(None, "test-endpoint")
+    except ResponseShapeError:
+        raised = True
+    check("R15: None raises ResponseShapeError", raised)
 
-    # str -> returns [] AND warns
-    out = _safe_list_from_response("garbage response", "test-endpoint")
-    check(
-        "F13: string -> returns [] (and logs WARN)",
-        out == [],
-        f"got {out}",
-    )
+    # R15: str -> RAISES
+    raised = False
+    try:
+        _safe_list_from_response("garbage response", "test-endpoint")
+    except ResponseShapeError:
+        raised = True
+    check("R15: string raises ResponseShapeError", raised)
 
-    # int -> returns []
-    out = _safe_list_from_response(42, "test-endpoint")
+    # R15: int -> RAISES
+    raised = False
+    try:
+        _safe_list_from_response(42, "test-endpoint")
+    except ResponseShapeError:
+        raised = True
+    check("R15: int raises ResponseShapeError", raised)
+
+    # F13 (silent path) — _safe_list_or_empty preserves the old "returns []"
+    # semantic for single-shot callers (positions, trades, markets, etc.)
     check(
-        "F13: int -> returns []",
-        out == [],
-        f"got {out}",
+        "F13: _safe_list_or_empty on error-dict returns []",
+        _safe_list_or_empty({"error": "x"}, "test-endpoint", list_keys=("data",)) == [],
+    )
+    check(
+        "F13: _safe_list_or_empty on None returns []",
+        _safe_list_or_empty(None, "test-endpoint") == [],
+    )
+    check(
+        "F13: _safe_list_or_empty on real list passes through",
+        _safe_list_or_empty([{"a": 1}], "test-endpoint") == [{"a": 1}],
     )
 
 
