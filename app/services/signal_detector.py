@@ -293,10 +293,61 @@ async def _aggregate_positions(
           AND p.last_updated_at >= NOW() - INTERVAL '20 minutes'
           AND ($2::TEXT IS NULL OR e.category = $2::TEXT)
     ),
-    -- Per (market, direction) totals — counts DISTINCT identities, not wallets.
-    -- avg_entry_price is size-weighted (not "avg of avgs") so a single large
-    -- position dominates over many small ones at different prices — the
-    -- correct cost-basis approximation for the gap calculation.
+    -- Pass 5 #1: identity-collapse the per-wallet positions before the
+    -- per-direction aggregate. A 4-wallet sybil cluster with $20k on each
+    -- wallet collapses to one row per (identity, market, outcome) with
+    -- current_value = $80k. Downstream aggregations now operate on entity-
+    -- level rows, so:
+    --   - avg_portfolio_fraction is per-ENTITY (cluster's total $$ vs
+    --     cluster's max wallet portfolio_value), not per-wallet -- the
+    --     cluster's real "% of capital deployed" instead of the dilution
+    --     of averaging across its sybils.
+    --   - avg_entry_price is identity-weighted (size-weighted across
+    --     identities), so the cost basis attributes one weight per entity
+    --     rather than one per wallet -- mathematically equivalent for
+    --     pure size-weighted averaging because it factors associatively.
+    --   - aggregate_usdc and total_dollars_in_market are unchanged
+    --     numerically (sum across wallets == sum across identity-summed
+    --     wallets), but conceptually attributed at entity level so they
+    --     stay consistent with the COUNT(DISTINCT identity) logic.
+    -- portfolio_value uses MAX rather than SUM at the identity level on
+    -- the assumption that sybil wallets often share funding (SUM would
+    -- double-count); MAX gives the upper-bound on entity capital.
+    identity_positions AS (
+        SELECT
+            identity, condition_id, outcome,
+            SUM(current_value)                          AS current_value,
+            SUM(size)                                   AS size,
+            AVG(cur_price)                              AS cur_price,
+            MIN(first_seen_at)                          AS first_seen_at,
+            CASE WHEN SUM(size) > 0
+                 THEN SUM(avg_price * size) / SUM(size)
+                 ELSE NULL
+            END                                         AS avg_entry_price,
+            MAX(portfolio_value)                        AS portfolio_value,
+            ANY_VALUE(question)                         AS question,
+            ANY_VALUE(slug)                             AS slug,
+            ANY_VALUE(category)                         AS category,
+            ANY_VALUE(event_id)                         AS event_id
+        FROM pool_positions
+        GROUP BY identity, condition_id, outcome
+    ),
+    -- R3b (Pass 3): contributing wallet addresses per (cid, direction)
+    -- so the exit detector can recompute against the original cohort.
+    -- Computed from raw pool_positions (not identity_positions) so the
+    -- output is the underlying wallet list -- the exit detector resolves
+    -- clusters at recompute time via cluster_membership.
+    direction_wallets AS (
+        SELECT
+            condition_id, outcome,
+            ARRAY_AGG(DISTINCT proxy_wallet ORDER BY proxy_wallet)
+                AS contributing_wallets
+        FROM pool_positions
+        GROUP BY condition_id, outcome
+    ),
+    -- Per (market, direction) totals -- one input row per identity, so
+    -- every aggregate counts entities not wallets. avg_entry_price is
+    -- size-weighted across identities (still single-position-dominant).
     direction_agg AS (
         SELECT
             condition_id, outcome,
@@ -311,15 +362,10 @@ async def _aggregate_positions(
             AVG(cur_price)                 AS current_price,
             MIN(first_seen_at)             AS earliest_first_seen_at,
             CASE WHEN SUM(size) > 0
-                 THEN SUM(avg_price * size) / SUM(size)
+                 THEN SUM(avg_entry_price * size) / SUM(size)
                  ELSE NULL
-            END                            AS avg_entry_price,
-            -- R3b (Pass 3): collect the wallet addresses contributing to
-            -- this (cid, direction). Persisted to signal_log so exit
-            -- detector can recompute against the original cohort instead
-            -- of the current top-N pool (which churns).
-            ARRAY_AGG(DISTINCT proxy_wallet)  AS contributing_wallets
-        FROM pool_positions
+            END                            AS avg_entry_price
+        FROM identity_positions
         GROUP BY condition_id, outcome
     ),
     -- F17: Total distinct identities per market across YES/NO outcomes only
@@ -327,14 +373,14 @@ async def _aggregate_positions(
     -- so stray non-YES/NO position rows on a binary market inflated the
     -- denominator and legitimate signals fell below the threshold.
     -- R2 (Pass 3): also expose total_dollars_in_market for dollar-weighted
-    -- skew. Same WHERE clause keeps the dollar denominator consistent with
-    -- the headcount denominator (don't count multi-outcome positions).
+    -- skew. Pass 5 #1: rows here are per-identity not per-wallet so the
+    -- denominator counts entities consistently with the numerator.
     market_totals AS (
         SELECT
             condition_id,
             COUNT(DISTINCT identity)         AS traders_any_direction,
             SUM(current_value)               AS total_dollars_in_market
-        FROM pool_positions
+        FROM identity_positions
         WHERE LOWER(outcome) IN ('yes', 'no')
         GROUP BY condition_id
     )
@@ -342,10 +388,11 @@ async def _aggregate_positions(
         d.condition_id, d.outcome, d.question, d.slug, d.category, d.event_id,
         d.trader_count, d.aggregate_usdc, d.avg_portfolio_fraction,
         d.current_price, d.earliest_first_seen_at, d.avg_entry_price,
-        d.contributing_wallets,
+        dw.contributing_wallets,
         m.traders_any_direction,
         m.total_dollars_in_market
     FROM direction_agg d
+    JOIN direction_wallets dw USING (condition_id, outcome)
     JOIN market_totals m ON m.condition_id = d.condition_id
     ORDER BY d.aggregate_usdc DESC
     """

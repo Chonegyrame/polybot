@@ -149,18 +149,38 @@ async def _recompute_one_signal_aggregates_for_cohort(
                 COALESCE(cm.cluster_id::text, c.proxy_wallet) AS identity
             FROM cohort c
             LEFT JOIN cluster_membership cm USING (proxy_wallet)
+        ),
+        -- Pass 5 #5: collapse positions to one row per identity before
+        -- the outer aggregate. The HAVING clause filters identities
+        -- whose net direction-side exposure is zero, so an entity that
+        -- has fully flattened on this side (regardless of how many of
+        -- its wallets are still alive) drops out of the count and the
+        -- sum together. Without this, an entity that closed its
+        -- position would still appear as `trader_count = 1` if any of
+        -- its wallets had stale (>30min) zero-size rows -- the COUNT
+        -- and SUM stayed inconsistent. Pre-existing signal_log rows
+        -- have peak_aggregate_usdc written with the old raw-wallet SUM;
+        -- legacy peak vs identity-collapsed current can differ slightly
+        -- on cluster-active markets but the TRIM threshold absorbs it.
+        identity_agg AS (
+            SELECT
+                wi.identity,
+                SUM(p.current_value) AS identity_usdc
+            FROM positions p
+            JOIN wallet_identity wi USING (proxy_wallet)
+            JOIN markets m ON m.condition_id = p.condition_id
+            WHERE p.condition_id = $2
+              AND p.size > 0
+              AND p.last_updated_at >= NOW() - INTERVAL '30 minutes'
+              AND m.closed = FALSE
+              AND UPPER(p.outcome) = UPPER($3)
+            GROUP BY wi.identity
+            HAVING SUM(p.current_value) > 0
         )
         SELECT
-            COUNT(DISTINCT wi.identity)::INT          AS trader_count,
-            COALESCE(SUM(p.current_value), 0)::NUMERIC AS aggregate_usdc
-        FROM positions p
-        JOIN wallet_identity wi USING (proxy_wallet)
-        JOIN markets m ON m.condition_id = p.condition_id
-        WHERE p.condition_id = $2
-          AND p.size > 0
-          AND p.last_updated_at >= NOW() - INTERVAL '30 minutes'
-          AND m.closed = FALSE
-          AND UPPER(p.outcome) = UPPER($3)
+            COUNT(*)::INT                              AS trader_count,
+            COALESCE(SUM(identity_usdc), 0)::NUMERIC   AS aggregate_usdc
+        FROM identity_agg
         """,
         contributing_wallets, condition_id, direction,
     )

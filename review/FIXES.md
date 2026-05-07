@@ -808,3 +808,83 @@ it and the test that prevents regression.
   later `clob_l2` row, not the earlier `unavailable` one).
 - **Total smoke count**: 623 → 657 across 12 suites (34 new
   Tier A tests in `smoke_phase_pass5_migrations.py`).
+
+### Tier B — items #1+#2+#5 — cluster-collapse family
+
+- **Status**: fixed (commit 2 of the Pass 5 plan)
+- **Source**: `review/PASS5_AUDIT.md` items #1 (Critical), #2 (Critical),
+  #5 (High). One conceptual fix (identity-collapse the SUM/HAVING) in
+  three SQL hotspots in three services.
+- **Files**:
+  - `app/services/signal_detector.py` — `_aggregate_positions` now
+    inserts an `identity_positions` CTE that pre-aggregates
+    `(identity, condition_id, outcome)` before `direction_agg` and
+    `market_totals` consume. Adds a sibling `direction_wallets` CTE that
+    keeps `contributing_wallets` derived from raw wallet rows (so the
+    R3b cohort tracker still gets a flat list of underlying wallets).
+  - `app/services/counterparty.py` — `find_counterparty_wallets`
+    SQL adds a `wallet_identity` CTE and groups by `wi.identity`. The
+    `is_counterparty` floor + concentration check is now applied at the
+    entity level. Returned dicts gain a `wallets` field (full underlying
+    list); the legacy `wallet` field becomes a deterministic
+    representative (alphabetically-first wallet of the entity) so back-
+    compat callers that print "the counterparty" keep working.
+  - `app/services/exit_detector.py` —
+    `_recompute_one_signal_aggregates_for_cohort` adds an `identity_agg`
+    inner CTE with `HAVING SUM(p.current_value) > 0` so the COUNT and
+    SUM are derived from the same per-identity aggregate. The outer
+    SELECT becomes `COUNT(*)` + `SUM(identity_usdc)` over identity_agg.
+  - `scripts/smoke_phase_pass5_cluster_collapse.py` — 49 new tests:
+    code-shape regression checks, pure `is_counterparty` regression,
+    identity-collapse aggregation against live DB (cluster + retail,
+    pure wash-trading cluster), counterparty cluster behaviors at the
+    floor (cluster $20k each, $4k each, $1k each, lone wallets), and
+    exit_detector identity-summed cohort recompute (cluster fully
+    holds, partial dropout, full dropout, two independent traders).
+- **Behavioral change vs raw-wallet predecessor**:
+  - `signal_detector.aggregate_usdc` and `total_dollars_in_market` are
+    **numerically unchanged** for all scenarios (sum across wallets =
+    sum across identity-summed wallets).
+  - `signal_detector.avg_portfolio_fraction` **changes** for cluster-
+    active markets: was averaged across raw wallet fractions
+    (`current_value / wallet_pv`), now averaged across identity
+    fractions (`identity_total / MAX(wallet_pv)` per cluster). For a
+    4-wallet cluster with $20k each on YES against a $200k MAX wallet
+    PV, the cluster contributes 0.40 to the average instead of four
+    rows of 0.10 each. MAX is used instead of SUM(PV) because sybil
+    wallets typically share funding — SUM would double-count capital.
+  - `counterparty` count behavior **changes** materially: a 4-wallet
+    cluster on the opposite side counts as 1 entity (was 4), and a
+    cluster of 4 wallets each at $4k ($16k entity total) clears the
+    $5k floor (was: 4 separate wallets each below floor → false
+    negative).
+  - `exit_detector` SUM/COUNT consistency **improves**: when a cluster
+    has wallets in different states, the entity-level HAVING filter
+    drops fully-flat identities cleanly. Numerically identical to the
+    pre-fix path on typical scenarios; legacy `peak_aggregate_usdc`
+    rows in `signal_log` were written with raw-wallet SUM and post-fix
+    `cur_agg` is identity-summed — same numerical value for one-sided
+    clusters; small differences possible on cluster-active markets.
+    The TRIM threshold absorbs the noise.
+- **Decision call-out (one-time)**: the audit's framing of #1 (the
+  dollar-skew floor R2 is "silently broken" by sybils) overstates the
+  fix — `aggregate_usdc` and `total_dollars_in_market` already had the
+  right totals, and the dollar-skew ratio was correct. The plan's own
+  worked example notes "the fix doesn't change firing behavior here"
+  for the audit's flagship scenario. The real material wins are:
+  (a) per-entity `avg_portfolio_fraction`, (b) cluster-aware
+  counterparty counting, (c) cleaner SUM/COUNT alignment for the exit
+  detector. Documented in commit message + this FIXES entry so future
+  readers don't expect false-positive signals to disappear.
+- **Live verification**: 13 smoke suites — **706/706 passing** (was
+  657 before this commit, +49 new in `smoke_phase_pass5_cluster_collapse.py`).
+  Test fixture inserts a synthetic cluster (`wallet_clusters` +
+  `cluster_membership` + portfolio_value_snapshots + positions) with a
+  unique `__pass5_cc_test__` tag, then restores any pre-existing rows
+  for the 5 borrowed traders during teardown.
+- **Scope deviations from the plan**: (a) `direction_wallets` is a new
+  separate CTE rather than the plan's `UNNEST(wallets_in_identity)`
+  cross-join (which would have multiplied rows). (b) `MAX(portfolio_
+  value)` per identity follows the plan as written; alternative `SUM`
+  would assume non-shared funding which is the worse default for
+  sybil clusters.

@@ -89,16 +89,30 @@ async def find_counterparty_wallets(
     tracked_pool: Iterable[str],
     min_opposite_usdc: float = MIN_OPPOSITE_USDC,
     concentration_threshold: float = CONCENTRATION_THRESHOLD,
-) -> list[dict[str, float | str]]:
-    """Return list of counterparty wallets for one signal.
+) -> list[dict]:
+    """Return list of counterparty entities for one signal.
 
-    Each entry: {wallet, same_usdc, opposite_usdc, concentration}.
+    Each entry: {wallet, wallets, same_usdc, opposite_usdc, concentration}.
     Sorted by opposite_usdc DESC (biggest counterparties first).
 
-    Implementation: one bulk SQL pulls all positions for tracked-pool
-    wallets on this market, aggregating per-wallet by (same vs opposite).
-    Filtered to the YES/NO outcomes only (multi-outcome positions ignored,
-    consistent with signal_detector).
+    Pass 5 #2: cluster-aware. The `is_counterparty` decision is now
+    applied at the entity level (cluster or lone wallet), not per raw
+    proxy_wallet. A 4-wallet sybil cluster on the opposite side at $20k
+    each contributes ONE entity at $80k same/opposite USDC -- not four
+    wallets each at $20k. The MIN_OPPOSITE_USDC floor and concentration
+    threshold are evaluated against the entity totals.
+
+      - `wallets` is the underlying proxy_wallet list for the entity
+        (length 1 for a lone wallet; >1 for a cluster).
+      - `wallet` is a representative address (the alphabetically-first
+        proxy_wallet of the entity), kept for backwards-compat with
+        existing call sites that print or display "the counterparty".
+        Use `wallets` when you need the full membership.
+
+    Implementation: bulk SQL joins tracked-pool wallets to
+    cluster_membership, then groups positions by entity (cluster_id if
+    present, else raw proxy_wallet). Filtered to YES/NO outcomes only,
+    consistent with signal_detector.
     """
     pool_list = list(tracked_pool)
     if not pool_list:
@@ -109,24 +123,32 @@ async def find_counterparty_wallets(
 
     rows = await conn.fetch(
         """
+        WITH wallet_identity AS (
+            SELECT
+                tp.proxy_wallet,
+                COALESCE(cm.cluster_id::text, tp.proxy_wallet) AS identity
+            FROM unnest($4::TEXT[]) AS tp(proxy_wallet)
+            LEFT JOIN cluster_membership cm USING (proxy_wallet)
+        )
         SELECT
-            p.proxy_wallet,
+            wi.identity,
             SUM(CASE WHEN LOWER(p.outcome) = LOWER($1) THEN p.current_value ELSE 0 END)
                 AS same_usdc,
             SUM(CASE WHEN LOWER(p.outcome) = LOWER($2) THEN p.current_value ELSE 0 END)
-                AS opposite_usdc
+                AS opposite_usdc,
+            ARRAY_AGG(DISTINCT p.proxy_wallet ORDER BY p.proxy_wallet) AS wallets
         FROM positions p
+        JOIN wallet_identity wi USING (proxy_wallet)
         WHERE p.condition_id = $3
-          AND p.proxy_wallet = ANY($4::TEXT[])
           AND p.size > 0
           AND LOWER(p.outcome) IN ('yes', 'no')
-        GROUP BY p.proxy_wallet
+        GROUP BY wi.identity
         HAVING SUM(CASE WHEN LOWER(p.outcome) = LOWER($2) THEN p.current_value ELSE 0 END) > 0
         """,
         same_outcome, opposite_outcome, condition_id, pool_list,
     )
 
-    out: list[dict[str, float | str]] = []
+    out: list[dict] = []
     for r in rows:
         same_u = float(r["same_usdc"] or 0.0)
         opp_u = float(r["opposite_usdc"] or 0.0)
@@ -137,8 +159,12 @@ async def find_counterparty_wallets(
         ):
             continue
         total = same_u + opp_u
+        wallets = list(r["wallets"] or [])
         out.append({
-            "wallet": r["proxy_wallet"],
+            # Pass 5 #2: representative wallet for back-compat callers.
+            # First wallet alphabetically -- deterministic for clusters.
+            "wallet": wallets[0] if wallets else "",
+            "wallets": wallets,
             "same_usdc": same_u,
             "opposite_usdc": opp_u,
             "concentration": (opp_u / total) if total > 0 else 0.0,
