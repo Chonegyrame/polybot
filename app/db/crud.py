@@ -1218,7 +1218,11 @@ async def fetch_half_life_rows(
     conn: asyncpg.Connection, category: str | None = None,
 ) -> list[dict[str, Any]]:
     """F23: Pull signal_log + signal_price_snapshots joined for half-life
-    computation. Returns raw dicts; the route shapes them into HalfLifeRow."""
+    computation. Returns raw dicts; the route shapes them into HalfLifeRow.
+
+    R8 (Pass 3): also returns sps.direction (snapshot_direction) so half-life
+    math can compare in the correct space (NO-direction snapshots are in
+    NO-space; legacy + YES are YES-space)."""
     sql = """
         SELECT
             s.id, s.direction,
@@ -1228,7 +1232,8 @@ async def fetch_half_life_rows(
             sps.snapshot_offset_min,
             sps.yes_price::numeric           AS yes_price,
             sps.bid_price::numeric           AS bid_price,
-            sps.ask_price::numeric           AS ask_price
+            sps.ask_price::numeric           AS ask_price,
+            sps.direction                    AS snapshot_direction
         FROM signal_log s
         JOIN signal_price_snapshots sps ON sps.signal_log_id = s.id
         JOIN markets m ON m.condition_id = s.condition_id
@@ -1621,19 +1626,20 @@ async def list_signals_pending_price_snapshots(
     min_age_minutes: int = 0,
     max_age_minutes: int = 125,
 ) -> list[dict[str, Any]]:
-    """B4/F7 — fetch signal_log rows due for a +5/15/30/60/120 min snapshot.
+    """B4/F7/R8 -- fetch signal_log rows due for a +5/15/30/60/120 min snapshot.
 
     Window expanded from 25-125 to 0-125 min so the +5 offset (added in F7)
     is reachable for fresh signals. Job cadence dropped from 30 min to 10
     min in `runner.py` to ensure the +5 window (0-10 min) is hit reliably.
 
-    Returns rows that fired between (now - max_age_minutes) and
-    (now - min_age_minutes), are NOT closed (resolved markets are skipped —
-    no point capturing post-resolution prices), and joined to the YES token
-    so the caller can hit CLOB without a second round-trip.
+    R8 (Pass 3): now returns BOTH yes_token and no_token, plus the signal's
+    direction. The snapshot job picks the direction-side token so half-life
+    math compares against the actual price the trader would see, not against
+    YES-side spread artifacts on NO signals.
 
-    The job runs every 30 min with overlap so a missed tick (sleep, restart)
-    still finds candidates within the 25–125 min window on the next run.
+    Filters: signal fired in window, market still open, AND has whichever
+    token the signal direction needs. (A YES signal with no clob_token_yes
+    is still skipped; same for NO.)
     """
     rows = await conn.fetch(
         """
@@ -1641,19 +1647,34 @@ async def list_signals_pending_price_snapshots(
             s.id              AS signal_log_id,
             s.first_fired_at,
             s.condition_id,
-            m.clob_token_yes  AS yes_token_id,
+            s.direction,
+            m.clob_token_yes,
+            m.clob_token_no,
             m.closed
         FROM signal_log s
         JOIN markets m ON m.condition_id = s.condition_id
-        WHERE s.first_fired_at <= NOW() - $1::INTERVAL
-          AND s.first_fired_at >= NOW() - $2::INTERVAL
+        WHERE s.first_fired_at <= NOW() - make_interval(mins => $1)
+          AND s.first_fired_at >= NOW() - make_interval(mins => $2)
           AND m.closed = FALSE
-          AND m.clob_token_yes IS NOT NULL
+          AND (
+              (s.direction = 'YES' AND m.clob_token_yes IS NOT NULL AND m.clob_token_yes <> '')
+              OR
+              (s.direction = 'NO'  AND m.clob_token_no  IS NOT NULL AND m.clob_token_no  <> '')
+          )
         """,
-        f"{min_age_minutes} minutes",
-        f"{max_age_minutes} minutes",
+        min_age_minutes,
+        max_age_minutes,
     )
-    return [dict(r) for r in rows]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        # Pick the direction-side token for the caller's convenience.
+        if d["direction"] == "NO":
+            d["token_id"] = d["clob_token_no"]
+        else:
+            d["token_id"] = d["clob_token_yes"]
+        out.append(d)
+    return out
 
 
 async def existing_price_snapshot_offsets(
@@ -1679,23 +1700,35 @@ async def insert_signal_price_snapshot(
     bid_price: float | None,
     ask_price: float | None,
     token_id: str,
+    direction: str | None = None,  # R8 (Pass 3) -- 'YES' or 'NO'
 ) -> bool:
-    """F4: record one price snapshot with both bid + ask. yes_price stays
-    populated for back-compat (mirrors bid_price). Returns True if inserted,
-    False on duplicate (UNIQUE on (signal_log_id, snapshot_offset_min)).
+    """F4 + R8: record one price snapshot with bid + ask + direction.
+
+    R8: prices are stored in DIRECTION-space (i.e., the bid/ask of the
+    direction-side token, not always the YES token). The direction column
+    distinguishes new direction-aware rows from legacy YES-only rows
+    (NULL direction).
+
+    yes_price is kept populated for back-compat (mirrors bid_price). For
+    NO-direction snapshots, yes_price now contains the NO-token bid -- but
+    the column name is misleading for those rows, which is why direction
+    must always be inspected when interpreting these prices going forward.
+
+    Returns True if inserted, False on duplicate (UNIQUE on
+    (signal_log_id, snapshot_offset_min)).
     """
     row = await conn.fetchrow(
         """
         INSERT INTO signal_price_snapshots (
             signal_log_id, snapshot_offset_min,
-            bid_price, ask_price, yes_price, token_id
+            bid_price, ask_price, yes_price, token_id, direction
         )
-        VALUES ($1, $2, $3, $4, $3, $5)
+        VALUES ($1, $2, $3, $4, $3, $5, $6)
         ON CONFLICT (signal_log_id, snapshot_offset_min) DO NOTHING
         RETURNING id
         """,
         signal_log_id, snapshot_offset_min,
-        bid_price, ask_price, token_id,
+        bid_price, ask_price, token_id, direction,
     )
     return row is not None
 

@@ -1482,7 +1482,12 @@ async def record_signal_price_snapshots() -> PriceSnapshotResult:
                 candidates_evaluated += 1
                 sid = int(c["signal_log_id"])
                 fired_at = c["first_fired_at"]
-                token_id = c["yes_token_id"]
+                # R8 (Pass 3): pick the direction-side token (NO token for
+                # NO-direction signals). Pre-fix always used the YES token,
+                # which biased half-life math for NO signals (YES bid/ask !=
+                # 1 - NO ask/bid in practice -- different MMs set them).
+                direction = c.get("direction") or "YES"
+                token_id = c["token_id"]
                 age_min = (
                     datetime.now(timezone.utc) - fired_at
                 ).total_seconds() / 60.0
@@ -1534,6 +1539,7 @@ async def record_signal_price_snapshots() -> PriceSnapshotResult:
                         bid_price=bid_price,
                         ask_price=ask_price,
                         token_id=token_id,
+                        direction=direction,  # R8 (Pass 3)
                     )
                     if inserted:
                         snapshots_inserted += 1

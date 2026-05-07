@@ -427,6 +427,198 @@ asyncio.run(test_r5_db())
 
 
 # ---------------------------------------------------------------------------
+# R8 -- snapshot direction-side token
+# ---------------------------------------------------------------------------
+
+section("R8 -- snapshot uses direction-side token; half-life is direction-aware")
+
+
+def test_r8_pure() -> None:
+    """Pure-function tests for direction-aware half-life math."""
+    from app.services.half_life import (
+        HalfLifeRow, compute_half_life_summary,
+    )
+
+    # NO-direction signal with NO-space snapshot (new R8 path).
+    # Signal fires at NO ask 0.45, smart money entered NO at 0.40.
+    # 30 min later NO bid is 0.42, NO ask is 0.44. Mid = 0.43.
+    # Did the price move toward smart money cost (0.40)?
+    # Fire was 0.45, snap is 0.43, smart_money is 0.40.
+    # |0.45 - 0.40| = 0.05; |0.43 - 0.40| = 0.03 -> snap closer -> True.
+    rows = [
+        HalfLifeRow(
+            category="politics",
+            fire_price=0.45, direction="NO",
+            smart_money_entry=0.40,
+            snapshot_price=0.42,  # bid (back-compat)
+            offset_min=30,
+            bid_price=0.42, ask_price=0.44,
+            snapshot_direction="NO",  # NEW
+        ),
+    ]
+    buckets = compute_half_life_summary(rows)
+    check("R8: NO-direction snapshot uses NO-space comparison directly",
+          len(buckets) == 1
+          and buckets[0].n == 1
+          and buckets[0].convergence_rate == 1.0,
+          f"buckets={[(b.category, b.offset_min, b.n, b.convergence_rate) for b in buckets]}")
+
+    # Legacy NO signal with snapshot_direction=None -- uses YES-space
+    # translation as before. Fire=0.45 (NO), snap=0.55 (YES), sm=0.40 (NO)
+    # Translated: fire_yes = 0.55, sm_yes = 0.60, snap_yes = 0.55.
+    # |0.55-0.60|=0.05; |0.55-0.60|=0.05 -> snap NOT closer (equal) -> False.
+    rows = [
+        HalfLifeRow(
+            category="politics",
+            fire_price=0.45, direction="NO",
+            smart_money_entry=0.40,
+            snapshot_price=0.55, offset_min=30,
+            bid_price=0.55, ask_price=0.55,
+            snapshot_direction=None,  # legacy
+        ),
+    ]
+    buckets = compute_half_life_summary(rows)
+    check("R8: legacy NO row (snapshot_direction=None) uses YES-space translation",
+          len(buckets) == 1 and buckets[0].n == 1
+          and buckets[0].convergence_rate == 0.0,
+          f"buckets={[(b.category, b.offset_min, b.n, b.convergence_rate) for b in buckets]}")
+
+    # YES-direction signal with YES snapshot (typical new path).
+    # Fire YES at 0.55, smart money entered YES at 0.50, snapshot at 0.52.
+    # |0.55-0.50|=0.05; |0.52-0.50|=0.02 -> closer -> True.
+    rows = [
+        HalfLifeRow(
+            category="politics",
+            fire_price=0.55, direction="YES",
+            smart_money_entry=0.50,
+            snapshot_price=0.52, offset_min=30,
+            bid_price=0.52, ask_price=0.52,
+            snapshot_direction="YES",
+        ),
+    ]
+    buckets = compute_half_life_summary(rows)
+    check("R8: YES-direction signal converges correctly in YES-space",
+          buckets[0].convergence_rate == 1.0,
+          f"got {buckets[0].convergence_rate}")
+
+
+test_r8_pure()
+
+
+async def test_r8_db() -> None:
+    """End-to-end DB test: list_signals_pending_price_snapshots returns
+    direction-side token for NO signals."""
+    from app.db.connection import init_pool, close_pool
+    from app.db import crud
+
+    pool = await init_pool(min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            # Pick a market with both clob_token_yes and clob_token_no
+            mkt = await conn.fetchrow(
+                """
+                SELECT condition_id, clob_token_yes, clob_token_no
+                FROM markets
+                WHERE clob_token_yes IS NOT NULL AND clob_token_yes <> ''
+                  AND clob_token_no IS NOT NULL AND clob_token_no <> ''
+                  AND closed = FALSE
+                LIMIT 1
+                """,
+            )
+            if mkt is None:
+                check("R8: DB round-trip skipped (no markets with both tokens)", True)
+                return
+            check("R8: found market with both YES + NO tokens", True,
+                  f"cid={mkt['condition_id'][:12]}...")
+
+            # Insert a synthetic signal with direction=NO so we can verify
+            # the helper picks the NO token.
+            test_mode = "_R8_TEST"
+            await conn.execute(
+                "DELETE FROM signal_log WHERE mode = $1", test_mode,
+            )
+            await conn.execute(
+                """
+                INSERT INTO signal_log
+                  (mode, category, top_n, condition_id, direction,
+                   first_fired_at, last_seen_at,
+                   peak_trader_count, peak_aggregate_usdc, peak_net_skew,
+                   first_trader_count, first_aggregate_usdc, first_net_skew,
+                   market_type)
+                VALUES ($1, '_test', 50, $2, 'NO',
+                        NOW() - INTERVAL '4 minutes',
+                        NOW() - INTERVAL '4 minutes',
+                        5, 25000, 0.65,
+                        5, 25000, 0.65,
+                        'binary')
+                """,
+                test_mode, mkt["condition_id"],
+            )
+
+            candidates = await crud.list_signals_pending_price_snapshots(conn)
+            cands = [c for c in candidates if c["condition_id"] == mkt["condition_id"]]
+            check("R8: pending snapshot found for NO-direction signal",
+                  len(cands) == 1, f"got {len(cands)}")
+            if cands:
+                c = cands[0]
+                check("R8: helper returned token_id == NO token (not YES)",
+                      c["token_id"] == mkt["clob_token_no"],
+                      f"got {c['token_id'][:12]}... vs no={mkt['clob_token_no'][:12]}...")
+                check("R8: direction field present and == 'NO'",
+                      c.get("direction") == "NO",
+                      f"got {c.get('direction')}")
+
+            # R1 verification: verify migration 010 lets us insert at offset 5
+            sid = await conn.fetchval(
+                "SELECT id FROM signal_log WHERE mode = $1 LIMIT 1",
+                test_mode,
+            )
+            inserted_5 = await crud.insert_signal_price_snapshot(
+                conn,
+                signal_log_id=sid, snapshot_offset_min=5,
+                bid_price=0.42, ask_price=0.44,
+                token_id=mkt["clob_token_no"], direction="NO",
+            )
+            check("R1: insert at snapshot_offset_min=5 succeeds (CHECK relaxed)",
+                  inserted_5)
+
+            inserted_15 = await crud.insert_signal_price_snapshot(
+                conn,
+                signal_log_id=sid, snapshot_offset_min=15,
+                bid_price=0.43, ask_price=0.44,
+                token_id=mkt["clob_token_no"], direction="NO",
+            )
+            check("R1: insert at snapshot_offset_min=15 succeeds (CHECK relaxed)",
+                  inserted_15)
+
+            # R8: confirm the persisted rows have direction='NO'
+            stored = await conn.fetch(
+                """
+                SELECT snapshot_offset_min, direction
+                FROM signal_price_snapshots
+                WHERE signal_log_id = $1
+                ORDER BY snapshot_offset_min
+                """, sid,
+            )
+            check("R8: persisted rows carry direction='NO'",
+                  all(r["direction"] == "NO" for r in stored),
+                  f"got {[r['direction'] for r in stored]}")
+
+            # Cleanup
+            await conn.execute(
+                "DELETE FROM signal_price_snapshots WHERE signal_log_id = $1", sid,
+            )
+            await conn.execute(
+                "DELETE FROM signal_log WHERE mode = $1", test_mode,
+            )
+    finally:
+        await close_pool()
+
+
+asyncio.run(test_r8_db())
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

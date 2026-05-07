@@ -1,26 +1,37 @@
-"""B4 — signal price-snapshot collection + half-life analytics.
+"""B4 -- signal price-snapshot collection + half-life analytics.
 
 Two pieces:
 
-  - `pick_offset_for_age` — pure mapping from minutes-since-fire to the
-    canonical 5 / 15 / 30 / 60 / 120 min bucket (with a ±5 min tolerance).
+  - `pick_offset_for_age` -- pure mapping from minutes-since-fire to the
+    canonical 5 / 15 / 30 / 60 / 120 min bucket (with a +-5 min tolerance).
     F7: added 5 + 15 min offsets so the short latency profiles (active
     1-3, responsive 5-10, casual 12-20) have real data behind them.
     Picks the CLOSEST canonical offset, with ties broken toward the
     smaller offset (so we capture early-time-horizon snapshots first).
 
-  - `compute_half_life_summary` — turns a pile of (signal, fire_price,
+  - `compute_half_life_summary` -- turns a pile of (signal, fire_price,
     snapshot_at_offset, smart_money_entry_price) tuples into per-category
-    convergence stats. n < 30 per category → flagged underpowered.
+    convergence stats. n < 30 per category -> flagged underpowered.
 
   F4: snapshots now carry both `bid_price` and `ask_price`. Half-life math
   uses mid = (bid + ask) / 2 when both available (falls back to bid for
   legacy rows). Comparing entry-side ask to snapshot-side bid baked a
   spread artifact into the convergence rate; mid is the honest comparison.
 
-  F5: math is done in YES-space. fire_price and smart_money_entry are
-  direction-space → translated via _to_yes_space. snapshot_price is
-  already YES-space.
+  R8 (Pass 3): snapshots are now stored in DIRECTION-space (NO-token book
+  for NO signals, YES-token for YES). The HalfLifeRow.snapshot_direction
+  field tells us which: 'YES' (legacy or new YES-direction) means
+  snapshot_price IS YES-space and we apply F5's _to_yes_space translation
+  to fire/smart_money inputs as before. 'NO' means snapshot_price IS
+  NO-space and we should NOT translate the snapshot side -- direct
+  comparison between fire (NO-space) + snapshot (NO-space) is honest.
+
+  F5: math is done in DIRECTION-aware space now. fire_price and
+  smart_money_entry are direction-space natively (positions on NO have
+  NO-space avg_price). For YES-direction snapshots: snapshot is YES-space,
+  same as before. For NO-direction snapshots: snapshot is NO-space, same
+  as direction-space inputs -> direct comparison without translation.
+  Legacy rows (snapshot_direction NULL) still use the YES-only translation.
 """
 
 from __future__ import annotations
@@ -75,16 +86,23 @@ class HalfLifeRow:
     F4: now carries both bid_price and ask_price. snapshot_price is kept
     for back-compat (mirrors bid). compute_half_life_summary uses mid
     when ask is available.
+
+    R8 (Pass 3): snapshot_direction tells us which token's book the
+    snapshot was captured against (YES or NO). For new direction-aware
+    rows it matches the signal direction; for legacy rows it's None
+    (always YES book historically).
     """
     category: str | None              # market_category from events
     fire_price: float                 # signal_entry_offer at fire (direction-space)
-    direction: str                    # 'YES' | 'NO'
+    direction: str                    # 'YES' | 'NO' -- the SIGNAL direction
     smart_money_entry: float | None   # first_top_trader_entry_price (direction-space)
-    snapshot_price: float | None      # YES bid (back-compat); prefer bid_price/ask_price
+    snapshot_price: float | None      # bid (back-compat); prefer bid_price/ask_price
     offset_min: int                   # 5 | 15 | 30 | 60 | 120
-    # F4 additions — both nullable for legacy rows.
-    bid_price: float | None = None    # YES-space bid at offset
-    ask_price: float | None = None    # YES-space ask at offset
+    # F4 additions -- both nullable for legacy rows.
+    bid_price: float | None = None    # bid at offset (in snapshot_direction-space)
+    ask_price: float | None = None    # ask at offset (in snapshot_direction-space)
+    # R8 addition -- which side's book the snapshot used.
+    snapshot_direction: str | None = None  # 'YES' | 'NO' | None (legacy = YES)
 
 
 @dataclass
@@ -150,22 +168,43 @@ def compute_half_life_summary(
     smart-money cost basis. n includes only rows where the comparison was
     definable (fire_gap > 0, snapshot_price available).
 
-    F5: math done in YES-space (canonical storage of snapshot prices).
     F4: snapshot side is mid (bid+ask)/2 when ask available, else bid only.
+
+    R8 (Pass 3): direction-aware comparison. The snapshot is in
+    snapshot_direction-space:
+      - snapshot_direction == 'NO' -> snapshot already in NO-space, do
+        the comparison directly in direction-space (no translation).
+      - snapshot_direction == 'YES' or None (legacy) -> snapshot is in
+        YES-space; translate fire and smart_money inputs from
+        direction-space to YES-space via 1-x for NO signals.
     """
     by_bucket: dict[tuple[str, int], list[bool]] = {}
 
     for r in rows:
         if r.smart_money_entry is None:
             continue
-        snap_yes = _snapshot_yes_mid(r)
-        if snap_yes is None:
+        snap_mid = _snapshot_yes_mid(r)
+        if snap_mid is None:
             continue
-        # F5: translate direction-space inputs to YES-space; snapshot is
-        # already YES-space so it passes through.
-        fire_yes = _to_yes_space(r.fire_price, r.direction)
-        sm_yes = _to_yes_space(r.smart_money_entry, r.direction)
-        moved = _moved_toward_smart_money(fire_yes, snap_yes, sm_yes)
+        # R8: choose the comparison space based on snapshot_direction.
+        if r.snapshot_direction == "NO" and r.direction == "NO":
+            # Both already in NO-space. Direct comparison.
+            fire_cmp = r.fire_price
+            sm_cmp = r.smart_money_entry
+            snap_cmp = snap_mid
+        elif r.snapshot_direction == "YES" and r.direction == "YES":
+            # Both already in YES-space. Direct comparison.
+            fire_cmp = r.fire_price
+            sm_cmp = r.smart_money_entry
+            snap_cmp = snap_mid
+        else:
+            # Mixed (legacy NO signal with YES-space snapshot, or
+            # snapshot_direction==None). Translate everything to YES-space
+            # for a consistent comparison (F5 behavior).
+            fire_cmp = _to_yes_space(r.fire_price, r.direction)
+            sm_cmp = _to_yes_space(r.smart_money_entry, r.direction)
+            snap_cmp = snap_mid  # legacy snapshots ARE YES-space
+        moved = _moved_toward_smart_money(fire_cmp, snap_cmp, sm_cmp)
         if moved is None:
             continue
         cat = r.category or "uncategorized"

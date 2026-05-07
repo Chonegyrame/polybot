@@ -357,6 +357,7 @@ async def get_half_life(
             offset_min=int(r["snapshot_offset_min"]),
             bid_price=_opt_f(r["bid_price"]),
             ask_price=_opt_f(r["ask_price"]),
+            snapshot_direction=r.get("snapshot_direction"),  # R8 (Pass 3)
         )
         for r in rows
     ]
