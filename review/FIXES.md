@@ -1099,3 +1099,91 @@ across hundreds of backtest signals, the bias adds up.
   comments at both call sites for operator discoverability.
 - **Live verification**: 17 smoke suites — **775/775 passing** (was
   762, +13 new).
+
+### Tier C — items #6 + #16 — operational visibility
+
+- **Status**: fixed (commit 7 of the Pass 5 plan; bundles two
+  related operational fixes that share `/system/status`).
+- **Source**: `review/PASS5_AUDIT.md` items #6 (High) + #16 (High).
+
+**#6 — `trader_category_stats` freshness gate**
+
+- The recency filter in trader_ranker drops every wallet whose overall
+  `last_trade_at` is >RECENCY_MAX_DAYS old. If the nightly trader-stats
+  job dies (02:30 UTC), every row's `last_trade_at` ages past the
+  threshold and the ranker silently returns `[]`. F25's 72h
+  `signals_health` would catch "no signals" but couldn't distinguish
+  a quiet weekend from a dead pipe.
+- **Files**:
+  - `app/db/crud.py` — new `get_stats_freshness(conn) -> {seeded,
+    fresh, last_refresh}`. Single-row SELECT off
+    `trader_category_stats`. `STATS_FRESHNESS_MAX_DAYS = 7`.
+    Bootstrap-safe: not seeded → trivially fresh.
+  - `app/services/trader_ranker.py` — `stats_fresh` CTE added
+    alongside `stats_seeded` in all 4 ranker SQL sites
+    (`_rank_absolute`, `_rank_hybrid`, `_rank_specialist`,
+    `gather_union_top_n_wallets`). Recency-filter clauses now
+    bypass on `NOT stats_seeded.has_data OR NOT stats_fresh.is_fresh
+    OR <recency clause>`.
+    New `_record_stats_staleness_if_needed(conn)` helper called at the
+    top of `rank_traders` and `gather_union_top_n_wallets`. On stale
+    state, ticks `STATS_STALE` health counter + emits a WARN log.
+    Best-effort: probe failures don't block the ranker (the SQL gate
+    is the actual fix; this is observability).
+  - `app/services/health_counters.py` — `STATS_STALE` constant + 1h
+    retention + included in `snapshot()`.
+- **Behavioral change**: when the nightly stats job stops running,
+  the rankers continue to return results (recency filter bypasses
+  past 7 days of staleness) AND the operator sees a `STATS_STALE`
+  counter ticking on `/system/status`. Before this fix, the rankers
+  silently returned `[]` and the only signal was "no signals fired"
+  three days later.
+
+**#16 — `snapshot_runs` completeness ledger**
+
+- Migration 020 (Tier A) added the table; this commit wires producers
+  + consumers.
+- **Files**:
+  - `app/db/crud.py` — three new helpers:
+    `insert_snapshot_run(conn, snapshot_date, started_at, completed_at,
+    total_combos, succeeded_combos, failed_combos, failures,
+    duration_seconds)` (UPSERT on `snapshot_date` PK so re-runs
+    overwrite); `latest_snapshot_run(conn)` returning the most-recent
+    row by `completed_at`; `latest_complete_snapshot_date(conn)`
+    returning the most-recent date where `failed_combos = 0`.
+  - `app/scheduler/jobs.py` — `daily_leaderboard_snapshot` now
+    captures `completed_at` and calls `crud.insert_snapshot_run` at
+    the end of the run with the actual results. Best-effort: a
+    ledger-write failure logs a warning but doesn't invalidate the
+    snapshot rows already committed in `leaderboard_snapshots`.
+  - `app/api/routes/system.py` — `/system/status.daily_snapshot` gains
+    `latest_run` (snapshot_date, complete bool, total_combos,
+    succeeded_combos, failed_combos, duration_seconds, completed_at)
+    and `last_complete_date`. `counters` gains
+    `stats_stale_last_hour`.
+- **Behavioral change**: the operator now sees in real time whether
+  the latest snapshot run was complete. Downstream readers that need
+  strict completeness can gate on
+  `crud.latest_complete_snapshot_date()` instead of
+  `MAX(snapshot_date)` to avoid mixing today's incomplete partial
+  with yesterday's full data.
+
+**Tests**:
+
+- `scripts/smoke_phase_pass5_ops_visibility.py` — 36 new tests:
+  - Code-shape regressions: `stats_fresh` CTE in all 4 SQL sites,
+    `STATS_STALE` constant + counter inclusion, all 4 crud helpers
+    present, `STATS_FRESHNESS_MAX_DAYS = 7`, jobs hook calls
+    `crud.insert_snapshot_run`, `/system/status` surfaces
+    `latest_run` + `last_complete_date` + `stats_freshness`.
+  - `get_stats_freshness` round-trip: empty path (seeded=False, fresh
+    trivially True), synthetic NOW() seed (seeded=True, fresh=True),
+    synthetic 14-days-ago seed (when only seed row, seeded=True,
+    fresh=False).
+  - `_record_stats_staleness_if_needed` with monkey-patched freshness:
+    stale → counter ticks; fresh → no tick; not seeded → no tick.
+  - `insert_snapshot_run` round-trip + UPSERT idempotence; jsonb
+    failures payload preserved; `latest_complete_snapshot_date`
+    skips runs with `failed_combos > 0` even when they're more
+    recent.
+- All 18 smoke suites pass: **811/811** (was 775, +36 new).

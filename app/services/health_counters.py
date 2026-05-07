@@ -38,6 +38,13 @@ ZOMBIE_DROP_MARKET_CLOSED: Final[str] = "zombie_drop_market_closed"
 ZOMBIE_DROP_DUST_SIZE: Final[str] = "zombie_drop_dust_size"
 ZOMBIE_DROP_RESOLVED_PRICE_PAST: Final[str] = "zombie_drop_resolved_price_past"
 
+# Pass 5 #6: trader_category_stats freshness. Recorded by the ranker
+# entrypoints when stats are seeded but the most recent last_trade_at
+# is >7 days old (= the nightly trader-stats job is stuck or dead).
+# 1h retention -- this is an active alert state, not a daily pattern;
+# if it's still set after an hour the operator should already be on it.
+STATS_STALE: Final[str] = "stats_stale"
+
 # How long to keep each event class. Events older than this get pruned.
 _RETENTION: dict[str, timedelta] = {
     RATE_LIMIT_HIT: timedelta(hours=1),
@@ -47,6 +54,7 @@ _RETENTION: dict[str, timedelta] = {
     ZOMBIE_DROP_MARKET_CLOSED: timedelta(hours=24),
     ZOMBIE_DROP_DUST_SIZE: timedelta(hours=24),
     ZOMBIE_DROP_RESOLVED_PRICE_PAST: timedelta(hours=24),
+    STATS_STALE: timedelta(hours=1),
 }
 
 
@@ -86,6 +94,7 @@ def snapshot() -> dict[str, int]:
         ZOMBIE_DROP_MARKET_CLOSED,
         ZOMBIE_DROP_DUST_SIZE,
         ZOMBIE_DROP_RESOLVED_PRICE_PAST,
+        STATS_STALE,
     )
     for name in counters:
         retention = _RETENTION.get(name, timedelta(hours=1))

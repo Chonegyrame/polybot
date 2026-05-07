@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 import asyncpg
@@ -2104,3 +2104,159 @@ async def insider_holdings_for_markets(
         condition_ids,
     )
     return {(r["condition_id"], r["direction"]) for r in rows if r["direction"]}
+
+
+# ---------------------------------------------------------------------------
+# Pass 5 #6: trader_category_stats freshness gate
+# ---------------------------------------------------------------------------
+
+
+# When MAX(last_trade_at) is older than this, we consider the nightly
+# trader-stats job stuck and bypass the recency filter in trader_ranker.
+STATS_FRESHNESS_MAX_DAYS = 7
+
+
+async def get_stats_freshness(
+    conn: asyncpg.Connection,
+) -> dict[str, Any]:
+    """Return whether trader_category_stats is seeded and fresh.
+
+    Pass 5 #6: the recency filter in trader_ranker drops every wallet whose
+    overall `last_trade_at` is >RECENCY_MAX_DAYS old. If the nightly
+    trader-stats job dies, every row's `last_trade_at` ages past threshold
+    and the ranker silently returns []. F25's 72h signals_health would catch
+    "no signals" but couldn't distinguish a quiet weekend from a dead pipe.
+
+    Returns: {seeded, fresh, last_refresh}.
+      seeded     -- True if any row exists
+      fresh      -- True if MAX(last_trade_at) is within
+                    STATS_FRESHNESS_MAX_DAYS (default 7).
+                    Trivially True when not seeded (bootstrap-safe).
+      last_refresh -- MAX(last_trade_at) timestamp, or None if not seeded.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            EXISTS (SELECT 1 FROM trader_category_stats LIMIT 1) AS seeded,
+            (SELECT MAX(last_trade_at) FROM trader_category_stats) AS last_refresh
+        """
+    )
+    seeded = bool(row["seeded"]) if row else False
+    last_refresh = row["last_refresh"] if row else None
+    if not seeded:
+        # Trivially fresh -- not yet seeded means we're in bootstrap mode
+        # and the recency filter is a no-op anyway.
+        return {"seeded": False, "fresh": True, "last_refresh": None}
+    fresh = (
+        last_refresh is not None
+        and last_refresh >= datetime.now(timezone.utc)
+            - timedelta(days=STATS_FRESHNESS_MAX_DAYS)
+    )
+    return {
+        "seeded": True,
+        "fresh": fresh,
+        "last_refresh": last_refresh,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pass 5 #16: snapshot_runs completeness ledger
+# ---------------------------------------------------------------------------
+
+
+async def insert_snapshot_run(
+    conn: asyncpg.Connection,
+    *,
+    snapshot_date: date,
+    started_at: datetime,
+    completed_at: datetime,
+    total_combos: int,
+    succeeded_combos: int,
+    failed_combos: int,
+    failures: list[dict[str, str]],
+    duration_seconds: float,
+) -> None:
+    """Persist one daily_leaderboard_snapshot run for completeness tracking.
+
+    Pass 5 #16: previously partial-failure runs (e.g. 27/28 combos succeed)
+    silently committed to leaderboard_snapshots with no operator-visible
+    flag. Downstream `MAX(snapshot_date) GROUP BY category` then mixed
+    today's incomplete data with yesterday's complete data. This row gives
+    the system a single place to gate completeness checks.
+
+    Re-running on the same date overwrites the prior row (typical for
+    catch-up reruns after a partial failure).
+    """
+    await conn.execute(
+        """
+        INSERT INTO snapshot_runs
+            (snapshot_date, started_at, completed_at, total_combos,
+             succeeded_combos, failed_combos, failures, duration_seconds)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)
+        ON CONFLICT (snapshot_date) DO UPDATE SET
+            started_at       = EXCLUDED.started_at,
+            completed_at     = EXCLUDED.completed_at,
+            total_combos     = EXCLUDED.total_combos,
+            succeeded_combos = EXCLUDED.succeeded_combos,
+            failed_combos    = EXCLUDED.failed_combos,
+            failures         = EXCLUDED.failures,
+            duration_seconds = EXCLUDED.duration_seconds
+        """,
+        snapshot_date,
+        started_at,
+        completed_at,
+        total_combos,
+        succeeded_combos,
+        failed_combos,
+        json.dumps(failures),
+        duration_seconds,
+    )
+
+
+async def latest_snapshot_run(
+    conn: asyncpg.Connection,
+) -> dict[str, Any] | None:
+    """Return the most-recent snapshot_runs row (by completed_at), or None.
+
+    Used by /system/status to surface the latest run's completeness state.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT
+            snapshot_date,
+            started_at,
+            completed_at,
+            total_combos,
+            succeeded_combos,
+            failed_combos,
+            failures,
+            duration_seconds
+        FROM snapshot_runs
+        ORDER BY completed_at DESC
+        LIMIT 1
+        """
+    )
+    if not row:
+        return None
+    return dict(row)
+
+
+async def latest_complete_snapshot_date(
+    conn: asyncpg.Connection,
+) -> date | None:
+    """Return the most-recent snapshot_date where the run had zero failures.
+
+    Pass 5 #16: downstream readers that want strict completeness gate on
+    this instead of MAX(snapshot_date) -- they get the latest day where
+    every combo succeeded. Returns None if the table is empty (e.g. before
+    this fix's first complete run).
+    """
+    return await conn.fetchval(
+        """
+        SELECT snapshot_date
+        FROM snapshot_runs
+        WHERE failed_combos = 0
+        ORDER BY snapshot_date DESC
+        LIMIT 1
+        """
+    )

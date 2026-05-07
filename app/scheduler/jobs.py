@@ -166,7 +166,8 @@ async def daily_leaderboard_snapshot(
                                      entries[0].user_name if entries else "?",
                                      entries[0].pnl if entries else 0)
 
-    duration = (datetime.now(timezone.utc) - started).total_seconds()
+    completed = datetime.now(timezone.utc)
+    duration = (completed - started).total_seconds()
     result = SnapshotResult(
         snapshot_date=snapshot_date,
         total_combinations=combo_count,
@@ -175,6 +176,29 @@ async def daily_leaderboard_snapshot(
         failures=failures,
         duration_seconds=duration,
     )
+    # Pass 5 #16: persist the completeness ledger so /system/status and
+    # downstream "is today's snapshot complete?" readers can gate on
+    # failed_combos = 0. Best-effort -- a write failure here doesn't
+    # invalidate the actual snapshot rows already committed.
+    try:
+        async with pool.acquire() as conn:
+            await crud.insert_snapshot_run(
+                conn,
+                snapshot_date=snapshot_date,
+                started_at=started,
+                completed_at=completed,
+                total_combos=combo_count,
+                succeeded_combos=combo_count - len(failures),
+                failed_combos=len(failures),
+                failures=[
+                    {"combo_label": label, "error_repr": err}
+                    for label, err in failures
+                ],
+                duration_seconds=duration,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("snapshot_runs ledger write failed: %s", e)
+
     log.info(
         "=== done in %.1fs — %d rows, %d unique wallets, %d failures ===",
         duration, total_rows, len(unique_wallets), len(failures),

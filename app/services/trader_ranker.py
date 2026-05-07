@@ -80,6 +80,32 @@ async def _latest_snapshot_date_for(
     return row["d"] if row and row["d"] else None
 
 
+async def _record_stats_staleness_if_needed(conn: asyncpg.Connection) -> None:
+    """Pass 5 #6: record STATS_STALE counter when stats are seeded but
+    >7 days old (= the nightly trader-stats job is stuck).
+
+    Best-effort. The freshness check is a single-row SELECT; if it fails
+    we swallow the error rather than blocking the ranker -- the SQL gate
+    inside each ranker still bypasses correctly on staleness, this is
+    purely the operator-visible signal.
+    """
+    try:
+        from app.db import crud
+        from app.services import health_counters
+
+        freshness = await crud.get_stats_freshness(conn)
+        if freshness.get("seeded") and not freshness.get("fresh"):
+            health_counters.record(health_counters.STATS_STALE)
+            log.warning(
+                "stats_stale: trader_category_stats last_trade_at is older "
+                "than %d days (last_refresh=%s) -- nightly job may be dead",
+                crud.STATS_FRESHNESS_MAX_DAYS,
+                freshness.get("last_refresh"),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("stats-staleness probe failed: %s", e)
+
+
 async def rank_traders(
     conn: asyncpg.Connection,
     mode: RankingMode,
@@ -99,6 +125,12 @@ async def rank_traders(
     if target_date is None:
         log.warning("no snapshot available for category=%s — returning empty", category)
         return []
+
+    # Pass 5 #6: detect-and-record stats staleness so the operator sees it
+    # in /system/status. The SQL gate inside each ranker independently
+    # bypasses the recency filter -- this Python-side check is purely
+    # observability.
+    await _record_stats_staleness_if_needed(conn)
 
     if mode == "absolute":
         rows = await _rank_absolute(conn, target_date, category, top_n)
@@ -130,6 +162,19 @@ async def _rank_absolute(
         WITH stats_seeded AS (
             SELECT EXISTS (SELECT 1 FROM trader_category_stats LIMIT 1) AS has_data
         ),
+        -- Pass 5 #6: freshness gate. If the nightly trader-stats job dies,
+        -- every row's last_trade_at ages past the recency threshold and
+        -- the recency filter would silently exclude every wallet. Once
+        -- stats are >7 days stale, behave as if not yet seeded -- skip
+        -- the recency filter. The Python wrapper records a STATS_STALE
+        -- health counter when this triggers so the operator sees it.
+        stats_fresh AS (
+            SELECT (
+                COALESCE(MAX(last_trade_at), 'epoch'::TIMESTAMPTZ)
+                >= NOW() - INTERVAL '7 days'
+            ) AS is_fresh
+            FROM trader_category_stats
+        ),
         base AS (
             SELECT
                 t.proxy_wallet,
@@ -144,13 +189,16 @@ async def _rank_absolute(
                    ON tcs.proxy_wallet = ls.proxy_wallet
                   AND tcs.category = 'overall'
             CROSS JOIN stats_seeded
+            CROSS JOIN stats_fresh
             WHERE ls.snapshot_date = $1
               AND ls.category = $2
               AND ls.time_period = 'all'
               AND ls.order_by = 'PNL'
-              -- Recency filter: skip when stats not yet seeded; otherwise enforce.
+              -- Recency filter: skip when stats not yet seeded OR when
+              -- seeded-but-stale (Pass 5 #6); otherwise enforce.
               AND (
                   NOT stats_seeded.has_data
+                  OR NOT stats_fresh.is_fresh
                   OR tcs.last_trade_at >= NOW() - make_interval(days => $4)
               )
               {_EXCLUDE_CONTAMINATED_SQL}
@@ -189,6 +237,14 @@ async def _rank_hybrid(
         WITH stats_seeded AS (
             SELECT EXISTS (SELECT 1 FROM trader_category_stats LIMIT 1) AS has_data
         ),
+        stats_fresh AS (
+            -- Pass 5 #6: see _rank_absolute for rationale.
+            SELECT (
+                COALESCE(MAX(last_trade_at), 'epoch'::TIMESTAMPTZ)
+                >= NOW() - INTERVAL '7 days'
+            ) AS is_fresh
+            FROM trader_category_stats
+        ),
         base AS (
             SELECT
                 t.proxy_wallet,
@@ -202,6 +258,7 @@ async def _rank_hybrid(
                    ON tcs.proxy_wallet = ls.proxy_wallet
                   AND tcs.category = 'overall'
             CROSS JOIN stats_seeded
+            CROSS JOIN stats_fresh
             WHERE ls.snapshot_date = $1
               AND ls.category = $2
               AND ls.time_period = 'all'
@@ -209,6 +266,7 @@ async def _rank_hybrid(
               AND ls.vol >= $3
               AND (
                   NOT stats_seeded.has_data
+                  OR NOT stats_fresh.is_fresh
                   OR tcs.last_trade_at >= NOW() - make_interval(days => $5)
               )
               {_EXCLUDE_CONTAMINATED_SQL}
@@ -284,6 +342,17 @@ async def _rank_specialist(
         WITH stats_seeded AS (
             SELECT EXISTS (SELECT 1 FROM trader_category_stats LIMIT 1) AS has_data
         ),
+        stats_fresh AS (
+            -- Pass 5 #6: see _rank_absolute for rationale. When stats are
+            -- seeded but stale (>7 days), the B5 sample-size floor and the
+            -- F9 last_trade_at gate both bypass -- the alternative is
+            -- silently returning [] forever until the operator notices.
+            SELECT (
+                COALESCE(MAX(last_trade_at), 'epoch'::TIMESTAMPTZ)
+                >= NOW() - INTERVAL '7 days'
+            ) AS is_fresh
+            FROM trader_category_stats
+        ),
         active_recently AS (
             -- Wallets present in the most recent monthly per-category leaderboard
             SELECT DISTINCT proxy_wallet
@@ -332,6 +401,7 @@ async def _rank_specialist(
                    ON tcs.proxy_wallet = ls.proxy_wallet
                   AND tcs.category = ls.category
             CROSS JOIN stats_seeded
+            CROSS JOIN stats_fresh
             WHERE ls.snapshot_date = $2
               AND ls.category = $1
               AND ls.time_period = 'all'
@@ -339,9 +409,11 @@ async def _rank_specialist(
               AND ls.vol >= $3
               AND ls.pnl > 0
               AND ls.proxy_wallet IN (SELECT proxy_wallet FROM active_recently)
-              -- B5 sample-size floor: only enforce once stats are seeded.
+              -- B5 sample-size floor: only enforce once stats are seeded
+              -- AND fresh (Pass 5 #6).
               AND (
                   NOT stats_seeded.has_data
+                  OR NOT stats_fresh.is_fresh
                   OR COALESCE(tcs.resolved_trades, 0) >= $5
               )
               -- F9: also enforce the same per-category recency check that
@@ -350,9 +422,12 @@ async def _rank_specialist(
               -- monthly-leaderboard presence, which let traders qualify on
               -- one huge old trade dominating the monthly view. Layering the
               -- last_trade_at filter on top tightens correctness without
-              -- removing the monthly-presence requirement.
+              -- removing the monthly-presence requirement. Pass 5 #6:
+              -- bypassed when stats are stale (the EXISTS clause would
+              -- structurally fail).
               AND (
                   NOT stats_seeded.has_data
+                  OR NOT stats_fresh.is_fresh
                   OR EXISTS (
                       SELECT 1 FROM trader_category_stats tcs2
                       WHERE tcs2.proxy_wallet = ls.proxy_wallet
@@ -419,9 +494,23 @@ async def gather_union_top_n_wallets(
     if top_n <= 0 or not categories:
         return []
 
+    # Pass 5 #6: same staleness detector as `rank_traders`. The SQL gates
+    # below already bypass on staleness -- this records the counter so the
+    # operator sees it in /system/status. Idempotent (latching counter).
+    await _record_stats_staleness_if_needed(conn)
+
     sql = """
     WITH stats_seeded AS (
         SELECT EXISTS (SELECT 1 FROM trader_category_stats LIMIT 1) AS has_data
+    ),
+    stats_fresh AS (
+        -- Pass 5 #6: bypass recency filter when stats are >7 days stale.
+        -- See _rank_absolute for rationale.
+        SELECT (
+            COALESCE(MAX(last_trade_at), 'epoch'::TIMESTAMPTZ)
+            >= NOW() - INTERVAL '7 days'
+        ) AS is_fresh
+        FROM trader_category_stats
     ),
     latest_per_category AS (
         SELECT category, MAX(snapshot_date) AS d
@@ -490,13 +579,17 @@ async def gather_union_top_n_wallets(
                ON tcs.proxy_wallet = ls.proxy_wallet
               AND tcs.category = ls.category
         CROSS JOIN stats_seeded
+        CROSS JOIN stats_fresh
         WHERE ls.time_period = 'all'
           AND ls.order_by = 'PNL'
           AND ls.category = ANY($1::TEXT[])
           AND ls.proxy_wallet NOT IN (SELECT proxy_wallet FROM contaminated)
-          -- Recency filter on Absolute & Hybrid (overall last-trade-at)
+          -- Recency filter on Absolute & Hybrid (overall last-trade-at).
+          -- Pass 5 #6: bypassed when stats are seeded-but-stale; otherwise
+          -- the entire pool empties out the moment the nightly job dies.
           AND (
               NOT stats_seeded.has_data
+              OR NOT stats_fresh.is_fresh
               OR ls.proxy_wallet IN (SELECT proxy_wallet FROM recent_overall)
           )
     ),
@@ -553,13 +646,19 @@ async def gather_union_top_n_wallets(
                ) AS rn
         FROM shrunk b
         CROSS JOIN stats_seeded
+        CROSS JOIN stats_fresh
         WHERE b.vol >= $3 AND b.pnl > 0
           AND EXISTS (
               SELECT 1 FROM active_recently a
               WHERE a.category = b.category AND a.proxy_wallet = b.proxy_wallet
           )
-          -- B5 sample-size floor for Specialist (skip until stats seeded)
-          AND (NOT stats_seeded.has_data OR b.resolved_trades >= $7)
+          -- B5 sample-size floor for Specialist (skip until stats seeded
+          -- AND fresh, Pass 5 #6).
+          AND (
+              NOT stats_seeded.has_data
+              OR NOT stats_fresh.is_fresh
+              OR b.resolved_trades >= $7
+          )
     )
     SELECT proxy_wallet FROM (
         SELECT proxy_wallet FROM ranked_absolute   WHERE rn <= $4

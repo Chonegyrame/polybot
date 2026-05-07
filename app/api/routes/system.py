@@ -92,6 +92,19 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
         days_since_snapshot, SNAPSHOT_GREEN_MAX_DAYS, SNAPSHOT_AMBER_MAX_DAYS
     )
 
+    # Pass 5 #16: surface the latest snapshot run's completeness state.
+    # Operator-visible indicator so a partial run (e.g. 27/28 combos) is
+    # caught immediately instead of silently mixing today's incomplete
+    # data with yesterday's complete data downstream.
+    latest_run = await crud.latest_snapshot_run(conn)
+    last_complete_date = await crud.latest_complete_snapshot_date(conn)
+
+    # Pass 5 #6: trader_category_stats freshness. When seeded but stale
+    # (>7 days old) the rankers' recency filters bypass automatically and
+    # the STATS_STALE health counter ticks; this surface lets the UI show
+    # the operator the underlying state.
+    stats_freshness = await crud.get_stats_freshness(conn)
+
     # --- Wallet classifier (weekly) ---
     # F23: extracted to crud.latest_classification_at
     last_classified_at = await crud.latest_classification_at(conn)
@@ -133,6 +146,38 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
                 "health": snapshot_health,
                 "last_date": last_snapshot.isoformat() if last_snapshot else None,
                 "days_since": days_since_snapshot,
+                # Pass 5 #16: completeness ledger (snapshot_runs) state.
+                # `complete=True` iff the latest run had failed_combos = 0;
+                # `last_complete_date` is the most-recent fully-successful
+                # run's date (may differ from `last_date` if today's run
+                # had partial failures).
+                "latest_run": (
+                    {
+                        "snapshot_date": latest_run["snapshot_date"].isoformat(),
+                        "complete": int(latest_run["failed_combos"]) == 0,
+                        "total_combos": int(latest_run["total_combos"]),
+                        "succeeded_combos": int(latest_run["succeeded_combos"]),
+                        "failed_combos": int(latest_run["failed_combos"]),
+                        "duration_seconds": float(latest_run["duration_seconds"]),
+                        "completed_at": latest_run["completed_at"].isoformat(),
+                    }
+                    if latest_run else None
+                ),
+                "last_complete_date": (
+                    last_complete_date.isoformat() if last_complete_date else None
+                ),
+            },
+            # Pass 5 #6: trader-stats freshness for the rankers' recency
+            # filter. seeded=False means we're in bootstrap mode; fresh=False
+            # with seeded=True means the nightly job is stuck and the
+            # ranker is bypassing recency until it recovers.
+            "stats_freshness": {
+                "seeded": bool(stats_freshness["seeded"]),
+                "fresh": bool(stats_freshness["fresh"]),
+                "last_refresh": (
+                    stats_freshness["last_refresh"].isoformat()
+                    if stats_freshness["last_refresh"] else None
+                ),
             },
             "wallet_classifier": {
                 "health": classifier_health,
@@ -158,6 +203,10 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
             "rate_limit_hits_last_hour": counters["rate_limit_hit"],
             "cycle_duration_warnings_last_24h": counters["cycle_duration_warning"],
             "api_failures_last_hour": counters["api_failure"],
+            # Pass 5 #6: stats-stale events recorded by the ranker
+            # entrypoints when they detect trader_category_stats is
+            # seeded but >7 days old. Non-zero = nightly job problem.
+            "stats_stale_last_hour": counters["stats_stale"],
             # Zombie/dust position drops at the API boundary (24h windows).
             # If `redeemable` suddenly drops to ~0 with the others unchanged,
             # Polymarket has likely renamed the field -- investigate.
