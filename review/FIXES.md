@@ -888,3 +888,55 @@ it and the test that prevents regression.
   value)` per identity follows the plan as written; alternative `SUM`
   would assume non-shared funding which is the worse default for
   sybil clusters.
+
+### Tier B — item #3 — specialist Bayesian prior over winners only
+
+- **Status**: fixed (commit 3 of the Pass 5 plan)
+- **Source**: `review/PASS5_AUDIT.md` item #3 (Critical). Same shape as
+  the F1 bug (Pass 1) but relocated to specialist mode.
+- **Files**:
+  - `app/services/trader_ranker.py` — `_rank_specialist`: new
+    `prior_pool` CTE that drops the candidate-restricting filters
+    (`pnl > 0`, `active_recently`, `resolved_trades >= $5`, F9
+    `last_trade_at`) and keeps only the data-quality filters (snapshot
+    date, category, time_period, order_by, specialist `vol >= $3`
+    floor, contamination exclusion). `cat_avg` now computes
+    `prior_roi = SUM(pnl)/SUM(vol)` from `prior_pool`. `base` (the
+    candidate set being ranked) is unchanged.
+  - `app/services/trader_ranker.py` — `gather_union_top_n_wallets`:
+    same pattern, scaled to the multi-category bulk query. New
+    `prior_pool` CTE drops the `recent_overall` recency filter (which
+    `base` retains for its own purposes); keeps the contamination
+    exclusion. `cat_avg` reads from `prior_pool` per category.
+  - `scripts/smoke_phase_pass5_specialist_prior.py` — 17 new tests:
+    code-shape regressions (both `_rank_specialist` and
+    `gather_union_top_n_wallets` have `prior_pool` CTE; `base` still
+    filters `pnl>0` / `active_recently` / `recent_overall`),
+    behavioral test against live DB with synthetic 'finance' category
+    data (6 winners + 4 losers + 1 candidate), and a hybrid-mode sanity
+    check (Hybrid path unchanged, candidate present with raw 20% ROI).
+- **Behavioral change**: the prior the shrinkage pulls toward changes
+  from "average ROI of qualifying winners" to "average ROI of the full
+  specialist-eligible universe." On the synthetic test scenario
+  (winners with 5% ROI on $12M vol, losers with -7.5% ROI on $4M vol,
+  candidate at $5k pnl on $25k vol):
+  - **Pre-fix prior** (winners only): 5.03%. Candidate's `shrunk_roi`
+    = (5000 + 50000 × 0.0503) / 75000 = **0.1002**.
+  - **Post-fix prior** (full pool): 1.90%. Candidate's `shrunk_roi`
+    = (5000 + 50000 × 0.0190) / 75000 = **0.0794**.
+  - Difference: ~2 percentage points lower under the honest prior, so
+    lucky tiny-volume specialists no longer get over-promoted. The
+    raw `roi` field (display) is unchanged at 0.20.
+- **Live verification**: 14 smoke suites — **723/723 passing** (was
+  706 before this commit, +17 new in `smoke_phase_pass5_specialist_prior.py`).
+  Test fixture inserts 11 synthetic wallets + leaderboard_snapshots +
+  trader_category_stats rows for `SNAP_DATE = 2099-01-15`, then cleans
+  up everything (DELETE by proxy_wallet across `traders`,
+  `leaderboard_snapshots`, `trader_category_stats`,
+  `wallet_classifications`).
+- **Scope deviation from the plan**: the plan suggested dropping
+  contamination exclusion from `prior_pool`. We kept it — including
+  market-makers / arb bots / known sybils in the prior would deflate
+  the baseline (they have high volume + ~0% ROI), giving specialists
+  the wrong target. The exclusion is about data quality, not about
+  candidate restriction — keeping it is the right call.

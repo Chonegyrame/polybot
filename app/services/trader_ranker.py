@@ -293,6 +293,31 @@ async def _rank_specialist(
               AND order_by = 'PNL'
               AND snapshot_date = $2
         ),
+        -- Pass 5 #3: honest category baseline for the Bayesian shrinkage
+        -- target. Pre-fix `cat_avg` was computed from `base`, which is
+        -- restricted to PnL>0 winners + active_recently + resolved_trades
+        -- floor. So the prior the shrinkage pulled toward was the average
+        -- ROI of qualifying winners -- structurally inflated. Lucky tiny-
+        -- volume traders got promoted (the F1 bug, relocated here).
+        --
+        -- prior_pool drops the candidate-restricting filters and keeps
+        -- only the per-snapshot data-quality filters: same date / category
+        -- / time_period / order_by, the specialist volume floor (defines
+        -- the specialist-eligible universe), and contamination exclusion
+        -- (MM/arb/sybils don't represent the population we want to shrink
+        -- toward). pnl>0, active_recently, resolved_trades floor, and the
+        -- F9 last_trade_at gate are all dropped here.
+        prior_pool AS (
+            SELECT ls.pnl, ls.vol
+            FROM leaderboard_snapshots ls
+            JOIN traders t USING (proxy_wallet)
+            WHERE ls.snapshot_date = $2
+              AND ls.category = $1
+              AND ls.time_period = 'all'
+              AND ls.order_by = 'PNL'
+              AND ls.vol >= $3
+              {_EXCLUDE_CONTAMINATED_SQL}
+        ),
         base AS (
             SELECT
                 t.proxy_wallet,
@@ -338,9 +363,11 @@ async def _rank_specialist(
               {_EXCLUDE_CONTAMINATED_SQL}
         ),
         cat_avg AS (
-            -- F1: ROI prior, not dollar-pnl prior. See _rank_hybrid for detail.
+            -- F1 + Pass 5 #3: ROI prior over the FULL specialist-eligible
+            -- pool (winners and losers alike), not over `base` (winners
+            -- only). See prior_pool comment above.
             SELECT COALESCE(SUM(pnl)::NUMERIC / NULLIF(SUM(vol), 0), 0)
-                   AS prior_roi FROM base
+                   AS prior_roi FROM prior_pool
         ),
         shrunk AS (
             SELECT
@@ -425,6 +452,28 @@ async def gather_union_top_n_wallets(
         WHERE category = 'overall'
           AND last_trade_at >= NOW() - make_interval(days => $5)
     ),
+    -- Pass 5 #3 (gather_union variant): broader pool for the per-category
+    -- shrinkage prior. `base` is recency-filtered (recent_overall), so a
+    -- prior computed from base reflects the active subset only. After
+    -- this fix, `prior_pool` includes inactive traders too -- the right
+    -- baseline because the prior should represent "what does an average
+    -- specialist-eligible trader earn?", not "what does an average active
+    -- trader earn?". Contamination exclusion stays; vol floor stays.
+    -- Mirrors the same pattern applied in _rank_specialist's prior_pool.
+    prior_pool AS (
+        SELECT
+            ls.category,
+            ls.pnl,
+            ls.vol
+        FROM leaderboard_snapshots ls
+        JOIN latest_per_category lpc
+          ON lpc.category = ls.category AND lpc.d = ls.snapshot_date
+        JOIN traders t USING (proxy_wallet)
+        WHERE ls.time_period = 'all'
+          AND ls.order_by = 'PNL'
+          AND ls.category = ANY($1::TEXT[])
+          AND ls.proxy_wallet NOT IN (SELECT proxy_wallet FROM contaminated)
+    ),
     base AS (
         SELECT
             ls.category,
@@ -451,13 +500,14 @@ async def gather_union_top_n_wallets(
               OR ls.proxy_wallet IN (SELECT proxy_wallet FROM recent_overall)
           )
     ),
-    -- F1: Per-category Bayesian prior for shrinkage. Must be an ROI rate
-    -- (sum_pnl / sum_vol), not AVG(pnl) which is a dollar quantity.
+    -- F1 + Pass 5 #3: Per-category Bayesian prior for shrinkage. ROI rate
+    -- (sum_pnl / sum_vol), and computed from prior_pool (full eligible
+    -- universe) rather than `base` (recency-filtered subset).
     cat_avg AS (
         SELECT category,
                COALESCE(SUM(pnl)::NUMERIC / NULLIF(SUM(vol), 0), 0)
                  AS prior_roi
-        FROM base GROUP BY category
+        FROM prior_pool GROUP BY category
     ),
     shrunk AS (
         SELECT b.*,
