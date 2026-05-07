@@ -1,167 +1,189 @@
-"""B2 — counterparty diagnostic.
+"""B2 + R4 + R7 (Pass 3) -- positions-based counterparty diagnostic.
 
-When a signal fires we ask: are any of the wallets in our tracked top-N
-pool currently trading AGAINST our signal direction on this market? If
-yes, the UI should warn "smart money is also on the other side" — same
-pool, opposite conviction, a strong indicator that the consensus may be
-less unanimous than the signal detector suggests.
+When a signal fires we ask: are any wallets in the tracked top-N pool
+CURRENTLY positioned on the OTHER side of this market with meaningful
+conviction? If yes, the UI surfaces "N top traders hold opposite side" --
+a contested-signal warning that tells the user the smart-money consensus
+isn't unanimous.
 
-F12 + F2 (combined): switched data source from `clob.polymarket.com/trades`
-(which required API auth and silently 401'd) to `data-api.polymarket.com/trades?
-market=<conditionId>` (public, no auth). The new endpoint returns trades from
-each trader's perspective with `(outcome, side)` pairs — cleaner than the
-maker/taker semantics the original implementation tried to use.
+This is a complete rewrite of the original CLOB-fills-based check
+(F12+F2 in Pass 2). The fills-based approach had two problems:
 
-Counterparty rule: a trader is a counterparty to our signal if they took
-a position on the OPPOSITE side. For a YES-direction signal:
-  - outcome="Yes" + side="SELL"  → exited a Yes position
-  - outcome="No"  + side="BUY"   → bet against Yes via a No buy
-For a NO-direction signal, mirror.
+  R4: a top trader who already held YES and sold some YES to take profit
+      was flagged as counterparty. But partial profit-takers are not
+      adversaries -- they're still long net-YES, just lighter. The
+      warning fired on essentially every winning trending market.
 
-Pure-function `detect_counterparty_overlap` keeps the logic testable; the
-DB / API plumbing lives in `check_and_persist_counterparty_warning`.
+  R7: fills had no time bound. A wallet who exited NO three weeks ago
+      got flagged as a counterparty to a fresh YES signal today.
+
+Pass 3 fix: query the POSITIONS table directly. For each wallet in the
+tracked pool that has a position on this market, classify them by
+(opposite_size_usdc, concentration_ratio). Counterparty iff:
+
+  - opposite_size_usdc >= MIN_OPPOSITE_USDC  (default $5k -- ignore
+    micro-positions that are effectively noise)
+  - opposite_size_usdc / (same_size + opposite_size) >= CONCENTRATION_THRESHOLD
+    (default 0.75 -- ignore hedgers / partial-position traders; require
+    the wallet's bet to be heavily on the opposite side)
+
+Returns the COUNT of qualifying wallets so the UI can tier the warning:
+  count == 0 -> no warning (clean signal)
+  count 1-2  -> mild warning ("1 top trader holds opposite side")
+  count 3+   -> strong warning ("3 top traders hold opposite side")
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable
+from typing import Iterable
 
 import asyncpg
 
 from app.db import crud
-from app.services.polymarket import PolymarketClient
 
 log = logging.getLogger(__name__)
 
-# Default fills page — tuned to be cheap. Polymarket data-api usually
-# responds in well under 1s.
-DEFAULT_FILLS_LIMIT = 100
+# Floors -- both must be cleared for a wallet to count as counterparty.
+MIN_OPPOSITE_USDC = 5_000.0       # absolute size floor (matches watchlist floor)
+CONCENTRATION_THRESHOLD = 0.75    # opposite_size / total_size on this market
 
 
-def _normalise_wallet(addr: str | None) -> str | None:
-    if not addr or not isinstance(addr, str):
-        return None
-    addr = addr.strip().lower()
-    if not addr.startswith("0x") or len(addr) != 42:
-        return None
-    return addr
+def _opposite_outcome(signal_direction: str) -> str:
+    """Map signal direction to the position outcome that would be adversarial."""
+    return "No" if signal_direction == "YES" else "Yes"
 
 
-def _is_counterparty_fill(fill: dict[str, Any], signal_direction: str) -> bool:
-    """Decide whether a single fill represents a trade AGAINST the signal.
+def _same_outcome(signal_direction: str) -> str:
+    """Map signal direction to the position outcome that's same-side."""
+    return "Yes" if signal_direction == "YES" else "No"
 
-    For YES signals (we're buying YES tokens), a counterparty is anyone who:
-      - sold YES tokens         (outcome="Yes", side="SELL")
-      - bought NO tokens        (outcome="No",  side="BUY")
-    For NO signals, mirrored.
 
-    Returns False on any fill where we can't determine outcome+side cleanly
-    (defensive — false negative is preferable to false positive on a
-    diagnostic the user reads as a "warn me" indicator).
+def is_counterparty(
+    same_side_usdc: float,
+    opposite_side_usdc: float,
+    *,
+    min_opposite_usdc: float = MIN_OPPOSITE_USDC,
+    concentration_threshold: float = CONCENTRATION_THRESHOLD,
+) -> bool:
+    """Pure decision function for "is this wallet a counterparty?"
+
+    Returns True iff:
+      - opposite_side_usdc >= min_opposite_usdc  (absolute size floor)
+      - opposite_side_usdc / (same + opposite) >= concentration_threshold
     """
-    outcome = fill.get("outcome")
-    side = fill.get("side")
-    if not isinstance(outcome, str) or not isinstance(side, str):
+    if opposite_side_usdc < min_opposite_usdc:
         return False
-    out_norm = outcome.strip().lower()
-    side_norm = side.strip().upper()
-    # Reject fills that aren't on a clean YES/NO outcome — multi-outcome
-    # markets or weird labels are out of scope for V1 (consistent with
-    # signal_detector's _outcome_to_direction filter).
-    if out_norm not in ("yes", "no") or side_norm not in ("BUY", "SELL"):
+    total = same_side_usdc + opposite_side_usdc
+    if total <= 0:
         return False
-    if signal_direction == "YES":
-        # counterparty = exited Yes OR entered No
-        return (out_norm == "yes" and side_norm == "SELL") or (
-            out_norm == "no" and side_norm == "BUY"
-        )
-    if signal_direction == "NO":
-        # counterparty = exited No OR entered Yes
-        return (out_norm == "no" and side_norm == "SELL") or (
-            out_norm == "yes" and side_norm == "BUY"
-        )
-    return False
+    concentration = opposite_side_usdc / total
+    return concentration >= concentration_threshold
 
 
-def _extract_counterparty_wallets(
-    fills: Iterable[dict[str, Any]], signal_direction: str,
-) -> set[str]:
-    """Pull `proxyWallet` addresses for fills that are counterparty to our
-    signal direction.
+async def find_counterparty_wallets(
+    conn: asyncpg.Connection,
+    *,
+    condition_id: str,
+    signal_direction: str,
+    tracked_pool: Iterable[str],
+    min_opposite_usdc: float = MIN_OPPOSITE_USDC,
+    concentration_threshold: float = CONCENTRATION_THRESHOLD,
+) -> list[dict[str, float | str]]:
+    """Return list of counterparty wallets for one signal.
 
-    F12+F2: replaces the old maker-side filter that targeted the CLOB
-    /trades endpoint. The data-api /trades response is per-trader, so we
-    use `proxyWallet` directly as the wallet identity (no maker/taker
-    disambiguation needed).
+    Each entry: {wallet, same_usdc, opposite_usdc, concentration}.
+    Sorted by opposite_usdc DESC (biggest counterparties first).
+
+    Implementation: one bulk SQL pulls all positions for tracked-pool
+    wallets on this market, aggregating per-wallet by (same vs opposite).
+    Filtered to the YES/NO outcomes only (multi-outcome positions ignored,
+    consistent with signal_detector).
     """
-    out: set[str] = set()
-    for fill in fills:
-        if not _is_counterparty_fill(fill, signal_direction):
+    pool_list = list(tracked_pool)
+    if not pool_list:
+        return []
+
+    same_outcome = _same_outcome(signal_direction)
+    opposite_outcome = _opposite_outcome(signal_direction)
+
+    rows = await conn.fetch(
+        """
+        SELECT
+            p.proxy_wallet,
+            SUM(CASE WHEN LOWER(p.outcome) = LOWER($1) THEN p.current_value ELSE 0 END)
+                AS same_usdc,
+            SUM(CASE WHEN LOWER(p.outcome) = LOWER($2) THEN p.current_value ELSE 0 END)
+                AS opposite_usdc
+        FROM positions p
+        WHERE p.condition_id = $3
+          AND p.proxy_wallet = ANY($4::TEXT[])
+          AND p.size > 0
+          AND LOWER(p.outcome) IN ('yes', 'no')
+        GROUP BY p.proxy_wallet
+        HAVING SUM(CASE WHEN LOWER(p.outcome) = LOWER($2) THEN p.current_value ELSE 0 END) > 0
+        """,
+        same_outcome, opposite_outcome, condition_id, pool_list,
+    )
+
+    out: list[dict[str, float | str]] = []
+    for r in rows:
+        same_u = float(r["same_usdc"] or 0.0)
+        opp_u = float(r["opposite_usdc"] or 0.0)
+        if not is_counterparty(
+            same_u, opp_u,
+            min_opposite_usdc=min_opposite_usdc,
+            concentration_threshold=concentration_threshold,
+        ):
             continue
-        norm = _normalise_wallet(fill.get("proxyWallet"))
-        if norm:
-            out.add(norm)
+        total = same_u + opp_u
+        out.append({
+            "wallet": r["proxy_wallet"],
+            "same_usdc": same_u,
+            "opposite_usdc": opp_u,
+            "concentration": (opp_u / total) if total > 0 else 0.0,
+        })
+
+    out.sort(key=lambda d: d["opposite_usdc"], reverse=True)  # type: ignore[arg-type]
     return out
 
 
-def detect_counterparty_overlap(
-    fills: list[dict[str, Any]],
-    tracked_pool: set[str],
-    signal_direction: str,
-) -> bool:
-    """Return True iff at least one counterparty wallet is in the tracked pool.
-
-    `tracked_pool` is the union of every wallet seen across recent
-    leaderboards — i.e., "every wallet our top-N filters could surface."
-    `signal_direction` is "YES" or "NO" — determines which fills count
-    as counterparties (see _is_counterparty_fill). Both arguments use
-    lowercased proxy wallet addresses.
-    """
-    if not fills or not tracked_pool:
-        return False
-    counterparties = _extract_counterparty_wallets(fills, signal_direction)
-    pool_lower = {w.lower() for w in tracked_pool}
-    return bool(counterparties & pool_lower)
-
-
-async def check_and_persist_counterparty_warning(
+async def check_and_persist_counterparty_count(
     conn: asyncpg.Connection,
-    pm: PolymarketClient,
     *,
     signal_log_id: int,
     condition_id: str,
     signal_direction: str,
-    tracked_pool: set[str],
-) -> bool:
-    """Run the check for one freshly-fired signal and write the result.
+    tracked_pool: Iterable[str],
+) -> int:
+    """R4+R7 (Pass 3): replace the old binary boolean with a count.
 
-    F12+F2: signature changed — now takes `condition_id` + `signal_direction`
-    (used to select the correct counterparty side) instead of `token_id`
-    (which was the wrong handle anyway since we're not using the CLOB
-    endpoint anymore).
-
-    Non-blocking: any exception is logged and the warning stays False
-    (it defaults to False at INSERT time anyway). Returns the persisted
-    bool so the caller can log a summary count.
+    Runs the positions-based check + persists the count to signal_log.
+    Non-blocking: any exception is logged and the count stays 0 (the
+    column default). Returns the count for caller-side logging.
     """
     try:
-        fills = await pm.get_market_trades(condition_id, limit=DEFAULT_FILLS_LIMIT)
+        wallets = await find_counterparty_wallets(
+            conn,
+            condition_id=condition_id,
+            signal_direction=signal_direction,
+            tracked_pool=tracked_pool,
+        )
     except Exception as e:  # noqa: BLE001
         log.warning(
-            "counterparty: data-api /trades raised for signal_log_id=%s cid=%s: %s",
+            "counterparty: positions query failed for signal_log_id=%s cid=%s: %s",
             signal_log_id, condition_id[:12], e,
         )
-        return False
+        return 0
 
-    overlap = detect_counterparty_overlap(fills, tracked_pool, signal_direction)
-    if overlap:
+    count = len(wallets)
+    if count > 0:
         try:
-            await crud.set_counterparty_warning(conn, signal_log_id)
+            await crud.set_counterparty_count(conn, signal_log_id, count)
         except Exception as e:  # noqa: BLE001
             log.warning(
-                "counterparty: failed to persist warning for signal_log_id=%s: %s",
-                signal_log_id, e,
+                "counterparty: failed to persist count=%d for signal_log_id=%s: %s",
+                count, signal_log_id, e,
             )
-            return False
-    return overlap
+            return 0
+    return count

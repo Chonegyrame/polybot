@@ -26,7 +26,7 @@ from app.services.polymarket import (
     LeaderboardTimePeriod,
     PolymarketClient,
 )
-from app.services.counterparty import check_and_persist_counterparty_warning
+from app.services.counterparty import check_and_persist_counterparty_count
 from app.services.exit_detector import ExitEvent, detect_exits
 from app.services.half_life import pick_offset_for_age
 from app.services.market_sync import discover_and_persist_markets
@@ -635,11 +635,13 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                                 (f"{label}/book/{s.condition_id[:12]}", repr(e))
                             )
 
-                        # B2: counterparty check is non-blocking — failures don't
-                        # touch the signal_log row (warning stays FALSE by default).
-                        # F12+F2: switched to data-api /trades?market=<conditionId>;
-                        # no longer needs token_id lookup, passes signal_direction
-                        # so the extraction can filter by (outcome, side).
+                        # R4+R7 (Pass 3): positions-based counterparty check.
+                        # Replaces the fills-based F12 path. Non-blocking:
+                        # failures leave counterparty_count = 0 (column default).
+                        # The check now requires opposing-side wallets to hold
+                        # >=$5k AND be >=75% concentrated against -- filters out
+                        # partial profit-takers and hedgers that flooded the
+                        # warning under the old logic.
                         if tracked_pool:
                             try:
                                 sid = await crud.get_signal_log_id(
@@ -647,14 +649,14 @@ async def log_signals(top_n: int = LOG_SIGNALS_TOP_N) -> LogSignalsResult:
                                     s.condition_id, s.direction,
                                 )
                                 if sid is not None:
-                                    flagged = await check_and_persist_counterparty_warning(
-                                        conn, pm,
+                                    cp_count = await check_and_persist_counterparty_count(
+                                        conn,
                                         signal_log_id=sid,
                                         condition_id=s.condition_id,
                                         signal_direction=s.direction,
                                         tracked_pool=tracked_pool,
                                     )
-                                    if flagged:
+                                    if cp_count > 0:
                                         counterparty_warnings += 1
                             except Exception as e:  # noqa: BLE001
                                 log.warning(

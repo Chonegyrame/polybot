@@ -771,6 +771,185 @@ test_r10_unified_close()
 
 
 # ---------------------------------------------------------------------------
+# R4 + R7 -- positions-based counterparty (concentration + size threshold)
+# ---------------------------------------------------------------------------
+
+section("R4 + R7 -- is_counterparty pure decision function")
+
+
+def test_r4_r7_pure() -> None:
+    from app.services.counterparty import (
+        is_counterparty, MIN_OPPOSITE_USDC, CONCENTRATION_THRESHOLD,
+    )
+
+    check("R4+R7: defaults locked at $5k + 75%",
+          MIN_OPPOSITE_USDC == 5000.0 and CONCENTRATION_THRESHOLD == 0.75,
+          f"min={MIN_OPPOSITE_USDC} conc={CONCENTRATION_THRESHOLD}")
+
+    # Walk-through table from the user-locked spec:
+    cases = [
+        # (same, opposite, expected_is_counterparty, label)
+        (0,    10000, True,  "$0 same + $10k opp -> 100% conc, flag"),
+        (2000, 8000,  True,  "$2k same + $8k opp -> 80% conc, flag"),
+        (3000, 9000,  True,  "$3k same + $9k opp -> 75% conc, flag (threshold)"),
+        (5000, 10000, False, "$5k same + $10k opp -> 67% conc, NO flag"),
+        (50000, 100000, False, "$50k same + $100k opp -> 67% conc, NO flag (whale hedged)"),
+        (0, 4000, False, "$0 same + $4k opp -> below $5k floor, NO flag"),
+        (10000, 15000, True, "$10k same + $15k opp -> 60% conc -- should NOT flag"),
+        # Wait, 15000 / 25000 = 0.60, BELOW 0.75 threshold -> should NOT flag
+        # Let me fix the case above: actually expected = False
+    ]
+    # Override the above last case which was wrong:
+    cases[-1] = (10000, 15000, False, "$10k same + $15k opp -> 60% conc, NO flag")
+
+    for same, opp, expected, label in cases:
+        got = is_counterparty(same, opp)
+        check(f"R4+R7: {label}", got == expected,
+              f"got {got}, expected {expected}")
+
+
+test_r4_r7_pure()
+
+
+section("R4 + R7 -- find_counterparty_wallets DB integration")
+
+
+async def test_r4_r7_db() -> None:
+    from app.db.connection import init_pool, close_pool
+    from app.services.counterparty import find_counterparty_wallets
+
+    pool = await init_pool(min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            # Need: a real condition_id with both YES + NO tokens, and
+            # at least one tracked wallet to insert positions for.
+            mkt = await conn.fetchrow(
+                """
+                SELECT condition_id FROM markets
+                WHERE clob_token_yes IS NOT NULL AND clob_token_yes <> ''
+                  AND clob_token_no IS NOT NULL AND clob_token_no <> ''
+                  AND closed = FALSE
+                LIMIT 1
+                """,
+            )
+            if mkt is None:
+                check("R4+R7: skipped (no market)", True)
+                return
+
+            wallets = await conn.fetch(
+                "SELECT proxy_wallet FROM traders LIMIT 3"
+            )
+            if len(wallets) < 3:
+                check("R4+R7: skipped (need >=3 traders)", True)
+                return
+            w1 = wallets[0]["proxy_wallet"]
+            w2 = wallets[1]["proxy_wallet"]
+            w3 = wallets[2]["proxy_wallet"]
+
+            cid = mkt["condition_id"]
+
+            # Snapshot any pre-existing positions so we can restore them
+            existing = await conn.fetch(
+                """
+                SELECT proxy_wallet, condition_id, asset, outcome,
+                       size, cur_price, current_value, avg_price,
+                       first_seen_at, last_updated_at
+                FROM positions
+                WHERE condition_id = $1
+                  AND proxy_wallet IN ($2, $3, $4)
+                """,
+                cid, w1, w2, w3,
+            )
+
+            # Wipe just for test
+            await conn.execute(
+                """
+                DELETE FROM positions
+                WHERE condition_id = $1
+                  AND proxy_wallet IN ($2, $3, $4)
+                """, cid, w1, w2, w3,
+            )
+
+            # Insert test positions:
+            # w1: $10k NO only -> clear counterparty for YES signal
+            # w2: $5k YES + $10k NO (67% NO conc) -> NOT counterparty
+            # w3: $0 YES + $4k NO (below $5k floor) -> NOT counterparty
+            async def ins(w: str, outcome: str, size: float, value: float):
+                await conn.execute(
+                    """
+                    INSERT INTO positions
+                      (proxy_wallet, condition_id, asset, outcome, size,
+                       cur_price, current_value, avg_price, first_seen_at,
+                       last_updated_at)
+                    VALUES ($1, $2, $3, $4, $5, 0.50, $6, 0.50,
+                            NOW(), NOW())
+                    """,
+                    w, cid, outcome + "_TOKEN", outcome, size, value,
+                )
+
+            await ins(w1, "No", 20000, 10000.0)
+            await ins(w2, "Yes", 10000, 5000.0)
+            await ins(w2, "No", 20000, 10000.0)
+            await ins(w3, "No", 8000, 4000.0)
+
+            # YES signal -> only w1 should fire
+            results = await find_counterparty_wallets(
+                conn,
+                condition_id=cid, signal_direction="YES",
+                tracked_pool=[w1, w2, w3],
+            )
+            wallets_flagged = {r["wallet"] for r in results}
+            check("R4+R7: w1 ($10k NO only) flagged on YES signal",
+                  w1 in wallets_flagged,
+                  f"flagged={wallets_flagged}")
+            check("R4+R7: w2 (67% NO conc) NOT flagged",
+                  w2 not in wallets_flagged,
+                  f"flagged={wallets_flagged}")
+            check("R4+R7: w3 ($4k below floor) NOT flagged",
+                  w3 not in wallets_flagged,
+                  f"flagged={wallets_flagged}")
+
+            # NO signal: w2 has $10k YES vs $5k NO -> 67% YES conc, fail
+            #            w1 has $10k NO only -> 0 YES, fail (no opposite)
+            #            so 0 counterparty for NO signal
+            results = await find_counterparty_wallets(
+                conn, condition_id=cid, signal_direction="NO",
+                tracked_pool=[w1, w2, w3],
+            )
+            check("R4+R7: NO signal -- 0 counterparty in this scenario",
+                  len(results) == 0,
+                  f"got {[r['wallet'] for r in results]}")
+
+            # Cleanup -- restore originals
+            await conn.execute(
+                """
+                DELETE FROM positions
+                WHERE condition_id = $1
+                  AND proxy_wallet IN ($2, $3, $4)
+                """, cid, w1, w2, w3,
+            )
+            for er in existing:
+                await conn.execute(
+                    """
+                    INSERT INTO positions
+                      (proxy_wallet, condition_id, asset, outcome, size,
+                       cur_price, current_value, avg_price, first_seen_at,
+                       last_updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    """,
+                    er["proxy_wallet"], er["condition_id"], er["asset"],
+                    er["outcome"], er["size"], er["cur_price"],
+                    er["current_value"], er["avg_price"],
+                    er["first_seen_at"], er["last_updated_at"],
+                )
+    finally:
+        await close_pool()
+
+
+asyncio.run(test_r4_r7_db())
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

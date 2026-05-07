@@ -72,7 +72,12 @@ async def get_active_signals(
                 if extra and extra["signal_entry_offer"] is not None else None
             )
             d["signal_entry_source"] = extra["signal_entry_source"] if extra else None
-            d["counterparty_warning"] = bool(extra["counterparty_warning"]) if extra else False
+            # R4+R7 (Pass 3): counterparty_count is the new int. Boolean
+            # warning is derived for back-compat (count > 0 -> True).
+            d["counterparty_count"] = (
+                int(extra["counterparty_count"]) if extra and extra.get("counterparty_count") is not None else 0
+            )
+            d["counterparty_warning"] = d["counterparty_count"] > 0
             # B1: exit-event enrichment. `has_exited` is the simple bool the
             # UI uses for the strikethrough/badge. `exit_event` carries the
             # detail dict for tooltips and side-by-side strategy compare.

@@ -46,12 +46,14 @@ from app.services.backtest_engine import (  # noqa: E402
     compute_edge_decay,
     summarize_rows,
 )
-from app.services.counterparty import (  # noqa: E402
-    _extract_counterparty_wallets,
-    _is_counterparty_fill,
-    _normalise_wallet,
-    detect_counterparty_overlap,
-)
+# R4+R7 (Pass 3): old fills-based counterparty helpers were removed and
+# replaced with positions-based logic in app.services.counterparty
+# (find_counterparty_wallets, is_counterparty). New tests live in
+# scripts/smoke_phase_pass3_fixes.py under R4 + R7. Old tests for the
+# removed _normalise_wallet, _is_counterparty_fill,
+# _extract_counterparty_wallets, detect_counterparty_overlap, and the
+# live data-api /trades shape probe have been deleted because they test
+# removed code paths.
 from app.services.polymarket import PolymarketClient  # noqa: E402
 from app.services.half_life import (  # noqa: E402
     HalfLifeRow,
@@ -145,277 +147,9 @@ async def test_migration_008_schema() -> None:
 # ===========================================================================
 
 
-def test_normalise_wallet() -> None:
-    section("B2: _normalise_wallet")
-    good = "0x" + "a" * 40
-    check("lowercase, 0x-prefix, 42 chars passes", _normalise_wallet(good) == good)
-    check("uppercase normalised to lowercase", _normalise_wallet(good.upper()) == good)
-    check("missing 0x prefix returns None", _normalise_wallet("a" * 42) is None)
-    check("wrong length returns None", _normalise_wallet("0x" + "a" * 39) is None)
-    check("None input returns None", _normalise_wallet(None) is None)
-    check("empty string returns None", _normalise_wallet("") is None)
-
-
-def test_f2_f12_counterparty_uses_outcome_and_side() -> None:
-    """F12 + F2 (combined regression): counterparty diagnostic uses
-    (outcome, side) pairs from the data-api /trades response. The yesterday-
-    shipped F2 fix targeted maker/taker fields on a CLOB endpoint that
-    requires API auth (returns 401, our code silently swallowed). After
-    switching to data-api /trades?market=<conditionId>, the response shape
-    is per-trader (proxyWallet + outcome + side), not per-fill-side.
-
-    For a YES signal, a counterparty is anyone who:
-      - Sold YES (outcome=Yes, side=SELL)  — exited a Yes position
-      - Bought NO (outcome=No, side=BUY)   — bet against Yes via No buy
-    For a NO signal, mirrored.
-
-    See review/PROBE_FINDINGS.md, review/FIXES.md F12 + F2.
-    """
-    section("F12+F2: counterparty uses (outcome, side) pairs from data-api")
-
-    # ---- _is_counterparty_fill predicate ----
-    # YES signal cases
-    check(
-        "YES signal: (Yes, SELL) is counterparty",
-        _is_counterparty_fill({"outcome": "Yes", "side": "SELL"}, "YES") is True,
-    )
-    check(
-        "YES signal: (No, BUY) is counterparty",
-        _is_counterparty_fill({"outcome": "No", "side": "BUY"}, "YES") is True,
-    )
-    check(
-        "YES signal: (Yes, BUY) is NOT counterparty (same side)",
-        _is_counterparty_fill({"outcome": "Yes", "side": "BUY"}, "YES") is False,
-    )
-    check(
-        "YES signal: (No, SELL) is NOT counterparty (same direction net)",
-        _is_counterparty_fill({"outcome": "No", "side": "SELL"}, "YES") is False,
-    )
-
-    # NO signal cases (mirror)
-    check(
-        "NO signal: (No, SELL) is counterparty",
-        _is_counterparty_fill({"outcome": "No", "side": "SELL"}, "NO") is True,
-    )
-    check(
-        "NO signal: (Yes, BUY) is counterparty",
-        _is_counterparty_fill({"outcome": "Yes", "side": "BUY"}, "NO") is True,
-    )
-    check(
-        "NO signal: (No, BUY) is NOT counterparty",
-        _is_counterparty_fill({"outcome": "No", "side": "BUY"}, "NO") is False,
-    )
-    check(
-        "NO signal: (Yes, SELL) is NOT counterparty",
-        _is_counterparty_fill({"outcome": "Yes", "side": "SELL"}, "NO") is False,
-    )
-
-    # Defensive cases — bad/missing fields, multi-outcome labels
-    check(
-        "Missing outcome: not counterparty (defensive)",
-        _is_counterparty_fill({"side": "SELL"}, "YES") is False,
-    )
-    check(
-        "Missing side: not counterparty (defensive)",
-        _is_counterparty_fill({"outcome": "Yes"}, "YES") is False,
-    )
-    check(
-        "Non-binary outcome ('Trump'): not counterparty",
-        _is_counterparty_fill({"outcome": "Trump", "side": "SELL"}, "YES") is False,
-    )
-    check(
-        "Garbage side: not counterparty",
-        _is_counterparty_fill({"outcome": "Yes", "side": "FOO"}, "YES") is False,
-    )
-
-    # ---- _extract_counterparty_wallets ----
-    addr_a = "0x" + "a" * 40
-    addr_b = "0x" + "b" * 40
-    addr_c = "0x" + "c" * 40
-    addr_upper = "0x" + "D" * 40
-
-    fills = [
-        # YES signal scenario:
-        {"proxyWallet": addr_a, "outcome": "Yes", "side": "SELL"},  # counterparty (sold yes)
-        {"proxyWallet": addr_b, "outcome": "No",  "side": "BUY"},   # counterparty (bought no)
-        {"proxyWallet": addr_c, "outcome": "Yes", "side": "BUY"},   # NOT (same side)
-        {"proxyWallet": addr_upper, "outcome": "No", "side": "BUY"},# counterparty + uppercase
-    ]
-    out_yes = _extract_counterparty_wallets(fills, "YES")
-    check(
-        "YES signal: extracts a + b + lowercased(D), excludes c",
-        out_yes == {addr_a, addr_b, addr_upper.lower()},
-        f"got {sorted(out_yes)}",
-    )
-
-    out_no = _extract_counterparty_wallets(fills, "NO")
-    # For NO signal, the same fills flip:
-    #   addr_a (Yes,SELL) → NOT counterparty (same direction as NO)
-    #   addr_b (No, BUY)  → NOT counterparty (same side as NO)
-    #   addr_c (Yes,BUY)  → counterparty (against NO)
-    #   addr_upper (No,BUY) → NOT counterparty (same side as NO)
-    check(
-        "NO signal: same fills flip — only c counts",
-        out_no == {addr_c},
-        f"got {sorted(out_no)}",
-    )
-
-    # ---- detect_counterparty_overlap ----
-    addr_in = "0x" + "1" * 40
-    addr_out = "0x" + "2" * 40
-    pool = {addr_in}
-    check(
-        "overlap=True when in-pool wallet is counterparty",
-        detect_counterparty_overlap(
-            [{"proxyWallet": addr_in, "outcome": "Yes", "side": "SELL"}],
-            pool, "YES",
-        ) is True,
-    )
-    check(
-        "overlap=False when only out-of-pool wallets are counterparty",
-        detect_counterparty_overlap(
-            [{"proxyWallet": addr_out, "outcome": "Yes", "side": "SELL"}],
-            pool, "YES",
-        ) is False,
-    )
-    check(
-        "overlap=False on empty fills",
-        detect_counterparty_overlap([], pool, "YES") is False,
-    )
-    check(
-        "overlap=False on empty pool",
-        detect_counterparty_overlap(
-            [{"proxyWallet": addr_in, "outcome": "Yes", "side": "SELL"}],
-            set(), "YES",
-        ) is False,
-    )
-    check(
-        "case-insensitive pool match",
-        detect_counterparty_overlap(
-            [{"proxyWallet": addr_in.upper(), "outcome": "Yes", "side": "SELL"}],
-            {addr_in.lower()}, "YES",
-        ) is True,
-    )
-    check(
-        "Direction-aware: same fills, opposite signal direction -> overlap flips",
-        detect_counterparty_overlap(
-            [{"proxyWallet": addr_in, "outcome": "Yes", "side": "BUY"}],
-            pool, "YES",
-        ) is False
-        and detect_counterparty_overlap(
-            [{"proxyWallet": addr_in, "outcome": "Yes", "side": "BUY"}],
-            pool, "NO",
-        ) is True,
-    )
-
-
-# ===========================================================================
-# F12 live-API contract smoke — verify data-api /trades shape against live
-# Polymarket. Catches API drift (field renames, response shape changes) that
-# would silently break our counterparty check otherwise.
-# ===========================================================================
-
-
-async def test_f12_live_data_api_trades_shape() -> None:
-    """F12 live-API contract: hit data-api /trades?market=<conditionId>
-    against the live Polymarket API and verify the response shape matches
-    what our counterparty check expects.
-
-    Skips gracefully if live API is unreachable. Fails LOUDLY (not silently)
-    if the response is wrong shape — this is the regression net for "what
-    if Polymarket renames a field" in the future.
-
-    See review/PROBE_FINDINGS.md.
-    """
-    section("F12 live: data-api /trades shape (catches future API drift)")
-
-    async with PolymarketClient() as pm:
-        # Discover an active market with recent fills via the existing
-        # markets endpoint. If none available, skip.
-        try:
-            markets = await pm.get_markets(limit=10, closed=False)
-        except Exception as e:  # noqa: BLE001
-            check(f"SKIPPED: gamma /markets unreachable ({e})", True, "skipped")
-            return
-
-        if not markets:
-            check("SKIPPED: no active markets available", True, "skipped")
-            return
-
-        # Try a few markets until one returns fills (some are too thin).
-        fills: list[dict] = []
-        used_cid = ""
-        for m in markets:
-            if not m.condition_id:
-                continue
-            try:
-                fills = await pm.get_market_trades(m.condition_id, limit=10)
-            except Exception as e:  # noqa: BLE001
-                continue
-            if fills:
-                used_cid = m.condition_id
-                break
-
-        if not fills:
-            check(
-                "SKIPPED: no fills available on any tested market",
-                True, "skipped (markets may be too thin right now)",
-            )
-            return
-
-        check(
-            f"data-api /trades returned a list (cid={used_cid[:14]}...)",
-            isinstance(fills, list) and len(fills) > 0,
-            f"got len={len(fills)}",
-        )
-
-        # Required fields for our counterparty check to work.
-        required = {"proxyWallet", "side", "outcome"}
-        first = fills[0]
-        missing = required - set(first.keys())
-        check(
-            f"first fill has required fields {sorted(required)}",
-            not missing,
-            f"missing: {sorted(missing)}; got fields: {sorted(first.keys())}",
-        )
-
-        # side values must be in {BUY, SELL}
-        side_values = {f.get("side") for f in fills if isinstance(f.get("side"), str)}
-        check(
-            "all 'side' values are BUY or SELL",
-            side_values.issubset({"BUY", "SELL"}),
-            f"got side values: {sorted(s for s in side_values if s)}",
-        )
-
-        # proxyWallet must look like a 0x-prefixed 42-char hex (Polygon proxy)
-        sample_wallet = first.get("proxyWallet", "")
-        check(
-            "proxyWallet is a normalisable Polygon address",
-            _normalise_wallet(sample_wallet) is not None,
-            f"got: {sample_wallet!r}",
-        )
-
-        # outcome should typically be Yes/No (multi-outcome markets are
-        # excluded by our pipeline anyway). At least one fill should be one
-        # of the standard binary labels.
-        outcomes = {f.get("outcome") for f in fills if isinstance(f.get("outcome"), str)}
-        binary = {o for o in outcomes if o.strip().lower() in ("yes", "no")}
-        check(
-            "at least one fill has a binary Yes/No outcome",
-            len(binary) > 0 or True,  # not strict — sample might be on a non-binary market
-            f"outcomes seen: {sorted(o for o in outcomes if o)}",
-        )
-
-        # End-to-end: the extraction function should return a set without
-        # crashing on real data.
-        wallets_yes = _extract_counterparty_wallets(fills, "YES")
-        wallets_no = _extract_counterparty_wallets(fills, "NO")
-        check(
-            "_extract_counterparty_wallets handles live data without error",
-            isinstance(wallets_yes, set) and isinstance(wallets_no, set),
-            f"YES counterparties: {len(wallets_yes)}, NO counterparties: {len(wallets_no)}",
-        )
-
+# test_normalise_wallet() removed -- _normalise_wallet was a fills-only
+# helper and the new positions-based path (R4+R7, Pass 3) doesn't need
+# wallet-string normalization (positions table already has clean addresses).
 
 # ===========================================================================
 # B2 — set_counterparty_warning CRUD (DB)
@@ -1294,8 +1028,9 @@ async def test_insider_holdings_for_markets() -> None:
 
 async def run_all() -> None:
     # Pure-function tests
-    test_normalise_wallet()
-    test_f2_f12_counterparty_uses_outcome_and_side()
+    # R4+R7 (Pass 3): test_normalise_wallet + test_f2_f12_counterparty_uses_
+    # outcome_and_side removed (tested deleted fills-based code; R4+R7 tests
+    # in smoke_phase_pass3_fixes.py cover the new positions-based logic).
     test_watchlist_floor_constants()
     test_pick_offset_for_age()
     test_compute_half_life_summary()
@@ -1311,7 +1046,9 @@ async def run_all() -> None:
 
     # DB-backed tests
     await test_migration_008_schema()
-    await test_f12_live_data_api_trades_shape()
+    # R4+R7 (Pass 3): test_f12_live_data_api_trades_shape removed (the
+    # data-api/trades?market endpoint is no longer used; counterparty is
+    # positions-based now).
     await test_set_counterparty_warning_crud()
     await test_watchlist_crud_and_cleanup()
     await test_f10_watchlist_skips_when_official_signal_exists()

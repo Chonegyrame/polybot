@@ -1296,6 +1296,7 @@ async def get_signal_enrichment(
                s.signal_entry_offer::numeric       AS signal_entry_offer,
                s.signal_entry_source,
                s.counterparty_warning,
+               s.counterparty_count,
                e.id                  AS exit_id,
                e.exited_at,
                e.drop_reason         AS exit_drop_reason,
@@ -1770,7 +1771,12 @@ async def fetch_signal_price_snapshots(
 async def set_counterparty_warning(
     conn: asyncpg.Connection, signal_log_id: int,
 ) -> bool:
-    """B2 — flip counterparty_warning to TRUE on a signal_log row.
+    """B2 -- flip counterparty_warning to TRUE on a signal_log row.
+
+    DEPRECATED in Pass 3 (R4+R7) -- use `set_counterparty_count` instead.
+    Kept around because some old test code may still reference it. New
+    code paths write counterparty_count integer (0 or N) which the legacy
+    boolean can be derived from as (count > 0).
 
     Idempotent: re-running on an already-flagged row is a no-op. Returns
     True if any row was actually updated to TRUE (i.e., previously FALSE).
@@ -1782,6 +1788,29 @@ async def set_counterparty_warning(
         WHERE id = $1 AND counterparty_warning = FALSE
         """,
         signal_log_id,
+    )
+    return result.endswith(" 1")
+
+
+async def set_counterparty_count(
+    conn: asyncpg.Connection, signal_log_id: int, count: int,
+) -> bool:
+    """R4+R7 (Pass 3) -- write the counterparty wallet count to signal_log.
+
+    Replaces the binary `counterparty_warning` boolean from B2/F12 with an
+    integer count produced by the new positions-based check. Also bumps the
+    legacy boolean for back-compat (count > 0 -> warning TRUE).
+
+    Returns True if any row was updated.
+    """
+    result = await conn.execute(
+        """
+        UPDATE signal_log
+        SET counterparty_count = $2,
+            counterparty_warning = ($2 > 0)
+        WHERE id = $1
+        """,
+        signal_log_id, count,
     )
     return result.endswith(" 1")
 
