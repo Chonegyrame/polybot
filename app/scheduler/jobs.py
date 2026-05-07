@@ -1491,9 +1491,12 @@ async def refresh_positions_then_log_signals() -> tuple[
     elapsed = (datetime.now(timezone.utc) - cycle_started).total_seconds()
     if elapsed >= REFRESH_CYCLE_WARN_SECONDS:
         log.warning(
-            "10-min cycle took %.1fs (>= %ds threshold) — pipeline falling behind cadence",
+            "10-min cycle took %.1fs (>= %ds threshold) -- pipeline falling behind cadence",
             elapsed, REFRESH_CYCLE_WARN_SECONDS,
         )
+        # D5 (Pass 3): record for /system/status counter
+        from app.services.health_counters import record, CYCLE_DURATION_WARNING
+        record(CYCLE_DURATION_WARNING)
     else:
         log.info("=== refresh cycle done in %.1fs ===", elapsed)
     return refresh_result, log_result, exit_result, autoclose_result

@@ -199,9 +199,20 @@ class PolymarketClient:
                 # Treat 5xx and 429 as retryable; bubble 4xx as terminal
                 if r.status_code == 429 or r.status_code >= 500:
                     log.warning("retryable status %d on %s", r.status_code, url)
+                    # D5 (Pass 3): tally rate-limit hits + 5xx for /system/status
+                    from app.services.health_counters import (
+                        record, RATE_LIMIT_HIT, API_FAILURE,
+                    )
+                    if r.status_code == 429:
+                        record(RATE_LIMIT_HIT)
+                    else:
+                        record(API_FAILURE)
                     r.raise_for_status()
                 if r.status_code >= 400:
                     log.error("client error %d on %s: %s", r.status_code, url, r.text[:200])
+                    # D5: terminal 4xx counts as API failure
+                    from app.services.health_counters import record, API_FAILURE
+                    record(API_FAILURE)
                     r.raise_for_status()
                 return r.json()
         return None  # unreachable; reraise above

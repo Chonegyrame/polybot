@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends
 
 from app.api.deps import get_conn
 from app.db import crud
+from app.services.health_counters import snapshot as health_counter_snapshot
 
 router = APIRouter(prefix="/system", tags=["system"])
 
@@ -116,6 +117,10 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
         wallets_health, signals_health,
     )
 
+    # D5 (Pass 3): live operational counters surfaced for the UI's
+    # health pane. In-memory; reset on process restart.
+    counters = health_counter_snapshot()
+
     return {
         "overall_health": overall,
         "components": {
@@ -140,10 +145,21 @@ async def get_status(conn: asyncpg.Connection = Depends(get_conn)) -> dict[str, 
             },
             "recent_signals": {
                 "health": signals_health,
+                # D5/cosmetic-fix: field renamed to match the actual window
+                # (F25 widened to 72h but the legacy field name still said
+                # 48h -- breaking operator trust during incident triage).
+                "fired_last_72h": signals_recent,
+                # Back-compat alias kept until UI migrates
                 "fired_last_48h": signals_recent,
             },
         },
-        # Back-compat fields — earlier UI builds read these flat. Keep until
+        # D5 (Pass 3): operational health counters
+        "counters": {
+            "rate_limit_hits_last_hour": counters["rate_limit_hit"],
+            "cycle_duration_warnings_last_24h": counters["cycle_duration_warning"],
+            "api_failures_last_hour": counters["api_failure"],
+        },
+        # Back-compat fields -- earlier UI builds read these flat. Keep until
         # the UI has migrated to `components.*`.
         "last_position_refresh_at": last_refresh.isoformat() if last_refresh else None,
         "minutes_since_refresh": minutes_since_refresh,

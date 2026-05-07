@@ -942,29 +942,31 @@ def test_apply_latency() -> None:
 
 
 def test_edge_decay_grouping_and_warning() -> None:
-    section("B11: compute_edge_decay grouping + decay_warning trigger")
+    # D4 (Pass 3): rolling 3-vs-3 comparison with min 6 weeks history.
+    # Pre-Pass-3 used 4-week minimum + recent-3-vs-all-time-prior comparison.
+    section("B11 + D4: compute_edge_decay rolling 3-vs-3")
 
-    # Build 5 weekly cohorts of 30 rows each. Earliest 2 with high P&L,
-    # later 3 with low P&L -> recent_avg < preceding_avg -> decay_warning.
+    # Build 6 weekly cohorts of 30 rows each. First 3 strong (winners),
+    # last 3 weak (losers) -> recent_3_avg << preceding_3_avg -> decay_warning.
     base = datetime(2026, 1, 5, tzinfo=timezone.utc)  # Monday
     rows: list[SignalRow] = []
-    # Two strong weeks: rows mostly resolve in signal direction (winners)
-    for week_idx in range(2):
+    # Three strong weeks: rows mostly resolve in signal direction (winners)
+    for week_idx in range(3):
         for i in range(30):
             rows.append(_make_row(
                 cid=f"strong_w{week_idx}_{i}",
                 direction="YES", resolved="YES",
-                entry=0.50 + (i * 0.001),  # ~0.50, varies slightly
+                entry=0.50 + (i * 0.001),
                 fired_at=base + timedelta(weeks=week_idx),
-                cluster_id=f"cluster_strong_{week_idx}_{i}",  # distinct so n_eff = n
+                cluster_id=f"cluster_strong_{week_idx}_{i}",
                 sid=10_000 + week_idx * 100 + i,
             ))
     # Three weak weeks: signals lose
-    for week_idx in range(2, 5):
+    for week_idx in range(3, 6):
         for i in range(30):
             rows.append(_make_row(
                 cid=f"weak_w{week_idx}_{i}",
-                direction="YES", resolved="NO",  # signal loses
+                direction="YES", resolved="NO",
                 entry=0.50,
                 fired_at=base + timedelta(weeks=week_idx),
                 cluster_id=f"cluster_weak_{week_idx}_{i}",
@@ -972,23 +974,24 @@ def test_edge_decay_grouping_and_warning() -> None:
             ))
 
     res = compute_edge_decay(rows, min_n_per_cohort=5)
-    check("5 cohorts emitted (weekly)", res.weeks_of_data == 5, f"got {res.weeks_of_data}")
-    check("insufficient_history=False at >=4 weeks", res.insufficient_history is False)
+    check("6 cohorts emitted (weekly)", res.weeks_of_data == 6, f"got {res.weeks_of_data}")
+    check("insufficient_history=False at >=6 weeks (D4 raised from 4)",
+          res.insufficient_history is False)
     check(
-        "decay_warning=True (recent 3 below preceding 2)",
+        "decay_warning=True (recent 3 << preceding 3, drop > 20%)",
         res.decay_warning is True,
     )
-    # Cohort weeks are sorted ascending, weeks 0-1 strong, 2-4 weak
     means = [c.mean_pnl_per_dollar for c in res.cohorts]
     check(
-        "first 2 cohorts mean > last 3 cohorts mean",
-        sum(means[:2]) / 2 > sum(means[2:]) / 3,
+        "first 3 cohorts mean > last 3 cohorts mean",
+        sum(means[:3]) / 3 > sum(means[3:]) / 3,
     )
 
-    # Insufficient history case
-    short_rows = rows[:60]  # only first 2 weeks
+    # Insufficient history case: 4 weeks (was enough pre-D4, now isn't)
+    short_rows = [r for r in rows if r.first_fired_at < base + timedelta(weeks=4)]
     res2 = compute_edge_decay(short_rows, min_n_per_cohort=5)
-    check("2 cohorts -> insufficient_history=True", res2.insufficient_history is True)
+    check("4 cohorts -> insufficient_history=True (D4 needs 6)",
+          res2.insufficient_history is True)
     check("with insufficient_history, decay_warning stays False", res2.decay_warning is False)
 
     # Min n cohort filter

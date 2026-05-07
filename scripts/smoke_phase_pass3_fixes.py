@@ -1322,6 +1322,146 @@ test_r14_source()
 
 
 # ---------------------------------------------------------------------------
+# D3 -- Kish n_eff in summarize_rows
+# ---------------------------------------------------------------------------
+
+section("D3 -- Kish n_eff used in summarize_rows underpowered flag")
+
+
+def test_d3_kish_in_summarize() -> None:
+    """Build a SignalRow set with one big cluster + many singletons.
+    Pre-fix would give n_eff = distinct clusters = 51.
+    With Kish: n_eff = 250^2 / (200^2 + 50) ~ 1.56 -> underpowered.
+    """
+    from datetime import datetime, timezone
+    from app.services.backtest_engine import (
+        SignalRow, summarize_rows, MIN_SAMPLE_SIZE,
+    )
+
+    def make_row(cid: str, cluster: str | None) -> SignalRow:
+        return SignalRow(
+            id=hash(cid), mode="hybrid", category="overall", top_n=50,
+            condition_id=cid, direction="YES",
+            first_trader_count=5, first_aggregate_usdc=30000,
+            first_net_skew=0.85, first_avg_portfolio_fraction=0.10,
+            signal_entry_offer=0.40, signal_entry_mid=0.40,
+            liquidity_at_signal_usdc=25000, liquidity_tier="medium",
+            first_top_trader_entry_price=0.35,
+            cluster_id=cluster, market_type="binary",
+            first_fired_at=datetime.now(timezone.utc),
+            resolved_outcome="YES", market_category="Politics",
+            exit_bid_price=None, exit_drop_reason=None, exited_at=None,
+            lens_count=1, lens_list=None,
+        )
+
+    # 200-row big cluster + 50 singletons
+    rows = []
+    for i in range(200):
+        rows.append(make_row(f"trump_{i}", "TRUMP_CLUSTER"))
+    for i in range(50):
+        rows.append(make_row(f"singleton_{i}", None))
+
+    result = summarize_rows(rows, trade_size_usdc=100.0)
+    check("D3: 200+50 rows -> Kish n_eff << 30 (was 51 with old method)",
+          result.n_eff < 30,
+          f"got n_eff={result.n_eff:.4f}")
+    check("D3: underpowered=True (was False with old method)",
+          result.underpowered,
+          f"got underpowered={result.underpowered}")
+    # Sanity check: Kish n_eff for 1 cluster of 200 + 50 singletons is ~1.56
+    check("D3: n_eff ~1.56 (Kish formula on Trump example)",
+          abs(result.n_eff - 1.56) < 0.05,
+          f"got {result.n_eff:.4f}")
+
+    # Balanced case: 50 clusters of 5 each. Kish n_eff = 250^2 / (50*25) = 50.
+    rows_balanced = []
+    for c in range(50):
+        for r in range(5):
+            rows_balanced.append(make_row(f"c{c}_r{r}", f"cluster_{c}"))
+    result = summarize_rows(rows_balanced, trade_size_usdc=100.0)
+    check("D3: balanced 50 clusters of 5 -> Kish n_eff = 50 (powered)",
+          abs(result.n_eff - 50.0) < 0.5,
+          f"got n_eff={result.n_eff:.4f}")
+    check("D3: balanced case underpowered=False",
+          not result.underpowered)
+
+
+test_d3_kish_in_summarize()
+
+
+# ---------------------------------------------------------------------------
+# D4 -- edge decay rolling 3-vs-3 + min drop threshold
+# ---------------------------------------------------------------------------
+
+section("D4 -- edge decay rolling 3-vs-3 with minimum drop")
+
+
+def test_d4_edge_decay() -> None:
+    from app.services.backtest_engine import (
+        EDGE_DECAY_MIN_DROP_PCT, EDGE_DECAY_MIN_WEEKS,
+    )
+    check("D4: EDGE_DECAY_MIN_DROP_PCT == 0.20",
+          EDGE_DECAY_MIN_DROP_PCT == 0.20)
+    check("D4: EDGE_DECAY_MIN_WEEKS == 6", EDGE_DECAY_MIN_WEEKS == 6)
+
+    # Source-inspection: comparison is rolling 3-vs-3
+    src = (ROOT / "app" / "services" / "backtest_engine.py").read_text(encoding="utf-8")
+    check("D4: edge_decay uses cohorts[-6:-3] (preceding 3, rolling)",
+          "cohorts[-6:-3]" in src,
+          "preceding range still 'cohorts[:-3]' (all-time, not rolling)")
+    check("D4: edge_decay applies MIN_DROP_PCT threshold",
+          "EDGE_DECAY_MIN_DROP_PCT" in src
+          and "decay_warning = recent_avg <= " in src,
+          "min-drop threshold not enforced")
+
+
+test_d4_edge_decay()
+
+
+# ---------------------------------------------------------------------------
+# D5 -- health counters on /system/status
+# ---------------------------------------------------------------------------
+
+section("D5 -- health_counters surfaced on /system/status")
+
+
+def test_d5_counters() -> None:
+    from app.services.health_counters import (
+        record, snapshot, reset,
+        RATE_LIMIT_HIT, CYCLE_DURATION_WARNING, API_FAILURE,
+    )
+    reset()
+    s = snapshot()
+    check("D5: snapshot has the three keys",
+          set(s.keys()) >= {"rate_limit_hit", "cycle_duration_warning", "api_failure"})
+    check("D5: all counters start at 0",
+          all(v == 0 for v in s.values()), f"got {s}")
+
+    record(RATE_LIMIT_HIT)
+    record(RATE_LIMIT_HIT)
+    record(API_FAILURE)
+    s = snapshot()
+    check("D5: 2 rate_limit_hit recorded -> counter == 2",
+          s["rate_limit_hit"] == 2, f"got {s['rate_limit_hit']}")
+    check("D5: 1 api_failure recorded -> counter == 1",
+          s["api_failure"] == 1, f"got {s['api_failure']}")
+
+    # System status route includes counters
+    routes_src = (ROOT / "app" / "api" / "routes" / "system.py").read_text(encoding="utf-8")
+    check("D5: /system/status response includes 'counters' block",
+          '"counters"' in routes_src
+          and "rate_limit_hits_last_hour" in routes_src,
+          "system.py doesn't expose counters")
+    check("D5: cosmetic field rename fired_last_72h present",
+          '"fired_last_72h"' in routes_src,
+          "fired_last_72h field still missing")
+    reset()
+
+
+test_d5_counters()
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

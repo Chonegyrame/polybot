@@ -801,9 +801,13 @@ def summarize_rows(
     # counts as a loss (didn't profit).
     wins = sum(1 for _, p in pnl_pairs if p > 0)
 
-    # Effective sample size = number of distinct clusters represented.
-    distinct_clusters = len({k or f"_solo_{i}" for i, k in enumerate(cluster_keys)})
-    n_eff = float(distinct_clusters)
+    # D3 (Pass 3): Kish effective sample size. Pre-fix used the count of
+    # distinct clusters (treating all clusters as equally informative
+    # regardless of size). For a Polymarket-style mix -- one Trump-2024
+    # cluster of 200 markets + 50 singletons -- distinct_clusters=51 looks
+    # "powered" (>= MIN_SAMPLE_SIZE=30) while Kish n_eff = 250^2/40050 = 1.56
+    # is severely underpowered. The Kish formula is the standard correction.
+    n_eff = compute_kish_n_eff(cluster_keys)
     underpowered = n_eff < MIN_SAMPLE_SIZE
 
     # F21: also stash the empirical bootstrap p-value so BH-FDR ranking can
@@ -1315,20 +1319,37 @@ def _iso_week_monday(dt: datetime) -> str:
     return monday_date.isoformat()
 
 
+# D4 (Pass 3): edge decay must use a rolling 3-vs-3 comparison with a
+# minimum drop threshold to avoid false alarms on stable strategies that
+# happen to have one noisy week.
+EDGE_DECAY_MIN_DROP_PCT = 0.20  # require >=20% drop to even consider warning
+EDGE_DECAY_MIN_WEEKS = 6        # need recent 3 + preceding 3 = 6 weeks
+
+
 def compute_edge_decay(
     rows: list[SignalRow],
     *,
     min_n_per_cohort: int = 5,
     trade_size_usdc: float = DEFAULT_TRADE_SIZE_USDC,
     exit_strategy: Literal["hold", "smart_money_exit"] = "hold",
-    min_weeks_for_warning: int = 4,
+    min_weeks_for_warning: int = EDGE_DECAY_MIN_WEEKS,
 ) -> EdgeDecayResult:
     """Group signal rows by week-of-fire and run the same engine per cohort.
 
-    `decay_warning` fires when the mean of the LAST 3 cohorts' mean_pnl_per_dollar
-    is below the mean of the PRECEDING cohorts. Requires >= `min_weeks_for_warning`
-    cohorts (default 4) to be honest; otherwise `insufficient_history=True` and
-    decay_warning stays False.
+    D4 (Pass 3): rolling 3-vs-3 comparison with minimum drop threshold.
+    Pre-fix compared recent 3 vs ALL preceding cohorts -- a stable strategy
+    with one noisy recent week could trigger false `decay_warning` because
+    a single outlier dragged the recent-3 mean below all-time average.
+
+    New logic:
+      - Need at least 6 weeks of cohort data (recent 3 + preceding 3)
+      - Compare recent 3 cohorts vs the preceding 3 cohorts (not all-time)
+      - Only fire `decay_warning` if recent mean is at least
+        EDGE_DECAY_MIN_DROP_PCT (20%) below preceding mean
+      - When recent mean is positive but small, "20% drop" means
+        recent_avg <= preceding_avg * 0.80
+      - When preceding mean is near zero or negative, fall back to
+        absolute-difference comparison (avoid divide-by-near-zero)
     """
     by_week: dict[str, list[SignalRow]] = {}
     for r in rows:
@@ -1356,15 +1377,25 @@ def compute_edge_decay(
     weeks_of_data = len(cohorts)
     insufficient_history = weeks_of_data < min_weeks_for_warning
     decay_warning = False
-    if not insufficient_history and weeks_of_data >= 4:
+    if not insufficient_history:
+        # D4: rolling 3-vs-3 comparison
         recent = cohorts[-3:]
-        preceding = cohorts[:-3]
+        preceding = cohorts[-6:-3]
         recent_means = [c.mean_pnl_per_dollar for c in recent if c.mean_pnl_per_dollar is not None]
         prec_means = [c.mean_pnl_per_dollar for c in preceding if c.mean_pnl_per_dollar is not None]
         if recent_means and prec_means:
             recent_avg = sum(recent_means) / len(recent_means)
             prec_avg = sum(prec_means) / len(prec_means)
-            decay_warning = recent_avg < prec_avg
+            # D4: require minimum drop magnitude. For positive prec_avg,
+            # interpret as "recent <= preceding * (1 - drop_pct)". For
+            # near-zero or negative prec_avg, use absolute drop threshold
+            # (default to MIN_DROP_PCT in absolute pnl/dollar units).
+            if prec_avg > 0.01:
+                threshold_value = prec_avg * (1.0 - EDGE_DECAY_MIN_DROP_PCT)
+                decay_warning = recent_avg <= threshold_value
+            else:
+                # Use absolute drop: recent_avg <= prec_avg - 0.05 (5cents/$)
+                decay_warning = recent_avg <= (prec_avg - EDGE_DECAY_MIN_DROP_PCT * 0.25)
 
     return EdgeDecayResult(
         cohorts=cohorts,
