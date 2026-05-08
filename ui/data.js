@@ -453,23 +453,6 @@ PB.MARKET_DETAIL = {
   },
 };
 
-// ---------- system status ----------
-PB.SYSTEM_STATUS = {
-  overall_health: 'green',
-  components: {
-    position_refresh:   { health: 'green', last_at: '14:38 UTC', minutes_since: 4 },
-    daily_snapshot:     { health: 'green', last_date: '2026-05-08', complete: true, succeeded: 28, failed: 0 },
-    stats_freshness:    { seeded: true, fresh: true },
-    wallet_classifier:  { health: 'green', last_at: '2026-05-04', days_since: 4 },
-    tracked_wallets:    { health: 'green', count: 530 },
-    recent_signals:     { health: 'green', fired_last_72h: 14 },
-  },
-  last_cycle_duration_s: 142,
-  consecutive_long_cycles: 0,
-  dropped_positions_last_cycle: 0,
-  zombie_drops_last_24h: 336,
-};
-
 // ---------- paper trades ----------
 // Field names match the backend `paper_trades` response exactly so the UI can
 // swap PB.PAPER_TRADES for fetch('/paper_trades') without renaming anything.
@@ -745,8 +728,8 @@ PB.EDGE_DECAY_FULL = {
   ],
 };
 
-// System status round-2 shape
-PB.SYSTEM_STATUS_V2 = {
+// System status — shape matches `/system/status` endpoint response
+PB.SYSTEM_STATUS = {
   overall_health: 'green',
   components: {
     position_refresh:   { health: 'green', last_at: '14:38 UTC', minutes_since: 4 },

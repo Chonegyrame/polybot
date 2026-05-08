@@ -120,8 +120,7 @@ function HealthPillSide({ status }) {
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
-  // round-2 v2 shape (with 3-state stats + zombie breakdown)
-  const v2 = D.SYSTEM_STATUS_V2;
+  const v2 = D.SYSTEM_STATUS;
   const z = v2.counters.zombie_drops_last_24h;
   const sf = v2.components.stats_freshness;
   const statsState = !sf.seeded ? 'unseeded' : (!sf.fresh ? 'stale' : 'fresh');

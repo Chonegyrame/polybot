@@ -135,3 +135,21 @@
 .table.compact td, .table.compact th { padding: 8px 12px; }
 .callout.bad { background: color-mix(in oklab, var(--bad) 12%, var(--bg-1)); border-color: color-mix(in oklab, var(--bad) 40%, var(--border)); }
 .callout.bad svg { color: var(--bad); }
+
+
+/* === Round 3 backtest filter panel === */
+.filters-panel-v3 { padding: 6px 14px 14px; border-top: 1px solid var(--border-subtle); }
+.filter-row-label { font-size: 10px; font-weight: 700; letter-spacing: .8px; text-transform: uppercase; color: var(--text-3); margin: 14px 0 8px; }
+.filter-row { display: grid; gap: 12px; }
+.filter-row.strategy { grid-template-columns: 1fr 1.4fr 1.4fr; }
+.filter-row.filters { grid-template-columns: repeat(4, 1fr); }
+.filter-row.sizing { grid-template-columns: 1fr 1.4fr 1.6fr; }
+.tier-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.tier-pill { font-family: var(--font-mono); font-size: 11px; padding: 6px 10px; border-radius: 6px; background: var(--bg-2); border: 1px solid var(--border); color: var(--text-2); cursor: pointer; text-transform: lowercase; }
+.tier-pill:hover { border-color: var(--border-strong); color: var(--text-1); }
+.tier-pill.on { background: color-mix(in oklab, var(--accent) 18%, var(--bg-1)); border-color: var(--accent); color: var(--accent); }
+.cb input[type="checkbox"] { accent-color: var(--accent); }
+@media (max-width: 1300px) {
+  .filter-row.filters { grid-template-columns: repeat(3, 1fr); }
+  .filter-row.strategy, .filter-row.sizing { grid-template-columns: 1fr 1fr; }
+}

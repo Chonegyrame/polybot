@@ -105,37 +105,75 @@ function Backtest() {
   const [cat, setCat] = useState('overall');
   const [topN, setTopN] = useState(50);
   const [direction, setDirection] = useState('both');
+  const [exitStrategy, setExitStrategy] = useState('hold');
   const [latencyProfile, setLatencyProfile] = useState('responsive');
-  const [customLatency, setCustomLatency] = useState(15);
+  const [customLatencyMin, setCustomLatencyMin] = useState(5);
+  const [customLatencyMax, setCustomLatencyMax] = useState(15);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [slice, setSlice] = useState('gap_bucket');
   const [showCorrections, setShowCorrections] = useState(true);
   const [benchmark, setBenchmark] = useState('buy_and_hold_favorite');
-  const [showAlt, setShowAlt] = useState(false);
   const [sessionRuns, setSessionRuns] = useState(7); // user has poked around
   const [filters, setFilters] = useState({
     skew_min: '', skew_max: '',
-    trader_count_min: '', trader_count_max: '',
-    aggregate_min: '', aggregate_max: '',
-    entry_min: '', entry_max: '',
-    gap_min: '', gap_max: '',
-    liquidity: 'all',
+    min_trader_count: '',
+    min_aggregate_usdc: '',
+    max_gap: '',
+    min_avg_portfolio_fraction: 0,         // 0 = unset
+    liquidity_tiers: [],                    // [] = all
     market_category: 'all',
-    require_dedup: false,
-    require_active_only: true,
-    require_yes_market: false,
-    exclude_resolved_at_fire: true,
+    dedup: false,
+    trade_size_usdc: 100,
+    holdout_from: '',
+    include_pre_fix: false,
+    include_multi_outcome: false,
   });
 
   const setF = (k, v) => setFilters(f => ({ ...f, [k]: v }));
-  const activeFilters = useMemo(() => Object.entries(filters).filter(([k,v]) => {
-    if (typeof v === 'boolean') return v && !['require_active_only','exclude_resolved_at_fire'].includes(k);
-    if (v === '' || v === 'all') return false;
-    return true;
-  }), [filters]);
+  const toggleTier = (tier) => setFilters(f => {
+    const has = f.liquidity_tiers.includes(tier);
+    return { ...f, liquidity_tiers: has ? f.liquidity_tiers.filter(t=>t!==tier) : [...f.liquidity_tiers, tier] };
+  });
+  const customLatencyError = latencyProfile === 'custom' && Number(customLatencyMax) < Number(customLatencyMin);
+  const activeFilters = useMemo(() => {
+    const out = [];
+    const f = filters;
+    if (f.skew_min !== '') out.push(['min_skew', f.skew_min]);
+    if (f.skew_max !== '') out.push(['max_skew', f.skew_max]);
+    if (f.min_trader_count !== '') out.push(['min_trader_count', f.min_trader_count]);
+    if (f.min_aggregate_usdc !== '') out.push(['min_aggregate_usdc', f.min_aggregate_usdc]);
+    if (f.max_gap !== '') out.push(['max_gap', f.max_gap]);
+    if (f.min_avg_portfolio_fraction > 0) out.push(['min_avg_portfolio_fraction', f.min_avg_portfolio_fraction]);
+    if (f.liquidity_tiers.length) out.push(['liquidity_tiers', f.liquidity_tiers.join(',')]);
+    if (f.market_category !== 'all') out.push(['market_category', f.market_category]);
+    if (f.dedup) out.push(['dedup', 'on']);
+    if (f.trade_size_usdc !== 100) out.push(['trade_size_usdc', f.trade_size_usdc]);
+    if (f.holdout_from) out.push(['holdout_from', f.holdout_from]);
+    if (f.include_pre_fix) out.push(['include_pre_fix', 'on']);
+    if (f.include_multi_outcome) out.push(['include_multi_outcome', 'on']);
+    return out;
+  }, [filters]);
+  const clearActive = (key) => {
+    const map = {
+      min_skew: () => setF('skew_min', ''),
+      max_skew: () => setF('skew_max', ''),
+      min_trader_count: () => setF('min_trader_count', ''),
+      min_aggregate_usdc: () => setF('min_aggregate_usdc', ''),
+      max_gap: () => setF('max_gap', ''),
+      min_avg_portfolio_fraction: () => setF('min_avg_portfolio_fraction', 0),
+      liquidity_tiers: () => setF('liquidity_tiers', []),
+      market_category: () => setF('market_category', 'all'),
+      dedup: () => setF('dedup', false),
+      trade_size_usdc: () => setF('trade_size_usdc', 100),
+      holdout_from: () => setF('holdout_from', ''),
+      include_pre_fix: () => setF('include_pre_fix', false),
+      include_multi_outcome: () => setF('include_multi_outcome', false),
+    };
+    map[key] && map[key]();
+  };
 
   // Re-run simulation: every change to a knob bumps sessionRuns
-  const knobKey = `${mode}|${cat}|${topN}|${direction}|${latencyProfile}|${customLatency}|${JSON.stringify(filters)}`;
+  const knobKey = `${mode}|${cat}|${topN}|${direction}|${exitStrategy}|${latencyProfile}|${customLatencyMin}|${customLatencyMax}|${JSON.stringify(filters)}`;
   useEffect(() => { setSessionRuns(r => r + 1); }, [knobKey]);
 
   const bt = D.BACKTEST;
@@ -159,7 +197,7 @@ function Backtest() {
           <h3>Cohort definition</h3>
           <span className="muted mono" style={{fontSize:11}}>POST /backtest/run · {sessionRuns} runs this session</span>
         </div>
-        <div style={{padding:'14px',display:'grid',gridTemplateColumns:'repeat(4, 1fr)',gap:12}}>
+        <div style={{padding:'14px',display:'grid',gridTemplateColumns:'repeat(3, 1fr)',gap:12}}>
           <Field label="Mode">
             <select className="select" value={mode} onChange={e=>setMode(e.target.value)}>
               {D.MODES.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
@@ -174,13 +212,6 @@ function Backtest() {
             <select className="select" value={topN} onChange={e=>setTopN(+e.target.value)}>
               {[20,30,50,75,100].map(n => <option key={n} value={n}>{n}</option>)}
             </select>
-          </Field>
-          <Field label="Direction">
-            <div className="segmented" style={{flexWrap:'nowrap'}}>
-              <button className={direction==='both'?'on':''} onClick={()=>setDirection('both')}>Both</button>
-              <button className={direction==='YES'?'on':''} onClick={()=>setDirection('YES')}>YES</button>
-              <button className={direction==='NO'?'on':''} onClick={()=>setDirection('NO')}>NO</button>
-            </div>
           </Field>
         </div>
 
@@ -206,10 +237,19 @@ function Backtest() {
             ))}
           </div>
           {latencyProfile === 'custom' && (
-            <div style={{marginTop:10,display:'flex',alignItems:'center',gap:10}}>
-              <span className="muted" style={{fontSize:12}}>Custom delay:</span>
-              <input type="range" min="0" max="120" step="1" value={customLatency} onChange={e=>setCustomLatency(+e.target.value)} style={{flex:1,maxWidth:300}}/>
-              <span className="mono" style={{fontSize:13,minWidth:60}}>{customLatency} min</span>
+            <div style={{marginTop:10,display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+              <span className="muted" style={{fontSize:12}}>Custom delay window:</span>
+              <div style={{display:'flex',alignItems:'center',gap:6}}>
+                <span className="trade-label" style={{margin:0,fontSize:10}}>min</span>
+                <input className="input mono" type="number" min="0" max="240" step="1" value={customLatencyMin}
+                  onChange={e=>setCustomLatencyMin(+e.target.value)} style={{width:80}}/>
+                <span className="muted">to</span>
+                <span className="trade-label" style={{margin:0,fontSize:10}}>max</span>
+                <input className="input mono" type="number" min="0" max="240" step="1" value={customLatencyMax}
+                  onChange={e=>setCustomLatencyMax(+e.target.value)} style={{width:80}}/>
+                <span className="muted" style={{fontSize:11}}>min</span>
+              </div>
+              {customLatencyError && <span className="chip bad" style={{fontSize:10}}>max must be ≥ min</span>}
             </div>
           )}
           {/* Latency stats */}
@@ -234,7 +274,7 @@ function Backtest() {
           {activeFilters.length > 0 && (
             <div style={{display:'flex',gap:6,flexWrap:'wrap',marginLeft:10}}>
               {activeFilters.map(([k,v]) => (
-                <span key={k} className="filter-chip" onClick={()=>setF(k, typeof v === 'boolean' ? false : (k.endsWith('_min')||k.endsWith('_max')?'':'all'))}>
+                <span key={k} className="filter-chip" onClick={()=>clearActive(k)}>
                   {k}: {String(v)} ✕
                 </span>
               ))}
@@ -242,28 +282,97 @@ function Backtest() {
           )}
         </div>
         {filtersOpen && (
-          <div className="filters-panel">
-            <FilterRange label="Headcount skew (%)" min={filters.skew_min} max={filters.skew_max} onMin={v=>setF('skew_min',v)} onMax={v=>setF('skew_max',v)} />
-            <FilterRange label="Trader count" min={filters.trader_count_min} max={filters.trader_count_max} onMin={v=>setF('trader_count_min',v)} onMax={v=>setF('trader_count_max',v)} />
-            <FilterRange label="Aggregate USDC" min={filters.aggregate_min} max={filters.aggregate_max} onMin={v=>setF('aggregate_min',v)} onMax={v=>setF('aggregate_max',v)} />
-            <FilterRange label="Entry price (¢)" min={filters.entry_min} max={filters.entry_max} onMin={v=>setF('entry_min',v)} onMax={v=>setF('entry_max',v)} />
-            <FilterRange label="Gap to smart money (%)" min={filters.gap_min} max={filters.gap_max} onMin={v=>setF('gap_min',v)} onMax={v=>setF('gap_max',v)} />
-            <Field label="Liquidity tier">
-              <select className="select" value={filters.liquidity} onChange={e=>setF('liquidity',e.target.value)}>
-                <option value="all">All tiers</option><option>deep</option><option>medium</option><option>thin</option>
-              </select>
-            </Field>
-            <Field label="Market category">
-              <select className="select" value={filters.market_category} onChange={e=>setF('market_category',e.target.value)}>
-                <option value="all">All categories</option>
-                {D.CATEGORIES.filter(c=>c!=='overall').map(c => <option key={c} value={c}>{D.CATEGORY_LABELS[c]}</option>)}
-              </select>
-            </Field>
-            <div style={{gridColumn:'span 2',display:'flex',gap:14,flexWrap:'wrap',alignItems:'center'}}>
-              <label className="cb"><input type="checkbox" checked={filters.require_dedup} onChange={e=>setF('require_dedup',e.target.checked)}/> Dedup mode (cluster-collapsed)</label>
-              <label className="cb"><input type="checkbox" checked={filters.require_active_only} onChange={e=>setF('require_active_only',e.target.checked)}/> Active markets only at fire-time</label>
-              <label className="cb"><input type="checkbox" checked={filters.require_yes_market} onChange={e=>setF('require_yes_market',e.target.checked)}/> YES-token only</label>
-              <label className="cb"><input type="checkbox" checked={filters.exclude_resolved_at_fire} onChange={e=>setF('exclude_resolved_at_fire',e.target.checked)}/> Exclude resolved-at-fire</label>
+          <div className="filters-panel-v3">
+            {/* Row 1 — Strategy */}
+            <div className="filter-row-label">Strategy</div>
+            <div className="filter-row strategy">
+              <Field label="Direction">
+                <div className="segmented" style={{flexWrap:'nowrap'}}>
+                  <button className={direction==='both'?'on':''} onClick={()=>setDirection('both')}>Both</button>
+                  <button className={direction==='YES'?'on':''} onClick={()=>setDirection('YES')}>YES</button>
+                  <button className={direction==='NO'?'on':''} onClick={()=>setDirection('NO')}>NO</button>
+                </div>
+              </Field>
+              <Field label="Exit strategy">
+                <div className="segmented" style={{flexWrap:'nowrap'}}>
+                  <button className={exitStrategy==='hold'?'on':''} onClick={()=>setExitStrategy('hold')}>Hold to resolution</button>
+                  <button className={exitStrategy==='smart_money_exit'?'on':''} onClick={()=>setExitStrategy('smart_money_exit')}>Smart money exit</button>
+                </div>
+              </Field>
+              <Field label="Dedup">
+                <label className="cb" style={{height:34,paddingLeft:2}}>
+                  <input type="checkbox" checked={filters.dedup} onChange={e=>setF('dedup', e.target.checked)}/>
+                  <span>Cluster-collapsed (one row per cid+direction)</span>
+                </label>
+              </Field>
+            </div>
+
+            {/* Row 2 — Filters */}
+            <div className="filter-row-label">Filters</div>
+            <div className="filter-row filters">
+              <FilterRange label="Headcount skew (%)" min={filters.skew_min} max={filters.skew_max}
+                onMin={v=>setF('skew_min',v)} onMax={v=>setF('skew_max',v)} />
+              <Field label="Min trader count">
+                <input className="input mono" placeholder="e.g. 5" value={filters.min_trader_count}
+                  onChange={e=>setF('min_trader_count', e.target.value)}/>
+              </Field>
+              <Field label="Min aggregate USDC">
+                <input className="input mono" placeholder="e.g. 100000" value={filters.min_aggregate_usdc}
+                  onChange={e=>setF('min_aggregate_usdc', e.target.value)}/>
+              </Field>
+              <Field label="Max gap to smart money (%)">
+                <input className="input mono" placeholder="e.g. 10" value={filters.max_gap}
+                  onChange={e=>setF('max_gap', e.target.value)}/>
+              </Field>
+              <Field label={`Min avg portfolio fraction · ${filters.min_avg_portfolio_fraction || 0}%`}>
+                <input type="range" min="0" max="20" step="1" value={filters.min_avg_portfolio_fraction || 0}
+                  onChange={e=>setF('min_avg_portfolio_fraction', +e.target.value)} style={{width:'100%'}}/>
+              </Field>
+              <Field label="Liquidity tiers (multi)">
+                <div className="tier-pills">
+                  {['thin','medium','deep','unknown'].map(t => (
+                    <button key={t} type="button"
+                      className={`tier-pill ${filters.liquidity_tiers.includes(t)?'on':''}`}
+                      onClick={()=>toggleTier(t)}>{t}</button>
+                  ))}
+                </div>
+              </Field>
+              <Field label="Market category">
+                <select className="select" value={filters.market_category} onChange={e=>setF('market_category',e.target.value)}>
+                  <option value="all">All categories</option>
+                  {D.CATEGORIES.filter(c=>c!=='overall').map(c => <option key={c} value={c}>{D.CATEGORY_LABELS[c]}</option>)}
+                </select>
+              </Field>
+            </div>
+
+            {/* Row 3 — Sizing & honesty */}
+            <div className="filter-row-label">Sizing &amp; honesty</div>
+            <div className="filter-row sizing">
+              <Field label="Trade size assumption ($)" hint="Used for fee + slippage modeling. $100 is a reasonable retail default.">
+                <input className="input mono" type="number" min="1" step="1" value={filters.trade_size_usdc}
+                  onChange={e=>setF('trade_size_usdc', +e.target.value || 100)}/>
+              </Field>
+              <Field label="Training data ends (holdout cutoff)" hint="Excludes signals fired on or after this date — use for honest pre-registered tests.">
+                <div style={{display:'flex',gap:6}}>
+                  <input className="input mono" type="date" value={filters.holdout_from}
+                    onChange={e=>setF('holdout_from', e.target.value)} style={{flex:1}}/>
+                  {filters.holdout_from && <button className="btn ghost sm" onClick={()=>setF('holdout_from','')}>×</button>}
+                </div>
+              </Field>
+              <Field label="Coverage toggles">
+                <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                  <label className="cb" title="Off by default. Includes signals where the order book couldn't be read at fire time.">
+                    <input type="checkbox" checked={filters.include_pre_fix}
+                      onChange={e=>setF('include_pre_fix', e.target.checked)}/>
+                    <span>Include unavailable-book signals</span>
+                  </label>
+                  <label className="cb" title="Off by default. Includes scalar / categorical / conditional markets.">
+                    <input type="checkbox" checked={filters.include_multi_outcome}
+                      onChange={e=>setF('include_multi_outcome', e.target.checked)}/>
+                    <span>Include multi-outcome markets</span>
+                  </label>
+                </div>
+              </Field>
             </div>
           </div>
         )}
@@ -511,15 +620,21 @@ function BenchBar({ value, max, dim }) {
   );
 }
 
-function Field({ label, children }) {
-  return <div><div className="trade-label" style={{marginBottom:6}}>{label}</div>{children}</div>;
+function Field({ label, hint, children }) {
+  return (
+    <div>
+      <div className="trade-label" style={{marginBottom:6}}>{label}</div>
+      {children}
+      {hint && <div className="muted" style={{fontSize:10,marginTop:4,lineHeight:1.4}}>{hint}</div>}
+    </div>
+  );
 }
 
 // ============================================================
 // Diagnostics
 // ============================================================
 function Diagnostics() {
-  const v2 = D.SYSTEM_STATUS_V2;
+  const v2 = D.SYSTEM_STATUS;
   const decay = D.EDGE_DECAY_FULL;
   const z = v2.counters.zombie_drops_last_24h;
   const sf = v2.components.stats_freshness;
