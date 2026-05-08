@@ -7,9 +7,22 @@
 
 const PB = {};
 
-// API base URL — points at the local FastAPI backend by default.
-// Change this for production / Railway deploy. Override via window.POLYBOT_API_BASE.
-PB.API_BASE = window.POLYBOT_API_BASE || 'http://127.0.0.1:8000';
+// API base URL.
+// Default behavior: when the UI is served by the FastAPI backend itself
+// (e.g. http://127.0.0.1:8000/ui/), use relative URLs so fetches go to the
+// same origin — no CORS, no port juggling.
+// When the UI is opened from `file://` or served on a different port (e.g.
+// running `python -m http.server` separately for dev), point at the backend
+// explicitly. Override via window.POLYBOT_API_BASE for any custom setup.
+PB.API_BASE = (() => {
+  if (typeof window !== 'undefined' && window.POLYBOT_API_BASE !== undefined) {
+    return window.POLYBOT_API_BASE;
+  }
+  if (typeof window !== 'undefined' && window.location && window.location.protocol.startsWith('http')) {
+    return '';  // same-origin (relative URLs) — works when served by FastAPI
+  }
+  return 'http://127.0.0.1:8000';  // file:// or non-browser environment
+})();
 
 // ---------- categories & modes (from spec Section "Primary controls") ----------
 PB.MODES = [

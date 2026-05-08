@@ -5,17 +5,30 @@ No build step — React + Babel are loaded from unpkg CDN at runtime.
 
 ## Run it
 
-The simplest way (any static file server works):
+**Recommended (one terminal):** the FastAPI backend serves the UI. From the
+project root:
+
+```
+.\venv\Scripts\python -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
+```
+
+Then open http://127.0.0.1:8000/ui/ (or just http://127.0.0.1:8000/ — the
+backend redirects browser visits to `/ui/`). One process runs both the API
+and the scheduler, and serves the UI as static files. Same-origin fetches
+work without CORS.
+
+**Alternative (separate static server):** for UI-only iteration without
+the backend:
 
 ```
 cd ui
 python -m http.server 8000
 ```
 
-Then open http://localhost:8000 in a browser.
-
-Just opening `index.html` directly with `file://` will also work, but some
-browsers block CDN fetches over `file://` — `http.server` is safer.
+Then open http://localhost:8000 in a browser. The UI will fall back to
+mock data and surface an "OFFLINE" pill since it can't reach the API.
+To wire it to a backend running on a different port, set
+`window.POLYBOT_API_BASE` before `data.js` loads (or just edit data.js).
 
 ## Files
 

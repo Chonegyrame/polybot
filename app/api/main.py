@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import (
     backtest,
@@ -27,6 +30,8 @@ from app.api.routes import (
     watchlist,
 )
 from app.scheduler.runner import lifespan_scheduler
+
+UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +68,17 @@ app.include_router(paper_trades.router)
 app.include_router(insider.router)
 app.include_router(watchlist.router)
 
+# Serve the UI at /ui/* from the same FastAPI process so a single `uvicorn`
+# command boots backend + scheduler + UI. html=True makes /ui/ resolve to
+# /ui/index.html so the user can navigate to /ui directly.
+if UI_DIR.exists():
+    app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
 
-@app.get("/")
-async def root() -> dict[str, str]:
+
+@app.get("/", include_in_schema=False)
+async def root(request: Request):
+    """Service identity probe (curl/health checks). Browser visits get
+    redirected to the UI for convenience — `Accept: text/html` is the tell."""
+    if "text/html" in request.headers.get("accept", "") and UI_DIR.exists():
+        return RedirectResponse(url="/ui/")
     return {"app": "polymarket-smart-money", "version": "0.9.0", "docs": "/docs"}
