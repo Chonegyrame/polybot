@@ -38,8 +38,14 @@ data/
 # Spike outputs (raw API dumps from validation runs)
 spike/output/
 
-# Claude Code local settings (machine-specific, not for sharing)
-.claude/settings.local.json
+# Claude Code local settings, skills, and worktrees (machine-specific, not for sharing)
+.claude/
+
+# Scheduler runtime log (rotates locally; not durable)
+cycle_log.txt
+
+# Scrutinizer skill checklist (referenced by the skill, not durable repo state)
+review/SCRUTINIZER_RESEARCH.md
 
 # Database backups (never commit — could contain real data)
 *.sql.gz
