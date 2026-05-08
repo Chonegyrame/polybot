@@ -39,6 +39,7 @@ This report has three parts:
 
 ### #1 — Sybil cluster wash-trading inflates `aggregate_usdc` and `dollar_skew` on the same side
 **Severity: Critical** — `app/services/signal_detector.py:300-339`
+**Status: fixed** in commit `668ae70` (Pass 5 Tier B #1+#2+#5). The audit's framing of this finding overstated the magnitude — `aggregate_usdc` and `total_dollars_in_market` were already correct sums across wallet rows. The actual material change is per-entity `avg_portfolio_fraction` and the structural alignment with the cluster-aware COUNT. See `review/FIXES.md` Tier B #1+#2+#5 for the honest behavioral diff.
 
 **What's wrong**
 The signal detector correctly counts a 4-wallet sybil cluster as 1 trader (it joins through `cluster_membership` for the headcount), but it sums dollars over the raw wallet positions. So one entity holding $20k on each of 4 wallets shows up as `trader_count = 1` but `aggregate_usdc = $80k`.
@@ -59,6 +60,7 @@ In `direction_agg`, sum `current_value` per **identity** (cluster-collapse) befo
 
 ### #2 — Counterparty count includes each sybil wallet separately
 **Severity: Critical** — `app/services/counterparty.py:110-148`
+**Status: fixed** in commit `668ae70` (Pass 5 Tier B #1+#2+#5). Real material change: 4-wallet cluster on opposite side now counts as 1 entity (was 4); 4-wallet cluster at $4k each ($16k total) clears the $5k floor as one entity (was: false negative).
 
 **What's wrong**
 The counterparty check queries `positions` by raw `proxy_wallet` and never joins `cluster_membership`. A 4-wallet cluster on the opposite side counts as 4 separate counterparties.
@@ -75,6 +77,7 @@ Mirror the `wallet_identity` CTE pattern from `signal_detector._aggregate_positi
 
 ### #3 — Specialist's Bayesian prior is computed over winners only
 **Severity: Critical** — `app/services/trader_ranker.py:296-353`
+**Status: fixed** in commit `3f8b558` (Pass 5 Tier B #3). New `prior_pool` CTE in `_rank_specialist` and `gather_union_top_n_wallets` reflects the full specialist-eligible universe (winners + losers). Synthetic test: pre-fix prior 5.03% → candidate shrunk to 0.10; post-fix prior 1.90% → shrunk to 0.0794.
 
 **What's wrong**
 Specialist mode filters its `base` CTE to `pnl > 0` (only winning specialists), then computes the Bayesian shrinkage prior `prior_roi = SUM(pnl) / SUM(vol)` from that same base. So the "average" the prior pulls each trader toward is the average of *winners only* — a structurally inflated number.
@@ -99,6 +102,7 @@ Split into two CTEs. `prior_pool` runs the same base query without the `pnl > 0`
 
 ### #4 — TRIM tier (20% drop) fires on routine API noise at typical cohort size
 **Severity: High** — `app/services/exit_detector.py:55-119`
+**Status: fixed** in commit `8566f8e` (Pass 5 Tier D bundle). `TRIM_THRESHOLD` raised 0.20 → 0.25 — needs ≥2 of 5 cohort wallets to actually go flat before TRIM fires.
 
 **What's wrong**
 With a 5-wallet cohort (the floor for an official signal), losing 1 wallet to a transient API blip is a 20% drop on `trader_count` → a TRIM event fires. The cohort-recompute uses a 30-min `last_updated_at` TTL, which is too short to absorb the kind of "200 OK with empty list" failure modes F13/F14 acknowledged are common.
@@ -113,6 +117,7 @@ Either require BOTH metrics over threshold for TRIM (currently it's either-or), 
 
 ### #5 — Exit detector's cohort recompute SUMs raw positions (same root cause as #1)
 **Severity: High** — `app/services/exit_detector.py:140-169`
+**Status: fixed** in commit `668ae70` (folded into the Pass 5 Tier B #1+#2+#5 cluster-collapse family per the plan's decision). Inner `identity_agg` CTE with `HAVING SUM > 0` collapses positions by identity before the outer COUNT/SUM. Numerically identical to the pre-fix path on typical scenarios; the structural alignment is what matters.
 
 **What's wrong**
 Same shape as #1. The recompute correctly does `COUNT(DISTINCT identity)` but `SUM(current_value)` runs over RAW wallet rows. The `peak_aggregate_usdc` watermark was written by `signal_detector` with the same bug, so peak and current are *consistent at fire time* — but cluster composition changes over time.
@@ -127,6 +132,7 @@ Same identity-collapse pattern as #1. Re-derive peak and current both off identi
 
 ### #6 — Stale `trader_category_stats` silently empties the entire signal pool
 **Severity: High** — `app/services/trader_ranker.py:131-155, 318-336, 422-426`
+**Status: fixed** in commit `d482f38` (Pass 5 Tier C #6+#16). New `stats_fresh` CTE in all 4 ranker SQL sites bypasses the recency filter when stats are seeded but >7 days stale. `STATS_STALE` health counter ticks on detection; surfaced at `/system/status.counters.stats_stale_last_hour`.
 
 **What's wrong**
 Every ranking mode applies `tcs.last_trade_at >= NOW() - 60 days`. The `stats_seeded` flag only checks if the table has any rows at all — it never checks freshness. If the nightly trader-stats job (02:30 UTC) breaks for 60+ days, every wallet's `last_trade_at` ages past threshold → recency filter rejects everyone → `gather_union_top_n_wallets` returns `[]` → zero signals fire.
@@ -141,6 +147,7 @@ Add a freshness gate alongside `stats_seeded`: if `MAX(last_trade_at) < NOW() - 
 
 ### #7 — Specialist's `active_recently` accepts a single old monthly-leaderboard row as proof of activity
 **Severity: High** — `app/services/trader_ranker.py:287-294, 409-419`
+**Status: dropped** per the user's audit-chat decision (finding judged too weak to act on). If a future audit surfaces "specialists with zero recent positions appearing in top-N," revisit; the F9 layered `last_trade_at` filter already gates most degenerate cases.
 
 **What's wrong**
 Specialist mode's "active recently" check just asks "is this wallet on the latest monthly leaderboard for this category?" Polymarket's monthly leaderboard reflects the calendar-month aggregate, so a trader who closed a huge position on April 30 and did nothing in May still appears on the May monthly leaderboard. The F9 layered `last_trade_at >= NOW() - 60d` filter doesn't catch this — that wallet's last_trade_at is 9 days ago, well within 60.
@@ -155,6 +162,7 @@ Replace the static-monthly check with a positions-based test: `EXISTS (SELECT 1 
 
 ### #8 — `bootstrap_p` is never persisted to `slice_lookups`; BH-FDR ranking uses the broken Gaussian approximation for every prior session entry
 **Severity: Critical** — `app/db/crud.py:727-787`, `migrations/002_backtest_schema.sql:170-179`
+**Status: fixed** in commits `5f7e81b` (migration 018) + `e5b4d0d` (Pass 5 Tier B #8 — crud + routes plumbing). `compute_corrections` now reads the persisted column for prior session entries instead of the Gaussian fallback. Behavioral test verified BH-FDR widened CI is 1.27× narrower with the persisted path (matches theoretical `z_{0.0125}/z_{0.05}`).
 
 **What's wrong**
 Pass 2 F21 fixed the p-value computation by adding empirical bootstrap p (works correctly on skewed P&L distributions) instead of the Gaussian-from-CI approximation. But the fix only applies to the *current* result. The `slice_lookups` table where prior session queries are stored has columns `reported_value, ci_low, ci_high` — no `bootstrap_p` column. `insert_slice_lookup` doesn't accept it. `get_session_slice_lookups` doesn't return it. So in `compute_corrections`, `e.get("bootstrap_p")` is **always None for every prior session entry** → falls through to `_pvalue_from_ci`, the very approximation F21 said was wrong.
@@ -169,6 +177,7 @@ New migration adds `bootstrap_p NUMERIC` column to `slice_lookups`. Pass `pnl_bo
 
 ### #9 — Dedup view drops `(cid, direction)` pairs when the first-fired row had a glitched book
 **Severity: Critical** — `migrations/007_dedup_view.sql:14-34`, `app/services/backtest_engine.py:651-652`
+**Status: fixed** in commits `5f7e81b` (migration 019 rebuilds the view with the unavailable filter inside the `first_fired` CTE — the entire structural fix) + `43284fa` (engine-consumer integration test). The engine's redundant filter is left in place as load-bearing on the non-dedup path.
 
 **What's wrong**
 The dedup view picks the canonical row per `(condition_id, direction)` using `DISTINCT ON ... ORDER BY first_fired_at ASC, id ASC`. The engine THEN applies `WHERE COALESCE(s.signal_entry_source,'') != 'unavailable'`. Order matters: when the canonical (earliest) fire happened to have `signal_entry_source = 'unavailable'` (CLOB book glitched at fire time), the dedup view picks it, then the engine filter throws it out — and the *whole pair* is gone, even if a clean re-fire happened later.
@@ -183,6 +192,7 @@ Move the `WHERE signal_entry_source != 'unavailable'` filter INSIDE the view's `
 
 ### #10 — Smart-money-exit P&L is missing exit-side slippage
 **Severity: Critical** — `app/services/backtest_engine.py:469-517`
+**Status: fixed** in commit `43284fa` (Pass 5 Tier B #9+#10). `compute_pnl_per_dollar_exit` now applies symmetric slippage: `effective_exit = max(0.001, exit_bid_price - slip)`. Worked example ($100 trade, $50k liquidity, entry 0.40 → 0.55, Politics): pre-fix P&L 0.32328 → post-fix 0.32104 (-0.00223 / dollar). Thin-book scenario: -0.00705 / dollar.
 
 **What's wrong**
 The entry side correctly bumps the price by `slip` to model market-impact: `effective_entry = entry_price + slip`. The exit side uses the raw `exit_bid_price` directly — there's no symmetric impact cost for *selling* shares back into the book.
@@ -199,6 +209,7 @@ In `compute_pnl_per_dollar_exit`, compute `exit_slip = _slippage_per_dollar(...)
 
 ### #11 — Kish n_eff treats NULL `cluster_id` as singletons, inflating effective sample size
 **Severity: High** — `app/services/backtest_engine.py:337-365`
+**Status: fixed** in commit `8566f8e` (Pass 5 Tier D bundle). NULL keys collapse to one shared `__null__` cluster in both `compute_kish_n_eff` and `cluster_bootstrap_mean_with_p`. Tests verify 30 NULLs → n_eff = 1.0 (was 30); 70xA + 30xNone → n_eff ≈ 1.72 (was ≈ 2.03).
 
 **What's wrong**
 The Kish formula correction itself is right (D3 fix). But for rows with `cluster_id = NULL` (gamma's `event_id` was missing at sync time and F26 logs but doesn't backfill), the code maps each NULL to a unique synthetic key `_solo_{i}` — i.e. each NULL is its own independent cluster. That's optimistic by construction.
@@ -213,6 +224,7 @@ Map all NULL keys to a single shared cluster key `__null__` (worst-case correlat
 
 ### #12 — Latency fallback threshold (50%) is too lenient
 **Severity: High** — `app/services/backtest_engine.py:1032-1097`
+**Status: fixed** in commit `8566f8e` (Pass 5 Tier D bundle). `LATENCY_FALLBACK_WARN_FRACTION` lowered 0.50 → 0.20. Route response surfaces `n_adjusted` + `n_fallback` explicitly alongside the existing `adjusted` / `fallback` fields (back-compat).
 
 **What's wrong**
 `latency_unavailable` only flips True when `n_fallback / total > 0.5`. So a backtest where 49% of rows fall back to the optimistic `signal_entry_offer` (no snapshot within ±5 min of the sampled offset) is reported as "fully adjusted" with no warning.
@@ -227,6 +239,7 @@ Lower threshold to 0.20. Also expose `n_adjusted` and `n_fallback` directly in t
 
 ### #13 — Win-rate point estimate is unweighted; CI is cluster-weighted; they disagree
 **Severity: High** — `app/services/backtest_engine.py:802, 826-834`
+**Status: fixed** in commit `8566f8e` (Pass 5 Tier D bundle). `cluster_bootstrap_mean_with_p` returns the bootstrap median as the `point` estimate; `summarize_rows`'s `wr` is now clamped from `wr_point_raw` (bootstrap), not `wins / len(pnl_pairs)`. Honest call-out: the audit's quantitative claim (0.59 → 0.65) overstated the magnitude — actual shift on the synthetic scenario is ~0.01 because cluster-bootstrap-of-mean is unbiased for the population mean in expectation.
 
 **What's wrong**
 `wr = wins / len(pnl_pairs)` — straight count-weighted point estimate. The CI for the same win rate is cluster-bootstrap (F8 fix). Same inconsistency exists between `mean_pnl_per_dollar` (unweighted point) and its cluster-bootstrap CI.
@@ -241,6 +254,7 @@ Use the bootstrap median (or mean of resampled means) as the headline point esti
 
 ### #14 — `markets.closed` flips back to FALSE on gamma blips
 **Severity: Critical** — `app/db/crud.py:392`, `:348` for events
+**Status: fixed** in commit `95629fe` (Pass 5 Tier C #14). `closed = (markets.closed OR EXCLUDED.closed)` / `closed = (events.closed OR EXCLUDED.closed)`. Once true, stays true. Reverse-flip risk explicitly accepted; manual recovery SQL documented inline at both call sites.
 
 **What's wrong**
 `upsert_market` does `closed = EXCLUDED.closed` unconditionally. `resolved_outcome` is properly `COALESCE`-protected (once written, it stays), but `closed` will overwrite. A gamma response that briefly serves `closed=false` for a resolved market (UMA dispute, replication lag) flips our row back to live. `events.closed` has the same flaw.
@@ -255,6 +269,7 @@ A market resolves YES at 14:00. Gamma sets `closed=true`, our DB updates correct
 
 ### #15 — Effective rate limit is N× configured rate (one TokenBucket per `PolymarketClient` instance)
 **Severity: Critical** — `app/services/polymarket.py:165`, `app/services/rate_limiter.py:9`
+**Status: fixed** in commit `ad44c26` (Pass 5 R17 — shipped before the Pass 5 plan was written, hence the "R17" naming). Module-level `_BUCKETS` registry keyed by hostname + `_DecorrelatedJitterWait` + `Retry-After` honoring + default lowered 10 → 8 r/s. See `review/FIXES.md` Pass 5 R17 entry.
 
 **What's wrong**
 `TokenBucket` is created fresh in every `PolymarketClient.__init__`. The codebase has 12 distinct `async with PolymarketClient()` sites. There's no module-level singleton. APScheduler runs different jobs concurrently — they don't compete for tokens.
@@ -269,6 +284,7 @@ Hoist the `TokenBucket` to module level in `rate_limiter.py` (or as a singleton 
 
 ### #16 — `daily_leaderboard_snapshot` partial failures pollute downstream reads
 **Severity: High** — `app/scheduler/jobs.py:110-182`
+**Status: fixed** in commits `5f7e81b` (migration 020 creates the `snapshot_runs` table) + `d482f38` (Pass 5 Tier C #6+#16 — crud helpers + jobs hook + `/system/status` surface). Downstream readers can gate on `crud.latest_complete_snapshot_date()` instead of `MAX(snapshot_date)` to avoid mixing partial today + complete yesterday.
 
 **What's wrong**
 The job runs 28 combos sequentially. Failures are tracked in an in-memory list — no `snapshot_runs` table, no `is_complete` flag. Per-combo transactions commit independently, so partial data lands in `leaderboard_snapshots`. Downstream readers using `MAX(snapshot_date) GROUP BY category` mix today's incomplete combos with yesterday's complete ones.
@@ -283,6 +299,7 @@ Persist a `snapshot_runs(snapshot_date PK, total_combos, failed_combos, complete
 
 ### #17 — Pass 4 zombie filter has a fall-open path on incomplete metadata
 **Severity: Medium** — `app/services/polymarket_types.py:155-207`
+**Status: fixed** in commit `8ce1b0f` (Pass 5 Tier C #17). New 5th predicate fires when `raw.redeemable IS NULL AND raw.closed IS NULL AND cur_price IS NULL AND _end_date_in_past()`. Reads the raw dict (not the dataclass field, which is bool-coerced) so we distinguish "API didn't send" from "explicitly False." New `ZOMBIE_DROP_INCOMPLETE_METADATA` counter surfaced at `/system/status`.
 
 **What's wrong**
 `Position.drop_reason()` returns the first matching reason from a 4-predicate ladder. If a position has `redeemable=None`, `raw['closed']=None`, `cur_price=None`, and `size > 1`, none of the 4 predicates match → kept. Polymarket's data-api occasionally serves stale rows mid-resolution with these fields blank.
@@ -297,6 +314,7 @@ Add a 4th predicate: `redeemable is None AND raw.get('closed') is None AND cur_p
 
 ### #18 — `iter_trades` paginator uses the silent `_safe_list_or_empty` path
 **Severity: Low/Medium** — `app/services/polymarket.py:386-402`
+**Status: fixed** in commit `5730542` (Pass 5 Tier E #18). `get_trades` gains `_paginator_mode: bool = False` kwarg; True path uses `_safe_list_from_response` (raises `ResponseShapeError`). `iter_trades` passes True and re-raises with a logged `iter_trades: aborted at offset=N` so a malformed mid-pagination response can no longer masquerade as clean exhaustion.
 
 **What's wrong**
 `iter_trades` paginates `get_trades`, which uses `_safe_list_or_empty` — the version that swallows shape errors and returns `[]`. So when Polymarket returns a 200-OK-with-garbage during overload (R15's exact scenario), pagination silently terminates at end-of-list. Currently constrained: `classify_tracked_wallets` and `compute_trader_category_stats` only take page 1, so the bug only bites if a future caller actually iterates. But `iter_trades` is exported and named to invite that.
@@ -311,6 +329,19 @@ Add a paginator-mode parameter to `get_trades` so `iter_trades` raises `Response
 
 ### #19 — Dead method `get_market_trades` invites accidental re-introduction of the F12 bug
 **Severity: Low** — `app/services/polymarket.py:548-584`
+**Status: dropped** per the user's audit-chat decision (off the critical path). Pure dead-code deletion can be done as a one-line cleanup commit anytime; not load-bearing for the UI build.
+
+---
+
+### NEW endpoint — `GET /signals/{signal_log_id}/contributors`
+
+**Status: shipped** in commit `b38f9aa`. Cluster-aware contributors + counterparty panel that backs UI-SPEC.md Section 2's expandable signal card. Returns one row per identity with `cluster_size`, full underlying `wallets` list, dollar fields summed across the FULL cluster's positions on this market, `is_hedged` flag, lifetime PnL/ROI from the latest overall leaderboard. The user's audit-chat decision: do not auto-filter cross-side clusters; expose the cluster's dual-side activity via this panel so the user judges cluster-active markets manually.
+
+---
+
+## Part 4 — Closure (2026-05-08)
+
+Pass 5 closed across 11 commits on `main` (`ad44c26`..`b38f9aa`). All 16 in-scope items shipped + 1 endpoint + 2 explicitly dropped (#7, #19). Smoke baseline grew 579 → **921 across 22 suites**. See `review/FIXES.md` for the per-commit behavioral diffs and `session-state.md` for the closure summary.
 
 **What's wrong**
 F12+R4+R7 retired the trades-based counterparty path in favor of positions-based. `get_market_trades` has no production caller. Leaving it around invites a future change to wire it back in with the wrong semantics.

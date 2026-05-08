@@ -2,9 +2,54 @@
 
 > Updated each session. Read this first when resuming work.
 
-**Pass 5 R17 (rate-limiter consolidation) shipped. Pass 3 + Pass 4 complete. Phase 7 live dry-run verified writing correctly. Phase 8 (data wipe) is now OPTIONAL — system runs at 3.3-min cycles steady-state with no zombie accumulation. Pass 5 audit complete — 17 open findings + 1 held; rate limiter (Critical) closed first per dependency analysis. Remaining 16 to plan + ship before UI build.**
+**Pass 5 CLOSED (2026-05-08). All 16 plan items + 1 new endpoint shipped across 11 commits on `main` (`5f7e81b`..`b38f9aa`); plus the pre-plan rate-limiter fix in `ad44c26`. 921 smoke tests across 22 suites, all green. 20 migrations applied to live Supabase (001-013, 015-020). Pass 3 + Pass 4 + Pass 5 all complete. The system is at the "ready for UI build" milestone per UI-SPEC.md.**
 
-623 smoke tests passing across 11 suites (was 579 → +44 from Pass 5 R17). 17 migrations applied to live Supabase (001-017, no 014). All Pass 3 + Pass 4 + Pass 5 R17 fixes committed on `main`.
+---
+
+## Pass 5 closure summary (2026-05-08)
+
+**Commits (11):**
+
+| Commit | Tier | Items | Smoke |
+|---|---|---|---|
+| `5f7e81b` | A | Migrations 018, 019, 020 | 623 → 657 |
+| `668ae70` | B | #1 + #2 + #5 cluster-collapse family | 657 → 706 |
+| `3f8b558` | B | #3 specialist Bayesian prior | 706 → 723 |
+| `e5b4d0d` | B | #8 bootstrap_p persistence | 723 → 742 |
+| `43284fa` | B | #9 + #10 engine integration | 742 → 762 |
+| `95629fe` | C | #14 closed monotonic | 762 → 775 |
+| `d482f38` | C | #6 + #16 ops visibility | 775 → 811 |
+| `8ce1b0f` | C | #17 zombie filter incomplete-metadata | 811 → 831 |
+| `8566f8e` | D | #4 + #11 + #12 + #13 math correctness | 831 → 862 |
+| `5730542` | E | #18 iter_trades fail-loud | 862 → 877 |
+| `b38f9aa` | E | `GET /signals/{id}/contributors` endpoint | 877 → 921 |
+
+**Plus** `ad44c26` (Pass 5 R17 rate-limiter consolidation, shipped before the plan was written; covered as audit item #15).
+
+**Audit decisions:**
+- **#7** specialist `active_recently` strictness: dropped per user (finding judged too weak).
+- **#19** dead `get_market_trades` deletion: dropped (off critical path; can be one-line cleanup anytime).
+- **#1+#2+#5** bundled into one cluster-collapse commit per the plan.
+- **#9+#10** bundled because both are engine-layer fixes; #9's structural fix shipped in commit 1's migration 019.
+- **#6+#16** bundled because both are operational-visibility fixes that share `/system/status` surface area.
+- **#4+#11+#12+#13** bundled per the plan ("math correctness bundle, all small independent changes").
+
+**Smoke baseline:** 579 (pre-Pass-5) → **921 across 22 suites**.
+
+**Honest call-outs documented in `review/FIXES.md`:**
+- Audit #1 framing overstated the magnitude — `aggregate_usdc` and `total_dollars_in_market` were already correct sums; real material wins are per-entity `avg_portfolio_fraction` (#1), cluster-aware counterparty (#2), exit_detector SUM/COUNT alignment (#5).
+- Audit #13 quantitative claim (0.59 → 0.65) overstated — actual shift is ~0.01 because cluster-bootstrap-of-mean is unbiased for the population mean in expectation. Structural fix is correct; magnitude is modest.
+- Migration 019 column list kept verbatim from migration 007 instead of adding the speculative Pass 3+ columns the plan sketched (those would have broken the engine's existing reads).
+- `_rank_specialist`'s `prior_pool` keeps the contamination-exclusion clause despite the plan's suggestion to drop it (including MM/arb/sybils would deflate the baseline).
+
+**Where to resume:**
+
+System is production-ready for the third-party UI build per `UI-SPEC.md`. The new `GET /signals/{signal_log_id}/contributors` endpoint is the last backend deliverable — UI Section 2's expandable signal panel can now be built. Optional next steps:
+
+1. **Run a fresh-session audit** with the strict-confidence prompt (see project memory `project_post_pass5_scrutinizer_skill.md`) — refine the scrutinizer skill once and use its output as the gate for shipping the UI.
+2. **Live cycle dry-run** to confirm steady-state cadence after Pass 5: `./venv/Scripts/python.exe scripts/run_cycle_once.py`. Pre-Pass-5 baseline was 3.3 min/cycle; Pass 5 added a few SQL CTEs but should not regress >50%.
+3. **Phase 8 data wipe** (still optional). Pass 4's zombie filter + `upsert_positions_for_trader`'s DELETE-stale clause keep the system clean without it.
+4. **Begin UI build** per `UI-SPEC.md` against the now-frozen API surface.
 
 ---
 
