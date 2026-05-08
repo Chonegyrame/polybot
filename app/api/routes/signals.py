@@ -176,6 +176,30 @@ async def get_recent_exits(
     }
 
 
+@router.get("/{signal_log_id}/contributors")
+async def get_signal_contributors(
+    signal_log_id: int,
+    conn: asyncpg.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Pass 5: contributors + counterparty panel for one signal.
+
+    Backs the UI-SPEC.md Section 2 expandable panel that shows WHO is
+    contributing to the signal and which top-N traders are on the
+    opposite side. Cluster-aware: a 4-wallet sybil cluster appears as
+    ONE row with `cluster_size=4`. `is_hedged=True` flags entities
+    holding both sides of the market. Counterparty list is filtered by
+    `is_counterparty` (>= $5k opposite-side USDC + >= 75% concentration).
+
+    Returns 404 when the signal_log row doesn't exist.
+    """
+    result = await crud.get_signal_contributors_and_counterparty(
+        conn, signal_log_id,
+    )
+    if result is None:
+        raise HTTPException(404, f"signal_log_id={signal_log_id} not found")
+    return result
+
+
 @router.get("/new")
 async def get_new_signals(
     since: datetime = Query(..., description="ISO 8601 timestamp; UI passes its localStorage.lastReadSignalsAt"),

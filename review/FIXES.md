@@ -1354,3 +1354,68 @@ across hundreds of backtest signals, the bias adds up.
   `get_trades` callers retain the silent-`[]` behavior (back-compat).
 - **Live verification**: 21 smoke suites — **877/877 passing** (was
   862, +15 new).
+
+### Tier E — `GET /signals/{signal_log_id}/contributors` endpoint
+
+- **Status**: fixed (commit 11 of the Pass 5 plan; depends on the
+  cluster machinery shipped in Tier B #1+#2+#5).
+- **Source**: `review/PASS5_PLAN.md` "NEW endpoint" + `UI-SPEC.md`
+  Section 2 (the contributors panel that drives the UI's expandable
+  signal card). The user's audit-chat decision: signals fire as the
+  math computes; the UI surfaces contributors + counterparty + a
+  hedge flag so the user judges cluster-active markets manually
+  instead of the engine auto-filtering them.
+- **Files**:
+  - `app/db/crud.py` — two new helpers:
+    - `_aggregate_signal_entities(conn, cohort, condition_id,
+      signal_direction)` — cluster-aware entity aggregation. Looks
+      up each cohort wallet's identity, expands to FULL cluster
+      membership (so dollar fields reflect the entire entity, not
+      just the cohort subset), sums positions on this market, and
+      enriches with `cluster_label`, `user_name`, `verified_badge`,
+      `avg_entry_price`, lifetime `pnl_usdc` + `roi` from the latest
+      `'overall'` leaderboard snapshot. Returns one dict per
+      identity in the UI-SPEC schema.
+    - `get_signal_contributors_and_counterparty(conn,
+      signal_log_id)` — top-level entrypoint. Pulls the signal_log
+      row, calls `_aggregate_signal_entities` twice (once for the
+      `contributing_wallets` cohort to build contributors, once for
+      `gather_union_top_n_wallets` minus contributors to build
+      counterparty candidates), then filters counterparty via the
+      shared `is_counterparty` predicate (>= $5k opposite-side USDC
+      + >= 75% concentration). Returns the documented summary
+      block. Returns `None` for unknown ids.
+  - `app/api/routes/signals.py` — new
+    `GET /signals/{signal_log_id}/contributors` route. Thin: calls
+    the crud helper, returns the dict, raises `HTTPException(404)`
+    on `None`.
+  - `scripts/smoke_phase_pass5_contributors_endpoint.py` — 44 new
+    tests:
+    - 404 path on `signal_log_id=-99999999` (crud + route).
+    - Contributors with one-sided cluster + retail: 4-wallet cluster
+      ($20k YES each = $80k entity) + 1 retail ($5k YES) collapses
+      to 2 entities. Verifies cluster_size=4, cluster_label,
+      cluster_id (UUID string), wallets list, same/opposite/net.
+    - Contributors with hedged cluster: 3 wallets YES + 1 wallet NO
+      → one entity with `is_hedged=True`, `same_side_usdc=$70k`,
+      `opposite_side_usdc=$20k`, `net_exposure_usdc=$50k`.
+      Summary `n_hedged_contributors=1`.
+    - Lone wallet path: 3 lone wallets, no cluster → 3 entities
+      each with `cluster_size=1` and `cluster_id=None`.
+    - Response shape: every contributor has the documented keys
+      (`proxy_wallet, user_name, verified_badge, cluster_id,
+      cluster_label, cluster_size, wallets, same_side_usdc,
+      opposite_side_usdc, is_hedged, net_exposure_usdc,
+      avg_entry_price, lifetime_pnl_usdc, lifetime_roi`); summary
+      has the documented keys; counterparty is a list.
+    - Route handler returns 200 + the documented shape for a real
+      signal_log_id.
+- **UI-SPEC alignment**: implementation follows Section 2 verbatim
+  with two minor enrichments: top-level response includes
+  `signal_log_id`, `condition_id`, `direction` for callers that want
+  the context without a separate lookup; each entity dict includes
+  a `wallets` array (list of underlying proxy_wallet addresses) so
+  the UI can show "Cluster A · 4 wallets" with the underlying
+  membership on hover.
+- **Live verification**: 22 smoke suites — **921/921 passing** (was
+  877, +44 new).

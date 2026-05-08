@@ -2260,3 +2260,274 @@ async def latest_complete_snapshot_date(
         LIMIT 1
         """
     )
+
+
+# ---------------------------------------------------------------------------
+# Pass 5 — /signals/{id}/contributors endpoint helpers
+# ---------------------------------------------------------------------------
+
+
+async def _aggregate_signal_entities(
+    conn: asyncpg.Connection,
+    cohort: list[str],
+    condition_id: str,
+    signal_direction: str,
+) -> list[dict[str, Any]]:
+    """Cluster-aware entity aggregation for the contributors endpoint.
+
+    For each wallet in `cohort`, looks up its identity (cluster_id if any,
+    else proxy_wallet itself), then expands to the FULL cluster's wallets,
+    sums positions on `condition_id` across that full membership, and
+    enriches with cluster_label / user_name / verified_badge / lifetime
+    pnl + roi from the latest 'overall' leaderboard snapshot.
+
+    The cohort can be either:
+      - signal_log.contributing_wallets (the original cohort that fired
+        the signal), to build the contributors list.
+      - the current top-N pool (gather_union_top_n_wallets), to build
+        the counterparty candidate list (caller filters via
+        is_counterparty before surfacing).
+
+    Returns one dict per identity with the schema documented at
+    `get_signal_contributors_and_counterparty` (UI-SPEC Section 2).
+    """
+    if not cohort:
+        return []
+
+    same_outcome = "Yes" if signal_direction == "YES" else "No"
+    opposite_outcome = "No" if signal_direction == "YES" else "Yes"
+
+    rows = await conn.fetch(
+        """
+        WITH cohort AS (
+            SELECT proxy_wallet FROM unnest($1::TEXT[]) AS proxy_wallet
+        ),
+        cohort_identities AS (
+            -- One row per identity present in the cohort. Lone wallets get
+            -- their proxy_wallet as identity; clustered wallets share their
+            -- cluster_id::text so multiple wallets in the same cluster
+            -- collapse to one row downstream.
+            SELECT DISTINCT
+                COALESCE(cm.cluster_id::text, c.proxy_wallet) AS identity,
+                cm.cluster_id
+            FROM cohort c
+            LEFT JOIN cluster_membership cm USING (proxy_wallet)
+        ),
+        identity_wallets AS (
+            -- For each identity, expand to its FULL cluster membership
+            -- (all wallets in cluster_membership for that cluster_id) so
+            -- the dollar aggregation reflects the entire entity, not just
+            -- the subset of wallets in the cohort. Lone wallets stay
+            -- single-element arrays.
+            SELECT
+                ci.identity,
+                ci.cluster_id,
+                CASE WHEN ci.cluster_id IS NOT NULL THEN
+                    (SELECT array_agg(proxy_wallet ORDER BY proxy_wallet)
+                     FROM cluster_membership
+                     WHERE cluster_id = ci.cluster_id)
+                ELSE
+                    ARRAY[ci.identity]
+                END AS wallets
+            FROM cohort_identities ci
+        ),
+        latest_lb AS (
+            -- Latest 'overall' leaderboard snapshot per wallet for lifetime
+            -- pnl/vol enrichment. DISTINCT ON picks the most-recent row per
+            -- proxy_wallet.
+            SELECT DISTINCT ON (proxy_wallet)
+                proxy_wallet, pnl, vol
+            FROM leaderboard_snapshots
+            WHERE category = 'overall'
+              AND time_period = 'all'
+              AND order_by = 'PNL'
+            ORDER BY proxy_wallet, snapshot_date DESC
+        )
+        SELECT
+            iw.identity,
+            iw.cluster_id::text AS cluster_id_text,
+            iw.wallets,
+            COALESCE(array_length(iw.wallets, 1), 0)::INT AS cluster_size,
+            wc.cluster_label,
+            COALESCE(SUM(
+                CASE WHEN UPPER(p.outcome) = UPPER($2)
+                     THEN p.current_value ELSE 0 END
+            ), 0)::NUMERIC AS same_usdc,
+            COALESCE(SUM(
+                CASE WHEN UPPER(p.outcome) = UPPER($3)
+                     THEN p.current_value ELSE 0 END
+            ), 0)::NUMERIC AS opposite_usdc,
+            CASE WHEN COALESCE(SUM(p.size), 0) > 0
+                 THEN SUM(p.avg_price * p.size) / SUM(p.size)
+                 ELSE NULL
+            END AS avg_entry_price,
+            (SELECT t.user_name FROM traders t
+             WHERE t.proxy_wallet = ANY(iw.wallets)
+               AND t.user_name IS NOT NULL
+             ORDER BY t.proxy_wallet
+             LIMIT 1) AS user_name,
+            COALESCE(
+                (SELECT BOOL_OR(t.verified_badge) FROM traders t
+                 WHERE t.proxy_wallet = ANY(iw.wallets)),
+                FALSE
+            ) AS verified_badge,
+            (SELECT COALESCE(SUM(lb.pnl), 0) FROM latest_lb lb
+             WHERE lb.proxy_wallet = ANY(iw.wallets)) AS lifetime_pnl_usdc,
+            CASE WHEN (SELECT COALESCE(SUM(lb.vol), 0) FROM latest_lb lb
+                       WHERE lb.proxy_wallet = ANY(iw.wallets)) > 0 THEN
+                (SELECT SUM(lb.pnl) FROM latest_lb lb
+                 WHERE lb.proxy_wallet = ANY(iw.wallets))::NUMERIC
+                / (SELECT SUM(lb.vol) FROM latest_lb lb
+                   WHERE lb.proxy_wallet = ANY(iw.wallets))
+            ELSE NULL END AS lifetime_roi
+        FROM identity_wallets iw
+        LEFT JOIN wallet_clusters wc ON wc.cluster_id = iw.cluster_id
+        LEFT JOIN positions p
+               ON p.proxy_wallet = ANY(iw.wallets)
+              AND p.condition_id = $4
+              AND p.size > 0
+              AND LOWER(p.outcome) IN ('yes', 'no')
+        GROUP BY iw.identity, iw.cluster_id, iw.wallets, wc.cluster_label
+        ORDER BY
+            (COALESCE(SUM(
+                CASE WHEN UPPER(p.outcome) = UPPER($2)
+                     THEN p.current_value ELSE 0 END
+            ), 0)
+            + COALESCE(SUM(
+                CASE WHEN UPPER(p.outcome) = UPPER($3)
+                     THEN p.current_value ELSE 0 END
+            ), 0)) DESC
+        """,
+        cohort, same_outcome, opposite_outcome, condition_id,
+    )
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        same = float(r["same_usdc"] or 0.0)
+        opp = float(r["opposite_usdc"] or 0.0)
+        wallets = list(r["wallets"] or [])
+        out.append({
+            # Representative wallet for callers that want a single address.
+            "proxy_wallet": wallets[0] if wallets else None,
+            "user_name": r["user_name"],
+            "verified_badge": bool(r["verified_badge"]),
+            "cluster_id": r["cluster_id_text"],  # str(UUID) or None
+            "cluster_label": r["cluster_label"],
+            "cluster_size": int(r["cluster_size"] or 0),
+            "wallets": wallets,
+            "same_side_usdc": same,
+            "opposite_side_usdc": opp,
+            "is_hedged": opp > 0 and same > 0,
+            "net_exposure_usdc": same - opp,
+            "avg_entry_price": (
+                float(r["avg_entry_price"])
+                if r["avg_entry_price"] is not None else None
+            ),
+            "lifetime_pnl_usdc": (
+                float(r["lifetime_pnl_usdc"])
+                if r["lifetime_pnl_usdc"] is not None else None
+            ),
+            "lifetime_roi": (
+                float(r["lifetime_roi"])
+                if r["lifetime_roi"] is not None else None
+            ),
+        })
+    return out
+
+
+async def get_signal_contributors_and_counterparty(
+    conn: asyncpg.Connection,
+    signal_log_id: int,
+) -> dict[str, Any] | None:
+    """Pass 5: contributors + counterparty panel for one signal.
+
+    Returns the response shape documented in UI-SPEC.md Section 2:
+        {
+          "contributors": [...],     # entities from signal_log.contributing_wallets
+          "counterparty": [...],     # top-N entities on opposite side (filtered by
+                                     #   is_counterparty floor + concentration)
+          "summary": {...}           # totals + counts
+        }
+
+    Both lists use the same identity-collapsed schema -- a 4-wallet cluster
+    appears as ONE row with cluster_size=4 and dollar fields summed across
+    the full cluster's positions on this market (not just the cohort
+    subset). is_hedged=True means the entity holds BOTH sides.
+
+    Returns None when signal_log_id doesn't exist.
+    """
+    sig = await conn.fetchrow(
+        """
+        SELECT id, mode, category, top_n, contributing_wallets,
+               condition_id, direction
+        FROM signal_log
+        WHERE id = $1
+        """,
+        signal_log_id,
+    )
+    if sig is None:
+        return None
+
+    contributing = list(sig["contributing_wallets"] or [])
+    cid = sig["condition_id"]
+    direction = sig["direction"]
+
+    # Imports inside the helper to avoid cycle (services.counterparty
+    # imports crud).
+    from app.services.counterparty import is_counterparty
+    from app.services.trader_ranker import gather_union_top_n_wallets
+
+    contributors = await _aggregate_signal_entities(
+        conn, contributing, cid, direction,
+    )
+
+    # Counterparty pool: current top-N for the signal's category. Use
+    # gather_union_top_n_wallets because it returns the cross-mode union
+    # in one bulk query; broader is fine because the is_counterparty
+    # filter rejects irrelevant candidates by floor + concentration.
+    # Exclude wallets already in the contributors cohort so an identity
+    # that's both a contributor (with hedge) and a counterparty doesn't
+    # appear twice.
+    contributing_set = {w.lower() for w in contributing}
+    pool_categories = (sig["category"],) if sig["category"] != "overall" else (
+        "overall",
+    )
+    pool = await gather_union_top_n_wallets(
+        conn, top_n=int(sig["top_n"]), categories=pool_categories,
+    )
+    pool = [w for w in pool if w.lower() not in contributing_set]
+
+    counterparty_candidates = await _aggregate_signal_entities(
+        conn, pool, cid, direction,
+    )
+    # Filter: an entity counts as a counterparty when its OPPOSITE-side
+    # exposure clears the floor and concentration thresholds. is_hedged
+    # contributors don't end up here because contributors are excluded
+    # from the pool above.
+    counterparty = [
+        c for c in counterparty_candidates
+        if is_counterparty(c["same_side_usdc"], c["opposite_side_usdc"])
+    ]
+
+    summary = {
+        "n_contributors": len(contributors),
+        "n_hedged_contributors": sum(
+            1 for c in contributors if c["is_hedged"]
+        ),
+        "n_counterparty": len(counterparty),
+        "total_same_side_usdc": float(
+            sum(c["same_side_usdc"] for c in contributors)
+        ),
+        "total_opposite_side_usdc": float(
+            sum(c["opposite_side_usdc"] for c in contributors)
+        ),
+    }
+
+    return {
+        "signal_log_id": int(sig["id"]),
+        "condition_id": cid,
+        "direction": direction,
+        "contributors": contributors,
+        "counterparty": counterparty,
+        "summary": summary,
+    }
