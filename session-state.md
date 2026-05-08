@@ -1,8 +1,73 @@
 # Session State
 
 > Updated each session. Read this first when resuming work.
+>
+> **For full per-commit behavioral detail (problem statement, fix summary,
+> files changed, scope deviations, smoke deltas), also read `review/FIXES.md`.**
+> This file is the orientation; FIXES.md is the source of truth for what
+> each commit actually did and why.
 
 **Pass 5 CLOSED (2026-05-08). All 16 plan items + 1 new endpoint shipped across 11 commits on `main` (`5f7e81b`..`b38f9aa`); plus the pre-plan rate-limiter fix in `ad44c26`. 921 smoke tests across 22 suites, all green. 20 migrations applied to live Supabase (001-013, 015-020). Pass 3 + Pass 4 + Pass 5 all complete. The system is at the "ready for UI build" milestone per UI-SPEC.md.**
+
+---
+
+## Tomorrow's first task — build the trading-strategy scrutinizer skill
+
+Before anything else, the user is building a custom Claude Code skill — a
+**post-Pass-5 trading-strategy code scrutinizer** — to break out of the
+audit-treadmill loop. Five prior audit passes each returned 17-25 findings
+with several "Critical" labels, but open-ended "review this code for issues"
+prompts will always produce a list. The fix is a single purpose-built
+skill with a strict bar that allows "no findings" as a valid result.
+
+**Refine the prompt with the user; don't pre-draft it solo.** The aspects
+to discuss together (also captured at
+`memory/project_post_pass5_scrutinizer_skill.md`):
+
+1. **Strict-confidence prompt structure.** Only surface findings where the
+   reviewer has >70% confidence the issue is real and material — would lose
+   money or miss a real signal in the next 30 days. Stylistic concerns,
+   refactoring opportunities, and future-V2 architecture get explicitly
+   excluded. Empty findings list is a valid output (and expected for
+   a healthy system).
+
+2. **Multi-agent consensus pattern.** Run 3-5 review agents in parallel
+   with the same strict prompt; only act on findings flagged by ≥2 agents.
+   This filters out the audit-noise where a single agent latches onto a
+   stylistic concern the others ignore.
+
+3. **Trading-specific review lens.** Domain-bound the reviewer to
+   trading-logic concerns:
+   - Fee math correctness (per-category rates, share-vs-dollar formulas)
+   - Slippage symmetry (entry vs exit, resolution path)
+   - Signal/exit threshold alignment (TRIM/EXIT/cohort recompute)
+   - Fill realism (book depth, latency, spread)
+   - Survivorship and selection bias (top-N reconstructed pre-fix)
+   - Multiple-testing hygiene (BH-FDR, bootstrap p, session window)
+   - Data integrity at the API seam (zombie filter, paginator shape errors)
+
+4. **Output format that respects the bar.** Each finding must include:
+   confidence %, money-loss/missed-signal mechanism, repro scenario,
+   concrete fix sketch. No severity labels (Critical/High/Medium) — the
+   strict prompt makes them all "actionable" or they don't pass the bar.
+
+5. **Scope-bounded.** The skill explicitly does NOT review:
+   - Code style / formatting / naming
+   - Test coverage gaps (unless they hide a logic bug)
+   - Architectural refactor opportunities
+   - V2 features (multi-process, Redis, alternate venues)
+   - Anything the reviewer can't tie to a money or signal-quality
+     consequence within 30 days
+
+**Falsifiable "done" condition:** the user ships the UI build only after
+running this skill on the post-Pass-5 codebase and getting a finding count
+of 0-2 (with full agent consensus on each). That's the exit criterion that
+breaks the audit loop — currently no audit has had a "done" gate, which is
+why every pass produces another list.
+
+**Where to put it:** TBD with the user. Options: project `.claude/`
+skill (lives with the repo, version-controlled with the codebase), or
+user-global `~/.claude/` (reusable across other trading projects).
 
 ---
 
