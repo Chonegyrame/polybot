@@ -1419,3 +1419,65 @@ across hundreds of backtest signals, the bias adds up.
   membership on hover.
 - **Live verification**: 22 smoke suites — **921/921 passing** (was
   877, +44 new).
+
+---
+
+## Post-Pass-5 — Scrutinizer 2026-05-08
+
+Strict-confidence multi-agent gate (`/scrutinize-trading-logic`). 3 reviewer
+agents in parallel, ≥2-of-3 consensus filter, 5 strict gates re-checked.
+Surfaced 1 finding via consensus + 1 single-agent finding the user opted
+to verify and fix. See `review/SCRUTINIZER_2026-05-08.md`.
+
+### F27 — Latency `_apply_latency` double-translates NO-direction snapshots after R8
+
+- **Status**: fixed
+- **Source**: `review/SCRUTINIZER_2026-05-08.md` Finding 1 (3 of 3 agents,
+  83% avg confidence)
+- **Files**:
+  - `app/services/backtest_engine.py:1090-1153` — `_apply_latency` now
+    branches on the snapshot's stored `direction`. YES signal → use
+    `snap_price` as-is. NO signal + `direction=='NO'` snapshot (post-R8
+    direction-space) → use as-is. NO signal + legacy / YES-space snapshot
+    → translate via `1 − snap_price` (preserved legacy behavior).
+  - `app/db/crud.py:fetch_signal_price_snapshots` — SELECT now includes
+    `direction`; returned dicts gain a `direction` key
+    (`'YES' | 'NO' | None`). Type signature widened to `dict[str,
+    float | str | None]` to accommodate.
+  - `scripts/smoke_phase_b2.py::test_apply_latency` — rewritten to cover
+    all 4 quadrants explicitly: NO-signal + NO-space (no translate),
+    NO-signal + legacy YES-space (translate via 1−x), legacy ask=None
+    bid-fallback (translate via 1−x), YES-signal + YES-space (no
+    translate). The pre-fix test encoded the bug.
+- **Error**: Pass 3 R8 / migration 012 changed `signal_price_snapshots`
+  to capture the direction-side token's bid/ask in **direction-space**
+  (NO-token book for NO signals). The half-life path was updated to
+  branch on `sps.direction`; the latency path was not.
+  `fetch_signal_price_snapshots` did not SELECT the column, so
+  `_apply_latency` had no signal to dispatch on and continued
+  hard-coding the pre-R8 assumption `new_offer = 1 − snap.ask` for NO
+  signals. Post-R8 NO snapshots are already in NO-space, so the
+  translation produced `1 − NO_ask` (≈ implied YES bid) and fed it into
+  `compute_pnl_per_dollar` as a direction-space `signal_entry_offer`,
+  multiplicatively breaking the P&L identity for the NO subset.
+- **Money mechanism**: NO signals tend to be entered at NO_ask < 0.5
+  (you bet NO when the market favors YES). The bug pushes
+  `effective_entry` from `NO_ask` to `1 − NO_ask` → > 0.5, well above
+  truth, which deflates `payout_per_share / effective_entry` on wins
+  and inflates `entry_fee = rate × (1 − effective_entry)`. Net effect:
+  systematically downward-biases `mean_pnl_per_dollar` on the NO subset
+  whenever a latency profile is engaged. Numeric example: NO signal at
+  `NO_ask = 0.30` → true payout/$ = 3.33; pre-fix reported 1.43 (>190pp
+  swing on the affected row).
+- **Test**: `test_apply_latency` 7/7 PASS post-fix; pre-fix the new
+  NO+NO-space assertion failed against the buggy code (returned
+  `1 − 0.32 = 0.68` instead of `0.32`). Full smoke suite 117/117
+  green (was 113/115; the 2 pre-existing fails were unrelated stale
+  threshold tests, refreshed in the same commit).
+- **Bundled cleanup — refresh stale `latency_unavailable` smoke tests**:
+  Pass 5 #12 lowered `LATENCY_FALLBACK_WARN_FRACTION` from 0.5 → 0.2,
+  but `test_f7_latency_unavailable_flag` still asserted the 0.5
+  threshold (`50/50 → False`, `40% → False`). Rewrote to match current
+  threshold: `50% → True`, `40% → True`, plus new boundary cases
+  (`20% → False`, `25% → True`) and updated docstring.
+

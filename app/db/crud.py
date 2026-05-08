@@ -1828,25 +1828,31 @@ async def insert_signal_price_snapshot(
 async def fetch_signal_price_snapshots(
     conn: asyncpg.Connection,
     signal_log_ids: list[int],
-) -> dict[tuple[int, int], dict[str, float | None]]:
-    """F4: Return {(signal_log_id, offset_min): {bid, ask, mid}} for ids.
+) -> dict[tuple[int, int], dict[str, float | str | None]]:
+    """F4: Return {(signal_log_id, offset_min): {bid, ask, mid, direction}}.
 
     `mid` is computed from (bid+ask)/2 when both available; falls back to
     bid only on legacy rows that pre-date F4. Used by B10 latency
     simulation (uses ask) and half-life analytics (uses mid).
+
+    `direction` is which side's book the snapshot was captured against:
+    'YES' | 'NO' | None (legacy rows pre-R8 = always YES book). Consumers
+    that compare the snapshot price against direction-space data must
+    branch on this field — bid/ask are returned in `direction`-space, not
+    YES-space.
     """
     if not signal_log_ids:
         return {}
     rows = await conn.fetch(
         """
         SELECT signal_log_id, snapshot_offset_min,
-               bid_price, ask_price, yes_price
+               bid_price, ask_price, yes_price, direction
         FROM signal_price_snapshots
         WHERE signal_log_id = ANY($1::BIGINT[])
         """,
         signal_log_ids,
     )
-    out: dict[tuple[int, int], dict[str, float | None]] = {}
+    out: dict[tuple[int, int], dict[str, float | str | None]] = {}
     for r in rows:
         bid = r["bid_price"] if r["bid_price"] is not None else r["yes_price"]
         ask = r["ask_price"]
@@ -1855,6 +1861,7 @@ async def fetch_signal_price_snapshots(
         mid_f = (bid_f + ask_f) / 2.0 if (bid_f is not None and ask_f is not None) else bid_f
         out[(int(r["signal_log_id"]), int(r["snapshot_offset_min"]))] = {
             "bid": bid_f, "ask": ask_f, "mid": mid_f,
+            "direction": r["direction"],
         }
     return out
 

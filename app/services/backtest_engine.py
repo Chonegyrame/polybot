@@ -1109,8 +1109,12 @@ def _apply_latency(
     Returns (new_rows, n_adjusted, n_fallback). Rows without a usable
     snapshot keep their original signal_entry_offer.
 
-    NO-direction rows: snapshot is YES-space; translate to direction space
-    via 1 − price.
+    R8: snapshots are stored in DIRECTION-space (NO-token book for NO
+    signals, YES-token for YES). Each snapshot dict carries a `direction`
+    key of 'YES' | 'NO' | None (legacy = YES-space). When the snapshot's
+    direction matches the signal's direction, the price is already in
+    direction-space and we use it as-is. For legacy rows (direction None)
+    or YES-space snapshots on a NO signal, translate via 1 − price.
     """
     window = _resolve_latency_window(f)
     if window is None:
@@ -1125,16 +1129,25 @@ def _apply_latency(
         snap = snapshots.get((r.id, offset)) if offset is not None else None
         # F4: prefer ask (true buy-cross price); fall back to bid for
         # legacy rows that pre-date F4 (bid only).
-        snap_yes = None
+        snap_price = None
         if snap is not None:
-            snap_yes = snap.get("ask")
-            if snap_yes is None:
-                snap_yes = snap.get("bid")
-        if snap_yes is None:
+            snap_price = snap.get("ask")
+            if snap_price is None:
+                snap_price = snap.get("bid")
+        if snap_price is None:
             fallback += 1
             new_rows.append(r)
             continue
-        new_offer = snap_yes if r.direction == "YES" else (1.0 - snap_yes)
+        # R8: branch on snapshot direction. If snapshot is already in the
+        # signal's direction-space, no translation. Else (YES-space
+        # snapshot on a NO signal — legacy or explicit) translate via 1−x.
+        snap_dir = snap.get("direction") if snap is not None else None
+        if r.direction == "YES":
+            new_offer = snap_price
+        elif snap_dir == "NO":
+            new_offer = snap_price
+        else:
+            new_offer = 1.0 - snap_price
         new_rows.append(dataclasses.replace(r, signal_entry_offer=new_offer))
         adjusted += 1
     return new_rows, adjusted, fallback

@@ -608,9 +608,11 @@ def test_f4_half_life_uses_mid_when_ask_present() -> None:
 
 def test_f7_latency_unavailable_flag() -> None:
     """F7 regression: the latency_unavailable() helper flips True when
-    fallback dominates (>50% of rows). Pre-fix the engine reported
-    'latency simulated' even when every row had fallen back to the
-    optimistic baseline (because the short profiles' windows didn't
+    fallback dominates. Pass 5 #12 lowered the threshold from 0.5 to 0.2
+    (LATENCY_FALLBACK_WARN_FRACTION) — anything over 20% fallback now
+    trips the warning. Pre-fix the engine reported 'latency simulated'
+    even when every row had fallen back to the optimistic baseline
+    (because the short profiles' windows didn't
     intersect any captured snapshot offset).
 
     See review/FIXES.md F7.
@@ -631,16 +633,24 @@ def test_f7_latency_unavailable_flag() -> None:
         latency_unavailable(0, 10) is True,
     )
     check(
-        "50/50 -> False (boundary; > not >=)",
-        latency_unavailable(5, 5) is False,
+        "50% fallback -> True (above 0.2 threshold)",
+        latency_unavailable(5, 5) is True,
     )
     check(
         "60% fallback -> True",
         latency_unavailable(4, 6) is True,
     )
     check(
-        "40% fallback -> False",
-        latency_unavailable(6, 4) is False,
+        "40% fallback -> True (above 0.2 threshold)",
+        latency_unavailable(6, 4) is True,
+    )
+    check(
+        "20% fallback -> False (boundary; > not >=)",
+        latency_unavailable(8, 2) is False,
+    )
+    check(
+        "25% fallback -> True (just above 0.2 threshold)",
+        latency_unavailable(75, 25) is True,
     )
 
 
@@ -883,46 +893,78 @@ def test_nearest_snapshot_offset() -> None:
 
 
 def test_apply_latency() -> None:
-    """F4-updated: snapshots are now {bid, ask, mid} dicts. Latency uses
-    the ASK (true buy-cross price) when available, falls back to bid for
-    legacy rows."""
-    section("B10/F4: _apply_latency adjusts entry using ASK from snapshot")
+    """F4 + R8: snapshots are {bid, ask, mid, direction} dicts. Latency
+    uses the ASK (true buy-cross price) when available; branches on the
+    snapshot's direction-space ('YES' | 'NO' | None=legacy YES-space)."""
+    section("B10/F4/R8: _apply_latency uses ASK and branches on snapshot direction")
     # Row: NO direction, fire_price=0.55 (NO ask), id=42
     row = _make_row("0xdelayed", direction="NO", entry=0.55, sid=42)
     f = BacktestFilters(latency_profile="delayed")  # 30-60 min window
-    # F4: snapshots are dicts now. ASK is what latency uses (the price
-    # you'd cross to buy after the delay).
-    snaps = {
-        (42, 30): {"bid": 0.40, "ask": 0.42, "mid": 0.41},
-        (42, 60): {"bid": 0.30, "ask": 0.32, "mid": 0.31},
-    }
 
-    new_rows, adjusted, fallback = _apply_latency([row], f, snaps)
+    # R8 post-fix: NO-direction snapshot stored in NO-space. ASK is
+    # already in NO-space, so latency must NOT translate via 1-x.
+    snaps_no_space = {
+        (42, 30): {"bid": 0.40, "ask": 0.42, "mid": 0.41, "direction": "NO"},
+        (42, 60): {"bid": 0.30, "ask": 0.32, "mid": 0.31, "direction": "NO"},
+    }
+    new_rows, adjusted, fallback = _apply_latency([row], f, snaps_no_space)
     check("returns one row", len(new_rows) == 1)
     new_row = new_rows[0]
-    # Latency uses ASK; for NO direction translate via 1-x.
-    # Expected: {1-0.42, 1-0.32} = {0.58, 0.68} depending on which offset hit.
-    expected = {1.0 - 0.42, 1.0 - 0.32}
+    # Post-R8: snapshot already direction-space, use ask as-is.
+    expected_no = {0.42, 0.32}
     check(
-        "F4: NO-direction entry uses ask (translated from YES snapshot)",
-        any(abs(new_row.signal_entry_offer - e) < 1e-9 for e in expected),
-        f"got {new_row.signal_entry_offer}, expected one of {expected}",
+        "R8: NO-signal + NO-space snapshot uses ask directly (no translation)",
+        any(abs(new_row.signal_entry_offer - e) < 1e-9 for e in expected_no),
+        f"got {new_row.signal_entry_offer}, expected one of {expected_no}",
     )
     check("adjusted=1, fallback=0", adjusted == 1 and fallback == 0)
 
-    # F4: legacy snapshot (ask=None) falls back to bid. Provide both offsets
-    # so whichever the seeded sample picks is available.
-    snaps_legacy = {
-        (42, 30): {"bid": 0.40, "ask": None, "mid": 0.40},
-        (42, 60): {"bid": 0.30, "ask": None, "mid": 0.30},
+    # Legacy (pre-R8) NO snapshots: direction=None, snapshot in YES-space.
+    # Latency must translate via 1-x for NO signals.
+    snaps_legacy_space = {
+        (42, 30): {"bid": 0.40, "ask": 0.42, "mid": 0.41, "direction": None},
+        (42, 60): {"bid": 0.30, "ask": 0.32, "mid": 0.31, "direction": None},
     }
-    new_rows3, adjusted3, _ = _apply_latency([row], f, snaps_legacy)
-    expected_legacy = {1.0 - 0.40, 1.0 - 0.30}
+    new_rows_legacy, adjusted_legacy, _ = _apply_latency([row], f, snaps_legacy_space)
+    expected_legacy = {1.0 - 0.42, 1.0 - 0.32}
     check(
-        "F4: legacy snapshot (ask=None) falls back to bid",
+        "Legacy: NO-signal + YES-space snapshot translates via 1-x",
+        adjusted_legacy == 1
+        and any(abs(new_rows_legacy[0].signal_entry_offer - e) < 1e-9 for e in expected_legacy),
+        f"got {new_rows_legacy[0].signal_entry_offer}, expected one of {expected_legacy}",
+    )
+
+    # F4 fallback: legacy snapshot with ask=None and direction=None falls
+    # back to bid AND translates via 1-x (legacy YES-space NO signal).
+    snaps_legacy_bid = {
+        (42, 30): {"bid": 0.40, "ask": None, "mid": 0.40, "direction": None},
+        (42, 60): {"bid": 0.30, "ask": None, "mid": 0.30, "direction": None},
+    }
+    new_rows3, adjusted3, _ = _apply_latency([row], f, snaps_legacy_bid)
+    expected_legacy_bid = {1.0 - 0.40, 1.0 - 0.30}
+    check(
+        "F4: legacy ask=None falls back to bid (still YES-space, still translates)",
         adjusted3 == 1
-        and any(abs(new_rows3[0].signal_entry_offer - e) < 1e-9 for e in expected_legacy),
+        and any(abs(new_rows3[0].signal_entry_offer - e) < 1e-9 for e in expected_legacy_bid),
         f"got {new_rows3[0].signal_entry_offer}",
+    )
+
+    # YES signal: snapshot in YES-space (either direction='YES' or legacy)
+    # — use ask as-is, no translation. Reuse cid/sid so the deterministic
+    # RNG picks the same offset as the NO branch above (so the (sid, off)
+    # lookup hits one of the seeded offsets).
+    yes_row = _make_row("0xdelayed", direction="YES", entry=0.45, sid=42)
+    snaps_yes = {
+        (42, 30): {"bid": 0.50, "ask": 0.52, "mid": 0.51, "direction": "YES"},
+        (42, 60): {"bid": 0.55, "ask": 0.57, "mid": 0.56, "direction": "YES"},
+    }
+    new_rows_yes, adjusted_yes, _ = _apply_latency([yes_row], f, snaps_yes)
+    expected_yes = {0.52, 0.57}
+    check(
+        "YES-signal + YES-space snapshot uses ask directly",
+        adjusted_yes == 1
+        and any(abs(new_rows_yes[0].signal_entry_offer - e) < 1e-9 for e in expected_yes),
+        f"got {new_rows_yes[0].signal_entry_offer}, expected one of {expected_yes}",
     )
 
     # No snapshot present -> fallback (entry unchanged)
@@ -931,9 +973,9 @@ def test_apply_latency() -> None:
     check("adjusted=0, fallback=1", adjusted2 == 0 and fallback2 == 1)
 
     # Profile=None -> rows unchanged + zero counts
-    new_rows3, adjusted3, fallback3 = _apply_latency([row], BacktestFilters(), snaps)
-    check("profile=None -> no-op", new_rows3 is [row] or new_rows3[0] is row or new_rows3[0].signal_entry_offer == 0.55)
-    check("profile=None -> 0/0 counters", adjusted3 == 0 and fallback3 == 0)
+    new_rows4, adjusted4, fallback4 = _apply_latency([row], BacktestFilters(), snaps_no_space)
+    check("profile=None -> no-op", new_rows4 is [row] or new_rows4[0] is row or new_rows4[0].signal_entry_offer == 0.55)
+    check("profile=None -> 0/0 counters", adjusted4 == 0 and fallback4 == 0)
 
 
 # ===========================================================================
