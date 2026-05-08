@@ -16,7 +16,18 @@ function App() {
   });
   const [trader, setTrader] = useState(null);
   const [marketCtx, setMarketCtx] = useState(null);
+  // Paper trades: fetched live from GET /paper_trades, with mock fallback.
+  // `placePaperTrade` POSTs to backend then re-fetches; offline writes go local.
   const [paperTrades, setPaperTrades] = useState(PB.PAPER_TRADES);
+  const [paperTradesOffline, setPaperTradesOffline] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    apiGet('/paper_trades').then(
+      (resp) => { if (!cancelled) { setPaperTrades(resp.trades || []); setPaperTradesOffline(false); } },
+      (e) => { if (!cancelled) { console.warn('Paper trades offline:', e.message); setPaperTradesOffline(true); } }
+    );
+    return () => { cancelled = true; };
+  }, []);
 
   // apply tweaks
   useEffect(() => {
@@ -39,17 +50,36 @@ function App() {
     setMarketCtx({ conditionId, direction });
     setTrader(null);
   }
-  function placePaperTrade(trade) {
-    setPaperTrades(prev => [{
-      id: Date.now(),
-      ...trade,
-      unrealized_pnl_usdc: 0,
-      realized_pnl_usdc: null,
-      status: 'open',
-      exit_reason: null,
-      entry_at: new Date().toISOString(),
-      exit_at: null,
-    }, ...prev]);
+  async function placePaperTrade(trade) {
+    // Try POST /paper_trades to the backend. Server validates + computes effective entry,
+    // then we re-fetch the list to pick up the canonical row. If backend is offline,
+    // fall back to local-only state so the user can still play with the form.
+    try {
+      const body = {
+        condition_id: trade.condition_id,
+        direction: trade.direction,
+        size_usdc: trade.entry_size_usdc,
+        signal_log_id: trade.signal_log_id ?? null,
+        notes: trade.notes ?? null,
+      };
+      await apiPost('/paper_trades', body);
+      const resp = await apiGet('/paper_trades');
+      setPaperTrades(resp.trades || []);
+      setPaperTradesOffline(false);
+    } catch (e) {
+      console.warn('Paper trade POST failed (offline?):', e.message);
+      setPaperTradesOffline(true);
+      setPaperTrades(prev => [{
+        id: Date.now(),
+        ...trade,
+        unrealized_pnl_usdc: 0,
+        realized_pnl_usdc: null,
+        status: 'open',
+        exit_reason: null,
+        entry_at: new Date().toISOString(),
+        exit_at: null,
+      }, ...prev]);
+    }
   }
 
   return (
@@ -133,15 +163,23 @@ function TradersPage({ openTrader }) {
             ))}
           </div>
         </div>
-        <TopTradersFullPage openTrader={openTrader} />
+        <TopTradersFullPage mode={mode} category={cat} openTrader={openTrader} />
       </div>
     </>
   );
 }
 
-function TopTradersFullPage({ openTrader }) {
+function TopTradersFullPage({ mode, category, openTrader }) {
+  // Live: GET /traders/top with the parent's mode + category.
+  const path = `/traders/top?mode=${mode || 'absolute'}&category=${category || 'overall'}&top_n=100`;
+  const res = useApi(path, { traders: PB.TOP_TRADERS });
+  const traders = res.data?.traders || [];
+  if (res.loading && traders.length === 0) {
+    return <div className="card card-pad muted">Loading traders…</div>;
+  }
   return (
     <div className="card">
+      {res.error && <div className="card-pad muted" style={{fontSize:12,borderBottom:'1px solid var(--border)'}}>⚠ Backend offline — showing mock data.</div>}
       <table className="table">
         <thead>
           <tr>
@@ -158,7 +196,7 @@ function TopTradersFullPage({ openTrader }) {
           </tr>
         </thead>
         <tbody>
-          {PB.TOP_TRADERS.map(t => (
+          {traders.map(t => (
             <tr key={t.proxy_wallet} className="row-clickable" onClick={() => openTrader(t.proxy_wallet)}>
               <td className="num muted">#{t.rank}</td>
               <td>

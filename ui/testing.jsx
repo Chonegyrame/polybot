@@ -176,11 +176,75 @@ function Backtest() {
   const knobKey = `${mode}|${cat}|${topN}|${direction}|${exitStrategy}|${latencyProfile}|${customLatencyMin}|${customLatencyMax}|${JSON.stringify(filters)}`;
   useEffect(() => { setSessionRuns(r => r + 1); }, [knobKey]);
 
-  const bt = D.BACKTEST;
-  const decay = D.EDGE_DECAY_FULL;
-  const halfLife = D.HALF_LIFE;
-  const lat = D.LATENCY_STATS_BY_PROFILE[latencyProfile] || D.LATENCY_STATS_BY_PROFILE.responsive;
-  const benchData = D.BENCHMARKS[benchmark];
+  // ---- Live backend wiring -------------------------------------------------
+  // Build a query string for /backtest/* endpoints from the filter state.
+  const qs = useMemo(() => {
+    const p = new URLSearchParams();
+    if (mode) p.set('mode', mode);
+    if (cat && cat !== 'overall') p.set('category', cat);
+    if (direction && direction !== 'both') p.set('direction', direction);
+    if (exitStrategy) p.set('exit_strategy', exitStrategy);
+    if (latencyProfile && latencyProfile !== 'none') {
+      p.set('latency_profile', latencyProfile);
+      if (latencyProfile === 'custom') {
+        p.set('latency_min_min', String(customLatencyMin));
+        p.set('latency_max_min', String(customLatencyMax));
+      }
+    }
+    const f = filters;
+    if (f.skew_min !== '') p.set('min_skew', String(f.skew_min));
+    if (f.skew_max !== '') p.set('max_skew', String(f.skew_max));
+    if (f.min_trader_count !== '') p.set('min_trader_count', String(f.min_trader_count));
+    if (f.min_aggregate_usdc !== '') p.set('min_aggregate_usdc', String(f.min_aggregate_usdc));
+    if (f.max_gap !== '') p.set('max_gap', String(f.max_gap));
+    if (f.min_avg_portfolio_fraction > 0) p.set('min_avg_portfolio_fraction', String(f.min_avg_portfolio_fraction / 100));
+    f.liquidity_tiers.forEach(t => p.append('liquidity_tiers', t));
+    if (f.market_category && f.market_category !== 'all') p.set('market_category', f.market_category);
+    if (f.dedup) p.set('dedup', 'true');
+    if (f.trade_size_usdc && f.trade_size_usdc !== 100) p.set('trade_size_usdc', String(f.trade_size_usdc));
+    if (f.holdout_from) p.set('holdout_from', f.holdout_from);
+    if (f.include_pre_fix) p.set('include_pre_fix', 'true');
+    if (f.include_multi_outcome) p.set('include_multi_outcome', 'true');
+    return p.toString();
+  }, [mode, cat, direction, exitStrategy, latencyProfile, customLatencyMin, customLatencyMax, filters]);
+
+  // /backtest/summary with optional ?benchmark=
+  const summaryPath = `/backtest/summary?${qs}${benchmark ? `&benchmark=${benchmark}` : ''}`;
+  const summaryRes = useApi(summaryPath, { ...D.BACKTEST, benchmark: { name: benchmark, ...D.BENCHMARKS[benchmark] } });
+  const bt = summaryRes.data || D.BACKTEST;
+
+  // /backtest/slice?dimension=
+  const slicePath = `/backtest/slice?dimension=${slice}&${qs}`;
+  const sliceRes = useApi(slicePath, { buckets: {} });
+  // Backend returns {buckets: {<label>: BacktestResult}} — flatten to array of rows for the table.
+  const sliceFromBackend = useMemo(() => {
+    if (!sliceRes.data?.buckets) return null;
+    return Object.entries(sliceRes.data.buckets).map(([name, b]) => ({
+      name, n_eff: b.n_eff, win_rate: b.win_rate, mean_pnl_per_dollar: b.mean_pnl_per_dollar,
+      pnl_ci_lo: b.pnl_ci_lo, pnl_ci_hi: b.pnl_ci_hi, pnl_bootstrap_p: b.pnl_bootstrap_p,
+      underpowered: b.underpowered,
+      star: (b.bh_fdr_pnl_ci_lo ?? -1) > 0,
+      corrections: {
+        bonferroni_pnl_ci_lo: b.bonferroni_pnl_ci_lo, bonferroni_pnl_ci_hi: b.bonferroni_pnl_ci_hi,
+        bh_fdr_pnl_ci_lo: b.bh_fdr_pnl_ci_lo, bh_fdr_pnl_ci_hi: b.bh_fdr_pnl_ci_hi,
+      },
+    }));
+  }, [sliceRes.data]);
+
+  // /backtest/edge_decay
+  const decayPath = `/backtest/edge_decay?${qs}`;
+  const decayRes = useApi(decayPath, D.EDGE_DECAY_FULL);
+  const decay = decayRes.data || D.EDGE_DECAY_FULL;
+
+  // /backtest/half_life
+  const halfLifePath = `/backtest/half_life${cat && cat !== 'overall' ? `?category=${cat}` : ''}`;
+  const halfLifeRes = useApi(halfLifePath, { buckets: D.HALF_LIFE });
+  const halfLife = (halfLifeRes.data?.buckets) || D.HALF_LIFE;
+
+  // Latency stats — embedded in /backtest/summary response when latency_profile is set.
+  // Otherwise fall back to mock-by-profile.
+  const lat = bt.latency_stats || D.LATENCY_STATS_BY_PROFILE[latencyProfile] || D.LATENCY_STATS_BY_PROFILE.responsive;
+  const benchData = bt.benchmark || D.BENCHMARKS[benchmark];
 
   // Multiplicity warning tier
   let mTier = 'ok';
@@ -188,7 +252,8 @@ function Backtest() {
   else if (sessionRuns >= 10) mTier = 'warn';
   else if (sessionRuns >= 5) mTier = 'soft';
 
-  const sliceData = D.SLICE_DATA[slice] || [];
+  // Prefer live slice if backend returned it, else fall back to mock buckets.
+  const sliceData = sliceFromBackend ?? (D.SLICE_DATA[slice] || []);
 
   return (
     <>
@@ -634,9 +699,13 @@ function Field({ label, hint, children }) {
 // Diagnostics
 // ============================================================
 function Diagnostics() {
-  const v2 = D.SYSTEM_STATUS;
+  // Live: GET /system/status. Falls back to PB.SYSTEM_STATUS mock when offline.
+  const sysRes = useApi('/system/status', D.SYSTEM_STATUS);
+  const v2 = sysRes.data || D.SYSTEM_STATUS;
+  // Edge-decay summary on the diagnostics page reads the canonical mock for now —
+  // the Backtest tab is the authoritative live edge_decay surface.
   const decay = D.EDGE_DECAY_FULL;
-  const z = v2.counters.zombie_drops_last_24h;
+  const z = v2.counters?.zombie_drops_last_24h || D.SYSTEM_STATUS.counters.zombie_drops_last_24h;
   const sf = v2.components.stats_freshness;
   const statsState = !sf.seeded ? 'unseeded' : (!sf.fresh ? 'stale' : 'fresh');
   const statsHealth = statsState === 'fresh' ? 'green' : statsState === 'stale' ? 'amber' : 'red';
@@ -738,16 +807,42 @@ function DiagRow({ label, health, last, detail }) {
 // Insider Wallets page (tracked-wallet management)
 // ============================================================
 function InsiderWallets() {
+  // Live: GET /insider_wallets. POST to add, DELETE to remove. Mock fallback for offline browsing.
   const [list, setList] = useState(D.INSIDER_WALLETS);
+  const [offline, setOffline] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [draft, setDraft] = useState({ proxy_wallet: '', label: '', notes: '' });
 
-  const add = () => {
+  const refresh = useCallback(() => {
+    apiGet('/insider_wallets').then(
+      (resp) => { setList(resp.wallets || []); setOffline(false); },
+      (e) => { console.warn('Insider wallets offline:', e.message); setOffline(true); }
+    );
+  }, []);
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const add = async () => {
     if (!/^0x[a-fA-F0-9]{40}$/.test(draft.proxy_wallet)) { alert('Wallet must be 0x… 42 chars'); return; }
-    setList(L => [{ ...draft, added_at: new Date().toISOString(), last_seen_at: null }, ...L]);
+    try {
+      await apiPost('/insider_wallets', { proxy_wallet: draft.proxy_wallet, label: draft.label || null, notes: draft.notes || null });
+      refresh();
+    } catch (e) {
+      console.warn('Insider add failed (offline?):', e.message);
+      setOffline(true);
+      setList(L => [{ ...draft, added_at: new Date().toISOString(), last_seen_at: null }, ...L]);
+    }
     setShowAdd(false); setDraft({ proxy_wallet: '', label: '', notes: '' });
   };
-  const remove = (w) => setList(L => L.filter(x => x.proxy_wallet !== w));
+  const remove = async (w) => {
+    try {
+      await apiDelete(`/insider_wallets/${w}`);
+      refresh();
+    } catch (e) {
+      console.warn('Insider delete failed (offline?):', e.message);
+      setOffline(true);
+      setList(L => L.filter(x => x.proxy_wallet !== w));
+    }
+  };
 
   return (
     <>

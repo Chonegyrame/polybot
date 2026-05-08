@@ -2,11 +2,14 @@
 // trader-modal.jsx — Trader drill-down (Section 4)
 // =============================================================
 function TraderModal({ wallet, onClose, openMarket }) {
-  const detail = PB.TRADER_DETAIL[wallet] || {
+  // Live: GET /traders/{wallet}. Mock fallback assembles a stub from PB.TRADER_DETAIL or top traders.
+  const mockDetail = PB.TRADER_DETAIL[wallet] || {
     profile: PB.TOP_TRADERS.find(t => t.proxy_wallet === wallet) || { proxy_wallet: wallet, user_name: null, pnl: 0, vol: 0, roi: 0 },
     classification: null, cluster: null, per_category: [], open_positions: [],
   };
-  const p = detail.profile;
+  const res = useApi(wallet ? `/traders/${wallet}` : null, mockDetail);
+  const detail = res.data || mockDetail;
+  const p = detail.profile || {};
   const c = detail.classification, cl = detail.cluster;
 
   return (

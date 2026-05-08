@@ -7,6 +7,10 @@
 
 const PB = {};
 
+// API base URL — points at the local FastAPI backend by default.
+// Change this for production / Railway deploy. Override via window.POLYBOT_API_BASE.
+PB.API_BASE = window.POLYBOT_API_BASE || 'http://127.0.0.1:8000';
+
 // ---------- categories & modes (from spec Section "Primary controls") ----------
 PB.MODES = [
   { id: 'absolute',   label: 'Absolute PnL',     blurb: 'Biggest dollar winners. Surfaces whales and insiders.' },

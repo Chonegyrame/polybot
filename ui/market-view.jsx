@@ -2,7 +2,21 @@
 // market-view.jsx — Per-market trading view + Paper trade form
 // =============================================================
 function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaperTrade }) {
-  const detail = PB.MARKET_DETAIL[conditionId] || PB.MARKET_DETAIL['0x8f3a...c1'];
+  // Live: GET /markets/{condition_id}. Backend returns {market, tracked_positions_by_outcome,
+  // tracked_positions_per_trader, signal_history}. orderbook + fills are NOT yet on the
+  // backend (Phase 2 — the trading_view endpoint), so we fall back to mock data for those.
+  const mockDetail = PB.MARKET_DETAIL[conditionId] || PB.MARKET_DETAIL['0x8f3a...c1'];
+  const res = useApi(conditionId ? `/markets/${conditionId}` : null, mockDetail);
+  const live = res.data || {};
+  const detail = {
+    market: live.market || mockDetail.market,
+    // Backend doesn't ship orderbook/fills — keep mock so the trade panel still shows depth+slippage estimates.
+    orderbook: mockDetail.orderbook,
+    fills: mockDetail.fills,
+    tracked_positions_by_outcome: live.tracked_positions_by_outcome || mockDetail.tracked_positions_by_outcome,
+    tracked_positions_per_trader: live.tracked_positions_per_trader || mockDetail.tracked_positions_per_trader,
+    signal_history: live.signal_history || mockDetail.signal_history,
+  };
   const { market, orderbook, fills, tracked_positions_by_outcome, tracked_positions_per_trader, signal_history } = detail;
   const [tab, setTab] = useState('signal');
   const [side, setSide] = useState(presetDirection || 'YES');

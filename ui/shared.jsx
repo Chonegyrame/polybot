@@ -4,6 +4,55 @@
 const { useState, useEffect, useRef, useMemo, useCallback } = React;
 const D = window.POLYBOT_DATA;
 
+// ---------- API client ----------
+// All UI components fetch via these helpers. Mock data in data.js (PB.SIGNALS,
+// PB.PAPER_TRADES, etc.) is used as a fallback when the backend is unreachable
+// so the UI is still usable in dev / when uvicorn isn't running.
+
+async function apiGet(path) {
+  const r = await fetch(`${D.API_BASE}${path}`, { headers: { 'Accept': 'application/json' } });
+  if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
+  return await r.json();
+}
+async function apiPost(path, body) {
+  const r = await fetch(`${D.API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(`POST ${path} → ${r.status}`);
+  return await r.json();
+}
+async function apiDelete(path) {
+  const r = await fetch(`${D.API_BASE}${path}`, { method: 'DELETE' });
+  if (!r.ok) throw new Error(`DELETE ${path} → ${r.status}`);
+  return await r.json();
+}
+
+// React hook: fetch a JSON path, fall back to `mock` if backend is unreachable.
+// `path === null` means "don't fetch yet" (useful for lazy loads). The hook
+// re-fetches whenever the path string changes.
+function useApi(path, mock) {
+  const [state, setState] = useState({ data: mock ?? null, loading: path !== null, error: null, source: mock ? 'mock' : 'pending' });
+  useEffect(() => {
+    if (path == null) return;
+    let cancelled = false;
+    setState(s => ({ ...s, loading: true, error: null }));
+    apiGet(path).then(
+      (data) => { if (!cancelled) setState({ data, loading: false, error: null, source: 'live' }); },
+      (e) => {
+        if (cancelled) return;
+        // Backend unreachable — keep mock data, surface error so UI can show "offline" badge.
+        // eslint-disable-next-line no-console
+        console.warn(`API offline for ${path}:`, e.message || e);
+        setState({ data: mock ?? null, loading: false, error: String(e.message || e), source: 'mock' });
+      }
+    );
+    return () => { cancelled = true; };
+  }, [path]);
+  return state;  // { data, loading, error, source }
+}
+
 // ---------- formatters ----------
 const fmtUSD = (n, decimals = 0) => {
   if (n == null) return '—';

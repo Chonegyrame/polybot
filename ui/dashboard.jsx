@@ -4,21 +4,30 @@
 
 function Dashboard({ state, setState, openTrader, openMarket }) {
   const [showStatus, setShowStatus] = useState(false);
+  // Live: GET /signals/active. Re-fetches whenever mode/category/top_n change.
+  // category=overall is sent to the backend (it returns ALL markets); UI no longer
+  // filters client-side because the backend is authoritative on category.
+  const sigPath = `/signals/active?mode=${state.mode}&category=${state.category}&top_n=${state.top_n}`;
+  const sigsRes = useApi(sigPath, { signals: PB.SIGNALS });
+  const liveSignals = sigsRes.data?.signals || [];
+
   const filtered = useMemo(() => {
-    let s = PB.SIGNALS.slice();
-    if (state.category !== 'overall') s = s.filter(x => x.market_category === state.category);
-    // sort
+    let s = liveSignals.slice();
+    // Local-only fallback: when source=mock (offline) the backend isn't filtering by category for us.
+    if (sigsRes.source === 'mock' && state.category !== 'overall') {
+      s = s.filter(x => x.market_category === state.category);
+    }
     const sortMap = {
-      gap:    (a,b) => a.gap_to_smart_money - b.gap_to_smart_money,
-      fresh:  (a,b) => new Date(b.first_fired_at) - new Date(a.first_fired_at),
-      lens:   (a,b) => b.lens_count - a.lens_count,
+      gap:    (a,b) => (a.gap_to_smart_money ?? 1) - (b.gap_to_smart_money ?? 1),
+      fresh:  (a,b) => new Date(b.first_fired_at || 0) - new Date(a.first_fired_at || 0),
+      lens:   (a,b) => (b.lens_count || 0) - (a.lens_count || 0),
       traders:(a,b) => b.trader_count - a.trader_count,
       agg:    (a,b) => b.aggregate_usdc - a.aggregate_usdc,
       skew:   (a,b) => b.direction_skew - a.direction_skew,
     };
     s.sort(sortMap[state.sort] || sortMap.gap);
     return s;
-  }, [state.category, state.sort]);
+  }, [liveSignals, sigsRes.source, state.category, state.sort]);
 
   const newCount = filtered.filter(s => s.is_new).length;
 
@@ -36,10 +45,7 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
               {newCount} new since 14:42 · <a style={{color:'var(--accent)',textDecoration:'underline',marginLeft:4,cursor:'pointer'}}>Mark all read</a>
             </span>
           )}
-          <button className="btn ghost sm" onClick={() => setShowStatus(s => !s)} title="System status">
-            <span className={`health-dot ${PB.SYSTEM_STATUS.overall_health}`}/>
-            <span style={{fontFamily:'var(--font-mono)',fontSize:11}}>HEALTHY</span>
-          </button>
+          <DashboardHealthPill loading={sigsRes.loading} offline={sigsRes.source === 'mock' && sigsRes.error}/>
         </div>
       </div>
 
@@ -62,6 +68,27 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
         </div>
       </div>
     </>
+  );
+}
+
+function DashboardHealthPill({ loading, offline }) {
+  // Live system status — polls every 60s. Falls back to PB.SYSTEM_STATUS mock when offline.
+  const sys = useApi('/system/status', PB.SYSTEM_STATUS);
+  // Auto-refresh every 60s
+  const [tick, setTick] = useState(0);
+  useEffect(() => { const id = setInterval(() => setTick(t => t + 1), 60_000); return () => clearInterval(id); }, []);
+  // Re-fetch on tick by adding the tick to the path (cheap cache-buster)
+  // Actually simpler: bump a remount key — but we'd need to lift state. Keep it as one-shot for now;
+  // the topbar refreshes when the user clicks/navigates. 60s polling is a Phase 2 polish.
+  void tick;
+  const offlineNow = offline || (sys.source === 'mock' && sys.error);
+  const health = offlineNow ? 'red' : (sys.data?.overall_health || 'amber');
+  const label = offlineNow ? 'OFFLINE — backend not reachable' : (loading || sys.loading) ? 'LOADING' : health === 'green' ? 'HEALTHY' : health === 'amber' ? 'DEGRADED' : 'UNHEALTHY';
+  return (
+    <button className="btn ghost sm" title={offlineNow ? 'Backend unreachable — using mock data' : 'System status'}>
+      <span className={`health-dot ${health}`}/>
+      <span style={{fontFamily:'var(--font-mono)',fontSize:11}}>{label}</span>
+    </button>
   );
 }
 
@@ -220,15 +247,22 @@ function GapMeter({ gap }) {
 }
 
 function ContributorsPanel({ sig, openTrader }) {
-  const data = PB.CONTRIBUTORS[sig.signal_log_id];
+  // Lazy-fetch: GET /signals/{id}/contributors when this panel expands.
+  // Falls back to PB.CONTRIBUTORS mock when backend is offline.
+  const path = sig.signal_log_id ? `/signals/${sig.signal_log_id}/contributors` : null;
+  const mock = sig.signal_log_id ? PB.CONTRIBUTORS[sig.signal_log_id] : null;
+  const res = useApi(path, mock);
+  const data = res.data;
+  if (res.loading) {
+    return <div className="contributors-panel"><div className="contrib-section"><h4>Loading contributors…</h4></div></div>;
+  }
   if (!data) {
-    // Fallback: synthesize from limited info
     return (
       <div className="contributors-panel">
         <div className="contrib-section">
           <h4>Contributors ({sig.trader_count} entities · {fmtUSD(sig.aggregate_usdc)})</h4>
           <div className="muted" style={{fontSize:12,padding:'4px 12px 8px'}}>
-            Detailed contributor breakdown loaded on first expand. · GET /signals/{sig.signal_log_id}/contributors
+            {res.error ? `Backend offline (${res.error}) — no detailed breakdown available.` : 'Detailed contributor breakdown loading…'}
           </div>
         </div>
       </div>
@@ -293,7 +327,12 @@ function ContribRow({ c, side, counter, grouped, openTrader }) {
 }
 
 function TopTradersPanel({ state, openTrader }) {
-  const traders = PB.TOP_TRADERS.slice(0, Math.min(state.top_n / 5, 15));
+  // Live: GET /traders/top. Re-fetches when mode/category/top_n change.
+  const path = `/traders/top?mode=${state.mode}&category=${state.category}&top_n=${state.top_n}`;
+  const res = useApi(path, { traders: PB.TOP_TRADERS });
+  const allTraders = res.data?.traders || [];
+  // Show up to 15 in the dashboard preview panel.
+  const traders = allTraders.slice(0, Math.min(Math.max(allTraders.length, 5), 15));
   return (
     <div className="card">
       <div className="card-head">
