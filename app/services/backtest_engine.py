@@ -817,13 +817,13 @@ def summarize_rows(
         if exit_strategy == "smart_money_exit" and r.exit_bid_price is not None:
             pnl = compute_pnl_per_dollar_exit(
                 r.signal_entry_offer, r.exit_bid_price,
-                r.category, trade_size_usdc, r.liquidity_at_signal_usdc,
+                r.market_category, trade_size_usdc, r.liquidity_at_signal_usdc,
                 median_liquidity_fallback=median_liquidity_fallback,
             )
         elif r.resolved_outcome in ("YES", "NO", "50_50"):
             pnl = compute_pnl_per_dollar(
                 r.signal_entry_offer, r.direction, r.resolved_outcome,  # type: ignore[arg-type]
-                r.category, trade_size_usdc, r.liquidity_at_signal_usdc,
+                r.market_category, trade_size_usdc, r.liquidity_at_signal_usdc,
                 median_liquidity_fallback=median_liquidity_fallback,
             )
         else:

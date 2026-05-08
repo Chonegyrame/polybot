@@ -1481,3 +1481,48 @@ to verify and fix. See `review/SCRUTINIZER_2026-05-08.md`.
   threshold: `50% → True`, `40% → True`, plus new boundary cases
   (`20% → False`, `25% → True`) and updated docstring.
 
+### F28 — Backtest fee uses `signal_log` lens-category, not market-category
+
+- **Status**: fixed
+- **Source**: `review/SCRUTINIZER_2026-05-08.md` Finding B (Agent 1
+  only — 1 of 3, but verified manually and confirmed real)
+- **Files**: `app/services/backtest_engine.py:817-828`
+  (`summarize_rows`)
+- **Error**: Both `compute_pnl_per_dollar*` call sites passed
+  `r.category` (the **lens** category from `signal_log.category`:
+  `'overall'`, `'crypto'`, `'politics'`, …) into `fees._resolve_rate`,
+  which expects the actual **market** category from `events.category`
+  (`'Crypto'`, `'Politics'`, `'Geopolitics'`, …). The lookup is
+  case-insensitive, so per-category lenses (`'crypto'` → `'Crypto'`)
+  coincidentally match, but the `'overall'` lens matches no key →
+  falls through to `DEFAULT_FEE_RATE = 0.05` regardless of the
+  underlying market.
+- **Money mechanism**: For overall-lens signals only, the fee is
+  miscalibrated per market: Crypto under-charged by ~2pp (real 7%
+  vs flat 5%) → overstates edge; Geopolitics over-charged by 5pp
+  (real 0%) → understates edge; Sports over by ~2pp;
+  Politics/Tech/Finance over by ~1pp. Per-market direction is
+  deterministic; net direction across an overall-lens backtest
+  depends on market mix. With Polymarket volume dominated by
+  Crypto + Politics, the most likely net effect is a small
+  overstatement of edge on the overall-lens headline.
+- **Fix**: Swap `r.category` → `r.market_category` at both fee call
+  sites (smart-money-exit branch and resolution branch).
+  `SignalRow.market_category` is already populated from
+  `e.category AS market_category` in `_SELECT_COLS` — the field
+  was just never threaded into the fee call.
+  `fees._resolve_rate` handles `None` gracefully (falls back to
+  `DEFAULT_FEE_RATE`), preserving today's behavior for rows without
+  event linkage.
+- **Slicing dimension preserved**: `_bucket()` at line 952 still
+  uses `row.category` for the `"category"` slicing dimension —
+  that's correct (slicing groups by lens, not by market category;
+  `"market_category"` is a separate dimension). Verified no other
+  fee-relevant call sites in the file consume `r.category`.
+- **Test**: full smoke suite 119/119 green post-fix. No new test
+  added — the bug is a single-line variable swap without a
+  realistic synthetic-fixture path to assert on (would require
+  fabricating a `SignalRow` with mismatched lens and market
+  categories, which the live data path already produces). Code
+  review confirms the only fee-bearing consumers of `r.category`
+  were these two lines.
