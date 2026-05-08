@@ -1,0 +1,107 @@
+/* ============================================================
+   styles-extra.css — fills in component CSS not in styles.css
+   ============================================================ */
+
+/* tabs (used by market view + testing) */
+.tabs {
+  display: flex; gap: 4px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+.tab {
+  background: transparent; border: none;
+  padding: 10px 14px; font-size: 13px;
+  color: var(--text-3);
+  cursor: pointer; font-family: inherit;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color 120ms;
+}
+.tab:hover { color: var(--text); }
+.tab.on { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* trade panel (per-market) */
+.trade-panel {
+  position: sticky; top: 84px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.trade-side { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.trade-side-btn {
+  display: flex; flex-direction: column; align-items: center;
+  padding: 14px;
+  border-radius: 10px;
+  border: 1px solid var(--border-2);
+  background: var(--panel-2);
+  color: var(--text-2);
+  cursor: pointer; font-family: inherit;
+  transition: all 120ms;
+}
+.trade-side-btn.yes.on { background: var(--yes-soft); color: var(--accent); border-color: var(--accent-line); box-shadow: 0 0 0 1px var(--accent-line); }
+.trade-side-btn.no.on  { background: var(--no-soft);  color: var(--no);     border-color: rgba(240,68,56,0.4); box-shadow: 0 0 0 1px rgba(240,68,56,0.4); }
+.trade-side-btn:hover { border-color: var(--border-strong); }
+
+.trade-label {
+  font-family: var(--font-mono); text-transform: uppercase;
+  letter-spacing: 0.08em; font-size: 10.5px; color: var(--text-3);
+  margin-bottom: 6px;
+}
+
+.trade-summary {
+  margin-top: 14px; padding: 10px 12px;
+  background: var(--bg-2);
+  border: 1px dashed var(--border-2);
+  border-radius: 10px;
+  font-size: 12.5px;
+}
+.sum-row { display: flex; justify-content: space-between; padding: 3px 0; font-family: var(--font-mono); }
+.sum-row .pos { color: var(--accent); }
+.sum-row .neg { color: var(--no); }
+.sum-row .warn { color: var(--amber); }
+
+/* order book (compact) */
+.ob-section { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; }
+.ob-label {
+  font-family: var(--font-mono); font-size: 10px;
+  text-transform: uppercase; letter-spacing: 0.08em;
+  margin-bottom: 4px; padding: 0 4px;
+}
+.ob-row {
+  display: grid; grid-template-columns: 70px 1fr 90px;
+  gap: 10px; padding: 5px 8px; align-items: center;
+  font-family: var(--font-mono); font-size: 12px;
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.ob-bar {
+  height: 8px; border-radius: 3px;
+  background: var(--bg-2); overflow: hidden;
+}
+.ob-fill { height: 100%; }
+.ob-fill.yes { background: var(--accent); opacity: 0.5; }
+.ob-fill.no  { background: var(--no); opacity: 0.5; }
+.ob-mid {
+  font-family: var(--font-mono); font-size: 11px;
+  color: var(--text-3); text-align: center;
+  padding: 6px; border-top: 1px dashed var(--border);
+  border-bottom: 1px dashed var(--border);
+  margin: 4px 0;
+  text-transform: uppercase; letter-spacing: 0.08em;
+}
+
+/* topbar chip rendering */
+.topbar-actions .chip { padding: 5px 10px; }
+.topbar-actions .chip a { color: var(--accent); cursor: pointer; }
+
+/* KPI helpers used inside KV (Diagnostics shows inline) */
+.kv .v.warn { color: var(--amber); }
+
+/* small adjustments for stat extra width inside signal cards */
+.signal-stats .stat:nth-child(5) { grid-column: span 1; }
+.signal-stats { gap: 18px; }
+
+/* sidebar nav-group-label spacing tweak */
+.sidebar .nav-item:last-child { margin-bottom: 6px; }
