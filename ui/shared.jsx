@@ -91,9 +91,9 @@ function Sidebar({ route, setRoute, status }) {
       ))}
 
       <div className="nav-group-label">Workspace</div>
-      <div className="nav-item"><span style={{width:16,height:16}}>{I.chart}</span><span className="nav-label">Backtest</span></div>
-      <div className="nav-item"><span style={{width:16,height:16}}>{I.pulse}</span><span className="nav-label">Diagnostics</span></div>
-      <div className="nav-item"><span style={{width:16,height:16}}>{I.insider}</span><span className="nav-label">Insider list</span></div>
+      <div className="nav-item" onClick={()=>setRoute('testing/backtest')}><span style={{width:16,height:16}}>{I.chart}</span><span className="nav-label">Backtest</span></div>
+      <div className="nav-item" onClick={()=>setRoute('testing/diag')}><span style={{width:16,height:16}}>{I.pulse}</span><span className="nav-label">Diagnostics</span></div>
+      <div className={`nav-item ${route==='insider'?'active':''}`} onClick={()=>setRoute('insider')}><span style={{width:16,height:16}}>{I.insider}</span><span className="nav-label">Insider wallets</span></div>
       <div className="nav-item"><span style={{width:16,height:16}}>{I.cog}</span><span className="nav-label">Settings</span></div>
       <div className="nav-item"><span style={{width:16,height:16}}>{I.help}</span><span className="nav-label">Help</span></div>
 
@@ -120,32 +120,47 @@ function HealthPillSide({ status }) {
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
+  // round-2 v2 shape (with 3-state stats + zombie breakdown)
+  const v2 = D.SYSTEM_STATUS_V2;
+  const z = v2.counters.zombie_drops_last_24h;
+  const sf = v2.components.stats_freshness;
+  const statsState = !sf.seeded ? 'unseeded' : (!sf.fresh ? 'stale' : 'fresh');
+  const statsHealth = statsState === 'fresh' ? 'green' : statsState === 'stale' ? 'amber' : 'red';
+  const overall = v2.overall_health;
   return (
     <div ref={ref} style={{ position: 'relative' }}>
       <div className="health-pill-side" onClick={() => setOpen(o => !o)}>
-        <span className={`health-dot ${status.overall_health}`}></span>
-        <span>All systems healthy</span>
-        <span className="micro" style={{ marginLeft: 'auto' }}>{status.components.position_refresh.minutes_since}m</span>
+        <span className={`health-dot ${overall}`}></span>
+        <span>{overall === 'green' ? 'All systems healthy' : overall === 'amber' ? 'Degraded' : 'System unhealthy'}</span>
+        <span className="micro" style={{ marginLeft: 'auto' }}>{v2.components.position_refresh.minutes_since}m</span>
       </div>
       {open && (
-        <div className="status-pop" style={{ top: 'auto', bottom: '100%', right: 0, left: 0, marginBottom: 6, marginTop: 0 }}>
-          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>System status · {status.overall_health}</div>
-          <StatusRow k="Last position refresh" v={`${status.components.position_refresh.minutes_since}m ago`} />
-          <StatusRow k="Last cycle duration" v={`${status.last_cycle_duration_s}s`} />
-          <StatusRow k="Long cycles (consec.)" v={status.consecutive_long_cycles} />
-          <StatusRow k="Dropped positions" v={status.dropped_positions_last_cycle} />
-          <StatusRow k="Tracked wallets" v={status.components.tracked_wallets.count} />
-          <StatusRow k="Daily snapshot" v={`${status.components.daily_snapshot.succeeded}/28 ✓`} />
-          <StatusRow k="Stats" v={status.components.stats_freshness.fresh ? 'fresh' : 'stale'} />
-          <StatusRow k="Signals fired (72h)" v={status.components.recent_signals.fired_last_72h} />
-          <StatusRow k="Zombie drops (24h)" v={status.zombie_drops_last_24h} />
+        <div className="status-pop" style={{ top: 'auto', bottom: '100%', right: 0, left: 0, marginBottom: 6, marginTop: 0, minWidth: 320 }}>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>System status · <span style={{textTransform:'uppercase'}}>{overall}</span></div>
+          <StatusRow k="Last position refresh" v={`${v2.components.position_refresh.minutes_since}m ago`} dot={v2.components.position_refresh.health}/>
+          <StatusRow k="Daily snapshot" v={`${v2.components.daily_snapshot.latest_run.succeeded_combos}/28 ✓`} dot={v2.components.daily_snapshot.health}/>
+          <StatusRow k="Stats freshness" v={statsState} dot={statsHealth}/>
+          <StatusRow k="Wallet classifier" v={`${v2.components.wallet_classifier.days_since}d ago`} dot={v2.components.wallet_classifier.health}/>
+          <StatusRow k="Tracked wallets" v={v2.components.tracked_wallets.count} dot={v2.components.tracked_wallets.health}/>
+          <StatusRow k="Signals fired (72h)" v={v2.components.recent_signals.fired_last_72h} dot={v2.components.recent_signals.health}/>
+          <div style={{ borderTop:'1px solid var(--border)', margin:'10px -2px 8px', paddingTop:8 }}>
+            <div style={{ fontSize:11, fontWeight:600, color:'var(--text-2)', marginBottom:6, letterSpacing:.4, textTransform:'uppercase' }}>Zombie drops (24h) · {z.total}</div>
+            <ZombieRow k="Redeemable" v={z.redeemable} kind="ok" />
+            <ZombieRow k="Market closed" v={z.market_closed} kind="ok" />
+            <ZombieRow k="Dust size" v={z.dust_size} kind="ok" />
+            <ZombieRow k="Resolved price past" v={z.resolved_price_past} kind={z.resolved_price_past ? 'warn' : 'ok'} />
+            <ZombieRow k="Incomplete metadata" v={z.incomplete_metadata} kind={z.incomplete_metadata ? 'warn' : 'ok'} />
+          </div>
         </div>
       )}
     </div>
   );
 }
-function StatusRow({ k, v }) {
-  return <div className="status-row"><span className="k">{k}</span><span className="v">{v}</span></div>;
+function ZombieRow({ k, v, kind }) {
+  return <div className="status-row" style={{padding:'3px 2px'}}><span className="k" style={{fontSize:11}}>{k}</span><span className={`v mono ${kind==='warn'?'warn':''}`} style={{fontSize:11}}>{v}</span></div>;
+}
+function StatusRow({ k, v, dot }) {
+  return <div className="status-row"><span className="k">{dot && <span className={`health-dot ${dot}`} style={{display:'inline-block',marginRight:6,verticalAlign:-1}}/>}{k}</span><span className="v">{v}</span></div>;
 }
 
 // ---------- Modal ----------

@@ -33,12 +33,12 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
       condition_id: conditionId,
       market_question: market.question,
       direction: side,
-      size_usdc: size,
+      entry_size_usdc: size,
       effective_entry_price: fillPlan.avgPrice,
       current_price: side === 'YES' ? market.condition_id ? 0.67 : 0.5 : 0.33,
-      fee_paid: fillPlan.fee,
-      slippage_paid: fillPlan.slipBps,
-      thesis: reasoning,
+      entry_fee_usdc: fillPlan.fee,
+      entry_slippage_usdc: fillPlan.slipBps,
+      notes: reasoning,
       signal_log_id: 9821,
     });
     showToast(`Paper trade placed · ${fmtUSD(size)} ${side}`, 'ok');

@@ -46,7 +46,7 @@ PB.SIGNALS = [
     has_exited: false, exit_event: null,
     has_insider: true,
     lens_count: 5,
-    lens_list: ['absolute_overall','absolute_crypto','hybrid_overall','hybrid_crypto','specialist_crypto'],
+    lens_list: ['absolute/overall','absolute/crypto','hybrid/overall','hybrid/crypto','specialist/crypto'],
     first_fired_at: '2026-05-08T10:18:00Z',
     last_seen_at: '2026-05-08T14:08:00Z',
     peak_trader_count: 31, peak_aggregate_usdc: 4_400_000,
@@ -77,7 +77,7 @@ PB.SIGNALS = [
     has_exited: false, exit_event: null,
     has_insider: false,
     lens_count: 2,
-    lens_list: ['absolute_finance','hybrid_finance'],
+    lens_list: ['absolute/finance','hybrid/finance'],
     first_fired_at: '2026-05-06T22:00:00Z',
     last_seen_at: '2026-05-08T13:22:00Z',
     peak_trader_count: 24, peak_aggregate_usdc: 2_010_000,
@@ -108,7 +108,7 @@ PB.SIGNALS = [
     has_exited: false, exit_event: null,
     has_insider: false,
     lens_count: 1,
-    lens_list: ['absolute_politics'],
+    lens_list: ['absolute/politics'],
     first_fired_at: '2026-05-08T11:42:00Z',
     last_seen_at: '2026-05-08T14:00:00Z',
     peak_trader_count: 5, peak_aggregate_usdc: 90_000,
@@ -139,7 +139,7 @@ PB.SIGNALS = [
     has_exited: false, exit_event: null,
     has_insider: false,
     lens_count: 1,
-    lens_list: ['absolute_finance'],
+    lens_list: ['absolute/finance'],
     first_fired_at: '2026-05-02T09:00:00Z',
     last_seen_at: '2026-05-08T12:00:00Z',
     peak_trader_count: 22, peak_aggregate_usdc: 1_180_000,
@@ -180,7 +180,7 @@ PB.SIGNALS = [
     },
     has_insider: false,
     lens_count: 2,
-    lens_list: ['absolute_sports','specialist_sports'],
+    lens_list: ['absolute/sports','specialist/sports'],
     first_fired_at: '2026-05-07T18:00:00Z',
     last_seen_at: '2026-05-08T13:45:00Z',
     peak_trader_count: 14, peak_aggregate_usdc: 480_000,
@@ -211,7 +211,7 @@ PB.SIGNALS = [
     has_exited: false, exit_event: null,
     has_insider: false,
     lens_count: 1,
-    lens_list: ['absolute_culture'],
+    lens_list: ['absolute/culture'],
     first_fired_at: '2026-05-04T19:30:00Z',
     last_seen_at: '2026-05-08T03:30:00Z',
     peak_trader_count: 10, peak_aggregate_usdc: 165_000,
@@ -471,49 +471,51 @@ PB.SYSTEM_STATUS = {
 };
 
 // ---------- paper trades ----------
+// Field names match the backend `paper_trades` response exactly so the UI can
+// swap PB.PAPER_TRADES for fetch('/paper_trades') without renaming anything.
 PB.PAPER_TRADES = [
   { id: 1, condition_id: '0x214b...a9', market_question: 'Will the Fed cut rates in March 2026?',
-    direction: 'NO', size_usdc: 500, effective_entry_price: 0.43, current_price: 0.42,
-    fee_paid: 8.6, slippage_paid: 1.2,
-    unrealized_pnl: 6.4, realized_pnl: null,
+    direction: 'NO', entry_size_usdc: 500, effective_entry_price: 0.43, current_price: 0.42,
+    entry_fee_usdc: 8.6, entry_slippage_usdc: 1.2,
+    unrealized_pnl_usdc: 6.4, realized_pnl_usdc: null,
     status: 'open', exit_reason: null,
-    opened_at: '2026-05-07T11:20:00Z', closed_at: null,
-    signal_log_id: 9817, thesis: 'Trader count + dollar skew both >65%, deep liquidity, Fed has been hawkish all month.' },
+    entry_at: '2026-05-07T11:20:00Z', exit_at: null,
+    signal_log_id: 9817, notes: 'Trader count + dollar skew both >65%, deep liquidity, Fed has been hawkish all month.' },
   { id: 2, condition_id: '0x8f3a...c1', market_question: 'Will Bitcoin hit $200k by end of 2026?',
-    direction: 'YES', size_usdc: 1000, effective_entry_price: 0.69, current_price: 0.67,
-    fee_paid: 21.7, slippage_paid: 4.5,
-    unrealized_pnl: -28.1, realized_pnl: null,
+    direction: 'YES', entry_size_usdc: 1000, effective_entry_price: 0.69, current_price: 0.67,
+    entry_fee_usdc: 21.7, entry_slippage_usdc: 4.5,
+    unrealized_pnl_usdc: -28.1, realized_pnl_usdc: null,
     status: 'open', exit_reason: null,
-    opened_at: '2026-05-08T10:21:00Z', closed_at: null,
-    signal_log_id: 9821, thesis: 'Cluster A whales heavy YES, no top counterparty, gap still under 5%.' },
+    entry_at: '2026-05-08T10:21:00Z', exit_at: null,
+    signal_log_id: 9821, notes: 'Cluster A whales heavy YES, no top counterparty, gap still under 5%.' },
   { id: 3, condition_id: '0xab12...ef', market_question: 'Will the Lakers make the 2026 NBA Finals?',
-    direction: 'NO', size_usdc: 300, effective_entry_price: 0.79, current_price: 0.81,
-    fee_paid: 1.9, slippage_paid: 0.6,
-    unrealized_pnl: null, realized_pnl: -12.4,
+    direction: 'NO', entry_size_usdc: 300, effective_entry_price: 0.79, current_price: 0.81,
+    entry_fee_usdc: 1.9, entry_slippage_usdc: 0.6,
+    unrealized_pnl_usdc: null, realized_pnl_usdc: -12.4,
     status: 'closed_exit', exit_reason: 'smart_money_exit',
-    opened_at: '2026-05-07T19:00:00Z', closed_at: '2026-05-08T13:46:00Z',
-    signal_log_id: 9772, thesis: 'Heavy NO consensus across two specialist lenses, deep book.' },
+    entry_at: '2026-05-07T19:00:00Z', exit_at: '2026-05-08T13:46:00Z',
+    signal_log_id: 9772, notes: 'Heavy NO consensus across two specialist lenses, deep book.' },
   { id: 4, condition_id: '0xZZZZ...01', market_question: 'Will Manchester City win the Premier League 2025-26?',
-    direction: 'YES', size_usdc: 250, effective_entry_price: 0.61, current_price: 1.00,
-    fee_paid: 4.7, slippage_paid: 0.9,
-    unrealized_pnl: null, realized_pnl: 96.4,
+    direction: 'YES', entry_size_usdc: 250, effective_entry_price: 0.61, current_price: 1.00,
+    entry_fee_usdc: 4.7, entry_slippage_usdc: 0.9,
+    unrealized_pnl_usdc: null, realized_pnl_usdc: 96.4,
     status: 'closed_resolved', exit_reason: 'resolved',
-    opened_at: '2026-04-12T15:00:00Z', closed_at: '2026-05-04T22:00:00Z',
-    signal_log_id: 9501, thesis: 'Top sports specialists piled in mid-March, low gap.' },
+    entry_at: '2026-04-12T15:00:00Z', exit_at: '2026-05-04T22:00:00Z',
+    signal_log_id: 9501, notes: 'Top sports specialists piled in mid-March, low gap.' },
   { id: 5, condition_id: '0xZZZZ...02', market_question: 'Will Argentina win Copa America 2026?',
-    direction: 'YES', size_usdc: 400, effective_entry_price: 0.42, current_price: 0.00,
-    fee_paid: 5.0, slippage_paid: 1.0,
-    unrealized_pnl: null, realized_pnl: -406.0,
+    direction: 'YES', entry_size_usdc: 400, effective_entry_price: 0.42, current_price: 0.00,
+    entry_fee_usdc: 5.0, entry_slippage_usdc: 1.0,
+    unrealized_pnl_usdc: null, realized_pnl_usdc: -406.0,
     status: 'closed_resolved', exit_reason: 'resolved',
-    opened_at: '2026-04-22T13:00:00Z', closed_at: '2026-05-01T22:00:00Z',
-    signal_log_id: 9444, thesis: 'Copying the absolute leaderboard sports wing.' },
+    entry_at: '2026-04-22T13:00:00Z', exit_at: '2026-05-01T22:00:00Z',
+    signal_log_id: 9444, notes: 'Copying the absolute leaderboard sports wing.' },
   { id: 6, condition_id: '0xZZZZ...03', market_question: 'Will OpenAI release GPT-6 before October 2026?',
-    direction: 'NO', size_usdc: 600, effective_entry_price: 0.71, current_price: 0.75,
-    fee_paid: 7.0, slippage_paid: 1.4,
-    unrealized_pnl: null, realized_pnl: 142.0,
+    direction: 'NO', entry_size_usdc: 600, effective_entry_price: 0.71, current_price: 0.75,
+    entry_fee_usdc: 7.0, entry_slippage_usdc: 1.4,
+    unrealized_pnl_usdc: null, realized_pnl_usdc: 142.0,
     status: 'closed_manual', exit_reason: 'manual_close',
-    opened_at: '2026-03-28T10:00:00Z', closed_at: '2026-04-19T16:00:00Z',
-    signal_log_id: 9101, thesis: 'Closed early — OpenAI roadmap rumour shifted prices.' },
+    entry_at: '2026-03-28T10:00:00Z', exit_at: '2026-04-19T16:00:00Z',
+    signal_log_id: 9101, notes: 'Closed early — OpenAI roadmap rumour shifted prices.' },
 ];
 
 // ---------- backtest summary ----------
@@ -600,5 +602,173 @@ PB.MARKETS = [
 // balance sparkline
 PB.BALANCE_SERIES = [10000, 9920, 9986, 10120, 10044, 10210, 10180, 10310, 10380, 10220, 10295, 10401, 10520, 10460, 10580, 10665, 10720, 10650, 10810, 10925, 10890, 11042, 11128, 11210];
 
-// expose
+// =============================================================
+// Round 2 additions — latency, benchmarks, full slices, zombies, insiders
+// =============================================================
+
+PB.LATENCY_PROFILES = [
+  { id: 'none',       label: 'Best case',  range: '0',        blurb: 'Fire-time pricing (baseline)' },
+  { id: 'active',     label: 'Active',     range: '1–3 min',  blurb: 'Watching dashboard live' },
+  { id: 'responsive', label: 'Responsive', range: '5–10 min', blurb: 'Glances a few times an hour' },
+  { id: 'casual',     label: 'Casual',     range: '12–20 min',blurb: 'Once or twice an hour' },
+  { id: 'delayed',    label: 'Delayed',    range: '30–60 min',blurb: 'Email/notification' },
+  { id: 'custom',     label: 'Custom…',    range: 'user',     blurb: 'Pick your own window' },
+];
+
+PB.LATENCY_STATS_BY_PROFILE = {
+  none:       { adjusted: 1.00, fallback: 0.00, n_adjusted: 87, n_fallback: 0,  latency_unavailable: false },
+  active:     { adjusted: 0.92, fallback: 0.08, n_adjusted: 80, n_fallback: 7,  latency_unavailable: false },
+  responsive: { adjusted: 0.84, fallback: 0.16, n_adjusted: 73, n_fallback: 14, latency_unavailable: false },
+  casual:     { adjusted: 0.76, fallback: 0.24, n_adjusted: 66, n_fallback: 21, latency_unavailable: true  },
+  delayed:    { adjusted: 0.61, fallback: 0.39, n_adjusted: 53, n_fallback: 34, latency_unavailable: true  },
+  custom:     { adjusted: 0.78, fallback: 0.22, n_adjusted: 68, n_fallback: 19, latency_unavailable: true  },
+};
+
+PB.BENCHMARKS = {
+  buy_and_hold_yes:      { label: 'Buy-and-hold YES',     blurb: 'Does direction matter, vs just attention?', n_eff: 34, mean_pnl_per_dollar:  0.022, pnl_ci_lo: -0.024, pnl_ci_hi: 0.068, win_rate: 0.49, win_rate_ci_lo: 0.39, win_rate_ci_hi: 0.59 },
+  buy_and_hold_no:       { label: 'Buy-and-hold NO',      blurb: 'Mirror — useful when YES has been crushed.',  n_eff: 34, mean_pnl_per_dollar: -0.018, pnl_ci_lo: -0.061, pnl_ci_hi: 0.025, win_rate: 0.46, win_rate_ci_lo: 0.36, win_rate_ci_hi: 0.56 },
+  buy_and_hold_favorite: { label: 'Buy-and-hold favorite',blurb: 'The "go with the crowd" baseline. Strongest test.', n_eff: 34, mean_pnl_per_dollar:  0.012, pnl_ci_lo: -0.034, pnl_ci_hi: 0.058, win_rate: 0.51, win_rate_ci_lo: 0.41, win_rate_ci_hi: 0.61 },
+  coin_flip:             { label: 'Coin flip',            blurb: 'Random direction. Expected ≈ −fees−slippage.', n_eff: 34, mean_pnl_per_dollar: -0.020, pnl_ci_lo: -0.063, pnl_ci_hi: 0.023, win_rate: 0.50, win_rate_ci_lo: 0.40, win_rate_ci_hi: 0.60 },
+  follow_top_1:          { label: 'Follow top-1',         blurb: 'Raw consensus, no filters.',                  n_eff: 34, mean_pnl_per_dollar:  0.039, pnl_ci_lo: -0.005, pnl_ci_hi: 0.083, win_rate: 0.55, win_rate_ci_lo: 0.45, win_rate_ci_hi: 0.65 },
+};
+
+PB.SLICE_DIMENSIONS = [
+  { id: 'mode',                label: 'Ranking mode' },
+  { id: 'category',            label: 'Lens category' },
+  { id: 'direction',           label: 'Direction' },
+  { id: 'market_category',     label: 'Market category' },
+  { id: 'liquidity_tier',      label: 'Liquidity tier' },
+  { id: 'skew_bucket',         label: 'Headcount skew' },
+  { id: 'trader_count_bucket', label: 'Trader count' },
+  { id: 'aggregate_bucket',    label: 'Aggregate USDC' },
+  { id: 'entry_price_bucket',  label: 'Entry price' },
+  { id: 'gap_bucket',          label: 'Gap to smart money' },
+  { id: 'lens_count_bucket',   label: 'Lens count (dedup only)' },
+];
+
+// pre-baked slice payloads
+function _b(name, n_eff, win, pnl, ciLo, ciHi, p, bonLo, bonHi, fdrLo, fdrHi, under) {
+  return { name, n_eff, win_rate: win, mean_pnl_per_dollar: pnl, pnl_ci_lo: ciLo, pnl_ci_hi: ciHi,
+    pnl_bootstrap_p: p, underpowered: under, star: fdrLo > 0,
+    corrections: { bonferroni_pnl_ci_lo: bonLo, bonferroni_pnl_ci_hi: bonHi,
+                   bh_fdr_pnl_ci_lo: fdrLo, bh_fdr_pnl_ci_hi: fdrHi } };
+}
+PB.SLICE_DATA = {
+  gap_bucket: [
+    _b('<-10% (cheaper than smart money)',  6, 0.78,  0.184,  0.062, 0.301, 0.012, -0.022, 0.402,  0.041, 0.318, true),
+    _b('near smart money entry',           14, 0.66,  0.119,  0.031, 0.211, 0.018, -0.014, 0.262,  0.018, 0.225, false),
+    _b('10-50% gap',                       11, 0.51,  0.024, -0.041, 0.087, 0.420, -0.118, 0.169, -0.058, 0.103, false),
+    _b('>50% gap',                          3, 0.36, -0.080, -0.211, 0.031, 0.180, -0.398, 0.181, -0.241, 0.061, true),
+  ],
+  liquidity_tier: [
+    _b('deep',     22, 0.62,  0.082,  0.018, 0.146, 0.022, -0.038, 0.211,  0.001, 0.158, false),
+    _b('medium',   10, 0.55,  0.041, -0.022, 0.108, 0.180, -0.118, 0.221, -0.038, 0.121, false),
+    _b('thin',      4, 0.42, -0.061, -0.182, 0.061, 0.310, -0.342, 0.211, -0.211, 0.082, true),
+    _b('unknown',   0, null,  null,   null,  null,  null,   null,   null,  null,   null,  true),
+  ],
+  direction: [
+    _b('YES', 22, 0.61, 0.078, 0.022, 0.131, 0.028, -0.038, 0.184, 0.002, 0.118, false),
+    _b('NO',  12, 0.51, 0.041,-0.018, 0.099, 0.180, -0.121, 0.211,-0.022, 0.099, false),
+  ],
+  mode: [
+    _b('absolute',   18, 0.60, 0.074, 0.018, 0.131, 0.028, -0.022, 0.182, 0.001, 0.121, false),
+    _b('hybrid',     11, 0.58, 0.062, 0.001, 0.122, 0.041, -0.058, 0.182, -0.018, 0.118, false),
+    _b('specialist',  5, 0.62, 0.094,-0.011, 0.198, 0.082, -0.138, 0.302, -0.041, 0.198, true),
+  ],
+  category: [
+    _b('crypto',   12, 0.66, 0.108, 0.038, 0.181, 0.012, -0.018, 0.231, 0.022, 0.182, false),
+    _b('finance',   9, 0.55, 0.038,-0.022, 0.099, 0.220, -0.121, 0.182,-0.038, 0.082, false),
+    _b('politics',  6, 0.62, 0.062,-0.011, 0.131, 0.110, -0.122, 0.231,-0.018, 0.131, true),
+    _b('sports',    4, 0.49, 0.012,-0.082, 0.108, 0.480, -0.211, 0.231,-0.118, 0.118, true),
+    _b('culture',   2, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+    _b('tech',      1, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+    _b('overall',   0, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+  ],
+  market_category: [
+    _b('crypto',   13, 0.65, 0.099, 0.028, 0.169, 0.014, -0.038, 0.231, 0.012, 0.158, false),
+    _b('finance',  10, 0.54, 0.041,-0.018, 0.099, 0.210, -0.118, 0.182,-0.022, 0.082, false),
+    _b('politics',  6, 0.61, 0.058,-0.018, 0.131, 0.140, -0.131, 0.231,-0.018, 0.122, true),
+    _b('sports',    3, 0.41,-0.018,-0.131, 0.098, 0.420, -0.272, 0.211,-0.118, 0.082, true),
+    _b('culture',   2, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+  ],
+  skew_bucket: [
+    _b('<60%',     2, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+    _b('60-69%',   8, 0.51, 0.018,-0.038, 0.082, 0.420, -0.122, 0.181,-0.062, 0.082, false),
+    _b('70-79%', 12, 0.58, 0.058, 0.001, 0.118, 0.062, -0.082, 0.211,-0.018, 0.108, false),
+    _b('80-89%', 10, 0.65, 0.118, 0.041, 0.198, 0.018, -0.022, 0.262, 0.018, 0.181, false),
+    _b('90-100%', 4, 0.74, 0.181, 0.061, 0.302, 0.012, -0.018, 0.402, 0.041, 0.301, true),
+  ],
+  trader_count_bucket: [
+    _b('<5',      4, 0.46, 0.022,-0.062, 0.108, 0.420, -0.181, 0.231,-0.082, 0.108, true),
+    _b('5-9',     9, 0.54, 0.041,-0.018, 0.098, 0.210, -0.118, 0.182,-0.022, 0.082, false),
+    _b('10-14', 11, 0.62, 0.092, 0.022, 0.161, 0.022, -0.022, 0.211, 0.001, 0.151, false),
+    _b('15-19',  6, 0.66, 0.121, 0.038, 0.211, 0.014, -0.038, 0.262, 0.022, 0.198, true),
+    _b('20+',    4, 0.71, 0.158, 0.041, 0.281, 0.018, -0.022, 0.331, 0.038, 0.262, true),
+  ],
+  aggregate_bucket: [
+    _b('<$100k',     5, 0.42,-0.011,-0.082, 0.058, 0.420, -0.181, 0.121,-0.082, 0.058, true),
+    _b('$100k-$500k',12, 0.55, 0.041,-0.018, 0.098, 0.210, -0.082, 0.181,-0.022, 0.082, false),
+    _b('$500k-$1M', 10, 0.62, 0.082, 0.012, 0.151, 0.038, -0.038, 0.211,-0.001, 0.131, false),
+    _b('$1M+',       7, 0.71, 0.142, 0.041, 0.241, 0.012, -0.018, 0.302, 0.022, 0.221, false),
+  ],
+  entry_price_bucket: [
+    _b('0-20¢',  4, 0.61, 0.121, 0.011, 0.231, 0.038, -0.061, 0.302, 0.001, 0.211, true),
+    _b('20-40¢', 10, 0.62, 0.094, 0.022, 0.161, 0.022, -0.022, 0.211, 0.001, 0.151, false),
+    _b('40-60¢', 11, 0.59, 0.061, 0.001, 0.122, 0.082, -0.082, 0.211,-0.018, 0.108, false),
+    _b('60-80¢',  7, 0.51, 0.018,-0.061, 0.098, 0.420, -0.181, 0.211,-0.082, 0.082, false),
+    _b('80-100¢', 2, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+  ],
+  lens_count_bucket: [
+    _b('1',    16, 0.51, 0.018,-0.038, 0.078, 0.380, -0.118, 0.151,-0.062, 0.082, false),
+    _b('2-3',  10, 0.61, 0.082, 0.011, 0.151, 0.022, -0.061, 0.221,-0.001, 0.121, false),
+    _b('4-5',   6, 0.71, 0.181, 0.061, 0.301, 0.014, -0.022, 0.402, 0.041, 0.301, true),
+    _b('6+',    2, null, null,  null,  null,  null,   null,   null,  null,  null, true),
+  ],
+};
+
+// Edge decay with quality flags
+PB.EDGE_DECAY_FULL = {
+  min_n_per_cohort: 5,
+  decay_warning: false,
+  insufficient_history: false,
+  weeks_of_data: 8,
+  min_weeks_needed: 8,
+  cohorts: [
+    { week: '2026-W11', n_eff: 8,  mean_pnl_per_dollar: 0.092, pnl_ci_lo: 0.012, pnl_ci_hi: 0.183, win_rate: 0.65, underpowered: false },
+    { week: '2026-W12', n_eff: 11, mean_pnl_per_dollar: 0.071, pnl_ci_lo: 0.018, pnl_ci_hi: 0.142, win_rate: 0.62, underpowered: false },
+    { week: '2026-W13', n_eff: 13, mean_pnl_per_dollar: 0.084, pnl_ci_lo: 0.022, pnl_ci_hi: 0.151, win_rate: 0.64, underpowered: false },
+    { week: '2026-W14', n_eff: 9,  mean_pnl_per_dollar: 0.066, pnl_ci_lo: 0.008, pnl_ci_hi: 0.131, win_rate: 0.61, underpowered: false },
+    { week: '2026-W15', n_eff: 12, mean_pnl_per_dollar: 0.058, pnl_ci_lo: 0.001, pnl_ci_hi: 0.121, win_rate: 0.59, underpowered: false },
+    { week: '2026-W16', n_eff: 10, mean_pnl_per_dollar: 0.062, pnl_ci_lo: 0.005, pnl_ci_hi: 0.122, win_rate: 0.60, underpowered: false },
+    { week: '2026-W17', n_eff: 4,  mean_pnl_per_dollar: 0.041,  pnl_ci_lo: -0.038, pnl_ci_hi: 0.121, win_rate: 0.56, underpowered: true  },
+    { week: '2026-W18', n_eff: 9,  mean_pnl_per_dollar: 0.038, pnl_ci_lo: -0.018, pnl_ci_hi: 0.098, win_rate: 0.55, underpowered: false },
+  ],
+};
+
+// System status round-2 shape
+PB.SYSTEM_STATUS_V2 = {
+  overall_health: 'green',
+  components: {
+    position_refresh:   { health: 'green', last_at: '14:38 UTC', minutes_since: 4 },
+    daily_snapshot:     { health: 'green', last_date: '2026-05-08', latest_run: { succeeded_combos: 28, failed_combos: 0 } },
+    stats_freshness:    { seeded: true, fresh: true, last_refresh: '2026-05-08T03:14:00Z' },
+    wallet_classifier:  { health: 'green', last_at: '2026-05-04', days_since: 4 },
+    tracked_wallets:    { health: 'green', count: 530 },
+    recent_signals:     { health: 'green', fired_last_72h: 14 },
+  },
+  counters: {
+    zombie_drops_last_24h: {
+      redeemable: 320, market_closed: 12, dust_size: 4,
+      resolved_price_past: 0, incomplete_metadata: 0, total: 336,
+    },
+  },
+};
+
+// Insider wallets
+PB.INSIDER_WALLETS = [
+  { proxy_wallet: '0x77ae9c2b1e3f4d5a6b7c8d9e0f1a2b3c4d5e6f78', label: 'NBA insider',     notes: 'Hit 4 of 5 last playoffs',      added_at: '2026-04-15T12:00:00Z', last_seen_at: '2026-05-08T09:31:00Z' },
+  { proxy_wallet: '0xb1d5f8a3c4e7920b1d3f5a8c9e2b4d6f8a1c3e5b', label: 'Fed leak',         notes: 'Two consecutive FOMC calls.',   added_at: '2026-03-22T18:00:00Z', last_seen_at: '2026-05-07T14:18:00Z' },
+  { proxy_wallet: '0x4a8c2e5f7b9d3a6c1e4f8b2d5a9c3e7b0d4f6a8c', label: 'Court leaker',     notes: 'Anticipated 3 Supreme Court rulings.', added_at: '2026-02-08T09:30:00Z', last_seen_at: '2026-05-06T22:01:00Z' },
+];
+
 window.POLYBOT_DATA = PB;

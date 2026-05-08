@@ -43,12 +43,12 @@ function App() {
     setPaperTrades(prev => [{
       id: Date.now(),
       ...trade,
-      unrealized_pnl: 0,
-      realized_pnl: null,
+      unrealized_pnl_usdc: 0,
+      realized_pnl_usdc: null,
       status: 'open',
       exit_reason: null,
-      opened_at: new Date().toISOString(),
-      closed_at: null,
+      entry_at: new Date().toISOString(),
+      exit_at: null,
     }, ...prev]);
   }
 
@@ -64,6 +64,7 @@ function App() {
         )}
         {route === 'traders' && <TradersPage openTrader={openTrader} />}
         {route === 'testing' && <Testing paperTrades={paperTrades} openMarket={openMarket} />}
+        {route === 'insider' && <InsiderWallets />}
       </main>
       {trader && <TraderModal wallet={trader} onClose={() => setTrader(null)} openMarket={openMarket} />}
       {marketCtx && (
