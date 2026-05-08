@@ -62,6 +62,29 @@ async def get_active_signals(
         for s in signals:
             d = asdict(s)
             extra = info_by_key.get((s.condition_id, s.direction))
+            # signal_log linkage — enables /signals/{id}/contributors lookup
+            # and the freshness/peak fields the UI signal card displays.
+            d["signal_log_id"] = extra["signal_log_id"] if extra else None
+            d["first_fired_at"] = (
+                extra["first_fired_at"].isoformat()
+                if extra and extra["first_fired_at"] is not None else None
+            )
+            d["last_seen_at"] = (
+                extra["last_seen_at"].isoformat()
+                if extra and extra["last_seen_at"] is not None else None
+            )
+            d["peak_trader_count"] = (
+                extra["signal_peak_trader_count"]
+                if extra and extra.get("signal_peak_trader_count") is not None else None
+            )
+            d["peak_aggregate_usdc"] = (
+                float(extra["signal_peak_aggregate_usdc"])
+                if extra and extra.get("signal_peak_aggregate_usdc") is not None else None
+            )
+            d["signal_entry_spread_bps"] = (
+                extra["signal_entry_spread_bps"]
+                if extra and extra.get("signal_entry_spread_bps") is not None else None
+            )
             d["liquidity_tier"] = extra["liquidity_tier"] if extra else None
             d["liquidity_at_signal_usdc"] = (
                 float(extra["liquidity_at_signal_usdc"])
@@ -72,6 +95,27 @@ async def get_active_signals(
                 if extra and extra["signal_entry_offer"] is not None else None
             )
             d["signal_entry_source"] = extra["signal_entry_source"] if extra else None
+            # gap_to_smart_money: signed fraction (entry_offer / smart-money cost basis - 1).
+            # Negative = price moved AWAY from smart money (cheaper than they entered).
+            # Positive = price moved TOWARD smart money's profit zone (less edge left).
+            # Computed here so the UI doesn't have to recompute and the default
+            # signal-feed sort can read a single field. Uses the persisted
+            # first_top_trader_entry_price from signal_log rather than the live
+            # avg_entry_price so backtest and live numbers match.
+            smart_money_basis = (
+                float(extra["first_top_trader_entry_price"])
+                if extra and extra.get("first_top_trader_entry_price") is not None else None
+            )
+            if d["signal_entry_offer"] is not None and smart_money_basis and smart_money_basis > 0:
+                d["gap_to_smart_money"] = d["signal_entry_offer"] / smart_money_basis - 1.0
+            else:
+                d["gap_to_smart_money"] = None
+            # Lens count / list — same shape vw_signals_unique_market exposes
+            # to backtest. Format is "mode/category" (slash-separated).
+            d["lens_count"] = (
+                int(extra["lens_count"]) if extra and extra.get("lens_count") is not None else 1
+            )
+            d["lens_list"] = list(extra["lens_list"]) if extra and extra.get("lens_list") else []
             # R4+R7 (Pass 3): counterparty_count is the new int. Boolean
             # warning is derived for back-compat (count > 0 -> True).
             d["counterparty_count"] = (
@@ -81,6 +125,8 @@ async def get_active_signals(
             # B1: exit-event enrichment. `has_exited` is the simple bool the
             # UI uses for the strikethrough/badge. `exit_event` carries the
             # detail dict for tooltips and side-by-side strategy compare.
+            # event_type ('trim'|'exit') drives the UI tier — trim = banner
+            # only (amber), exit = banner + paper-trade auto-close (red).
             if extra and extra["exit_id"] is not None:
                 d["has_exited"] = True
                 d["exit_event"] = {
@@ -103,6 +149,7 @@ async def get_active_signals(
                         float(extra["peak_aggregate_usdc"])
                         if extra["peak_aggregate_usdc"] is not None else None
                     ),
+                    "event_type": extra.get("exit_event_type"),
                 }
             else:
                 d["has_exited"] = False

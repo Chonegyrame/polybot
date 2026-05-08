@@ -41,11 +41,24 @@ async def get_top_traders(
         category=category,     # type: ignore[arg-type]
         top_n=top_n,
     )
+    enrichment: dict[str, dict[str, Any]] = {}
+    if traders:
+        enrichment = await crud.get_top_traders_enrichment(
+            conn, wallets=[t.proxy_wallet for t in traders],
+        )
+    rows: list[dict[str, Any]] = []
+    for t in traders:
+        d = asdict(t)
+        e = enrichment.get(t.proxy_wallet)
+        d["n_resolved"] = int(e["n_resolved"]) if e and e.get("n_resolved") is not None else 0
+        d["n_active"] = int(e["n_active"]) if e and e.get("n_active") is not None else 0
+        d["cluster_id"] = e["cluster_id"] if e else None
+        rows.append(d)
     return {
         "mode": mode,
         "category": category,
         "top_n": top_n,
-        "traders": [asdict(t) for t in traders],
+        "traders": rows,
     }
 
 
@@ -67,6 +80,24 @@ async def get_trader(
     positions = await crud.get_trader_open_positions(conn, wallet, limit=200)
     classification = await crud.get_trader_classification(conn, wallet)
     cluster_row = await crud.get_trader_sybil_cluster(conn, wallet)
+    # Profile aggregates derived from per_category — the leaderboard 'overall'
+    # row is authoritative for total pnl/vol/roi; n_positions is just the
+    # count of currently-open positions returned above. The UI drill-down
+    # header reads these directly off `profile`.
+    overall = next((r for r in per_category if r.get("category") == "overall"), None)
+    if overall is not None:
+        profile["pnl"] = float(overall["pnl"]) if overall.get("pnl") is not None else 0.0
+        profile["vol"] = float(overall["vol"]) if overall.get("vol") is not None else 0.0
+        profile["roi"] = float(overall["roi"]) if overall.get("roi") is not None else 0.0
+    else:
+        # Fallback: sum across non-overall categories if 'overall' wasn't in
+        # the latest snapshot for this wallet.
+        total_pnl = sum(float(r["pnl"]) for r in per_category if r.get("pnl") is not None)
+        total_vol = sum(float(r["vol"]) for r in per_category if r.get("vol") is not None)
+        profile["pnl"] = total_pnl
+        profile["vol"] = total_vol
+        profile["roi"] = (total_pnl / total_vol) if total_vol > 0 else 0.0
+    profile["n_positions"] = len(positions)
     return {
         "profile": profile,
         "classification": classification,

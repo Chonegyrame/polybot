@@ -665,6 +665,56 @@ async def get_paper_trade(
     return dict(row) if row else None
 
 
+async def get_paper_trade_display_enrichment(
+    conn: asyncpg.Connection, *, trade_pairs: list[tuple[str, str]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Bulk-enrich paper trades for UI display: `market_question` (JOIN markets)
+    and `current_price` (latest observed `positions.cur_price` for the same
+    condition_id + matching outcome — sampled from any tracked wallet's most
+    recent position row, since price is the same for everyone). Keyed by
+    (condition_id, outcome_label) where outcome_label is 'Yes' or 'No'.
+    The route maps direction='YES'/'NO' to outcome 'Yes'/'No' before lookup."""
+    if not trade_pairs:
+        return {}
+    cids = [p[0] for p in trade_pairs]
+    rows = await conn.fetch(
+        """
+        WITH latest_price AS (
+            SELECT DISTINCT ON (condition_id, outcome)
+                   condition_id, outcome, cur_price::numeric AS cur_price
+            FROM positions
+            WHERE condition_id = ANY($1::TEXT[])
+              AND size > 0
+            ORDER BY condition_id, outcome, last_updated_at DESC
+        )
+        SELECT m.condition_id, m.question AS market_question,
+               lp.outcome, lp.cur_price
+        FROM markets m
+        LEFT JOIN latest_price lp ON lp.condition_id = m.condition_id
+        WHERE m.condition_id = ANY($1::TEXT[])
+        """,
+        cids,
+    )
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    # Index market_question + current_price separately. We key on
+    # (condition_id, outcome) for current_price — there's one row per
+    # outcome — and broadcast market_question (same per condition_id).
+    market_q: dict[str, str | None] = {}
+    price_by_key: dict[tuple[str, str], float | None] = {}
+    for r in rows:
+        market_q[r["condition_id"]] = r["market_question"]
+        if r["outcome"] is not None:
+            price_by_key[(r["condition_id"], r["outcome"])] = (
+                float(r["cur_price"]) if r["cur_price"] is not None else None
+            )
+    for cid, outcome in trade_pairs:
+        out[(cid, outcome)] = {
+            "market_question": market_q.get(cid),
+            "current_price": price_by_key.get((cid, outcome)),
+        }
+    return out
+
+
 async def close_paper_trade_manual(
     conn: asyncpg.Connection,
     trade_id: int,
@@ -1250,9 +1300,19 @@ async def get_trader_per_category_stats(
 async def get_trader_open_positions(
     conn: asyncpg.Connection, wallet: str, limit: int = 200,
 ) -> list[dict[str, Any]]:
-    """F23: Currently-open positions for one wallet, joined with market metadata."""
+    """F23: Currently-open positions for one wallet, joined with market
+    metadata. Includes `portfolio_fraction` (= current_value /
+    latest portfolio_value_snapshots.value) per position so the UI
+    drill-down can show the conviction indicator without a second query."""
     rows = await conn.fetch(
         """
+        WITH latest_pv AS (
+            SELECT DISTINCT ON (proxy_wallet)
+                proxy_wallet, value::numeric AS portfolio_value
+            FROM portfolio_value_snapshots
+            WHERE proxy_wallet = $1
+            ORDER BY proxy_wallet, fetched_at DESC
+        )
         SELECT p.condition_id, p.outcome, p.size,
                p.avg_price::numeric AS avg_price,
                p.cur_price::numeric AS cur_price,
@@ -1261,10 +1321,16 @@ async def get_trader_open_positions(
                p.percent_pnl::numeric AS percent_pnl,
                p.first_seen_at,
                m.question, m.slug, m.closed,
-               e.category AS market_category
+               e.category AS market_category,
+               CASE
+                   WHEN pv.portfolio_value IS NOT NULL AND pv.portfolio_value > 0
+                       THEN (p.current_value / pv.portfolio_value)::numeric
+                   ELSE NULL
+               END AS portfolio_fraction
         FROM positions p
         JOIN markets m USING (condition_id)
         LEFT JOIN events e ON e.id = m.event_id
+        LEFT JOIN latest_pv pv ON pv.proxy_wallet = p.proxy_wallet
         WHERE p.proxy_wallet = $1 AND p.size > 0
         ORDER BY p.current_value DESC NULLS LAST
         LIMIT $2
@@ -1277,10 +1343,13 @@ async def get_trader_open_positions(
 async def get_trader_classification(
     conn: asyncpg.Connection, wallet: str,
 ) -> dict[str, Any] | None:
-    """F23: Latest wallet_classifications row for a trader, or None."""
+    """F23: Latest wallet_classifications row for a trader, or None.
+    Includes the JSONB `features` dict + `classifier_version` so the UI
+    drill-down can render the forensic explainability panel."""
     row = await conn.fetchrow(
         """
-        SELECT wallet_class, confidence, classified_at
+        SELECT wallet_class, confidence, classified_at, features,
+               classifier_version, trades_observed
         FROM wallet_classifications WHERE proxy_wallet = $1
         """,
         wallet,
@@ -1291,10 +1360,16 @@ async def get_trader_classification(
 async def get_trader_sybil_cluster(
     conn: asyncpg.Connection, wallet: str,
 ) -> dict[str, Any] | None:
-    """F23: Sybil cluster membership info for a trader, or None."""
+    """F23: Sybil cluster membership info for a trader, or None.
+    Returns cluster_id, detection_method, cluster_size, plus the evidence
+    JSONB flattened into top-level keys (n_pair_edges, mean_co_entry_rate,
+    etc.) so the UI can render the cluster panel without a second
+    unwrapping step."""
     row = await conn.fetchrow(
         """
-        SELECT cm.cluster_id::text, wc.detection_method, wc.evidence
+        SELECT cm.cluster_id::text, wc.detection_method, wc.evidence,
+               (SELECT COUNT(*) FROM cluster_membership
+                WHERE cluster_id = cm.cluster_id)::int AS cluster_size
         FROM cluster_membership cm
         JOIN wallet_clusters wc USING (cluster_id)
         WHERE cm.proxy_wallet = $1
@@ -1302,7 +1377,17 @@ async def get_trader_sybil_cluster(
         """,
         wallet,
     )
-    return dict(row) if row else None
+    if row is None:
+        return None
+    out = dict(row)
+    # Flatten evidence JSONB into top-level keys for UI convenience. The
+    # raw `evidence` dict is preserved alongside so callers needing the
+    # untouched shape can still read it.
+    evidence = out.get("evidence") or {}
+    if isinstance(evidence, dict):
+        for k, v in evidence.items():
+            out.setdefault(k, v)
+    return out
 
 
 async def fetch_half_life_rows(
@@ -1370,33 +1455,97 @@ async def count_signals_since(
     return int(n or 0)
 
 
+async def get_top_traders_enrichment(
+    conn: asyncpg.Connection, *, wallets: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Bulk enrichment for /traders/top. UI-spec'd fields not on RankedTrader:
+    `n_resolved` (overall resolved trade count from trader_category_stats),
+    `n_active` (count of positions still in size > 0), and `cluster_id`
+    (sybil cluster membership, NULL for unclustered wallets). Keyed by
+    proxy_wallet (lower-cased)."""
+    if not wallets:
+        return {}
+    rows = await conn.fetch(
+        """
+        SELECT
+            w.proxy_wallet,
+            COALESCE(s.resolved_trades, 0)             AS n_resolved,
+            COALESCE(p.n_active, 0)                    AS n_active,
+            cm.cluster_id::text                        AS cluster_id
+        FROM unnest($1::TEXT[]) AS w(proxy_wallet)
+        LEFT JOIN trader_category_stats s
+               ON s.proxy_wallet = w.proxy_wallet AND s.category = 'overall'
+        LEFT JOIN (
+            SELECT proxy_wallet, COUNT(*)::int AS n_active
+            FROM positions
+            WHERE size > 0
+            GROUP BY proxy_wallet
+        ) p ON p.proxy_wallet = w.proxy_wallet
+        LEFT JOIN cluster_membership cm ON cm.proxy_wallet = w.proxy_wallet
+        """,
+        wallets,
+    )
+    return {r["proxy_wallet"]: dict(r) for r in rows}
+
+
 async def get_signal_enrichment(
     conn: asyncpg.Connection, *,
     mode: str, category: str, top_n: int, condition_ids: list[str],
 ) -> dict[tuple[str, str], dict[str, Any]]:
-    """F23: Bulk enrichment for /signals/active — liquidity_tier, entry-pricing,
-    counterparty warning, and any matching signal_exits row. Keyed by
-    (condition_id, direction)."""
+    """F23: Bulk enrichment for /signals/active. Surfaces fields the live
+    Signal dataclass doesn't carry but the UI signal card needs:
+    `signal_log_id` (so the UI can call /signals/{id}/contributors),
+    `first_fired_at` / `last_seen_at` (freshness label), the signal-level
+    peak metrics (aliased `signal_peak_*` to avoid collision with the exit
+    row's peak), the smart-money cost basis (`first_top_trader_entry_price`,
+    used to compute `gap_to_smart_money` in the route), `signal_entry_spread_bps`,
+    plus the exit row's `event_type` so the UI can differentiate trim
+    (banner only, amber) vs exit (auto-close, red) banners. `lens_count` /
+    `lens_list` come via a per-(cid, direction) aggregate joined here so the
+    UI sees the same lens info that `vw_signals_unique_market` surfaces to
+    backtest. Keyed by (condition_id, direction)."""
     if not condition_ids:
         return {}
     rows = await conn.fetch(
         """
+        WITH lenses AS (
+            SELECT condition_id, direction,
+                   COUNT(DISTINCT (mode || '/' || category)) AS lens_count,
+                   ARRAY_AGG(
+                       DISTINCT (mode || '/' || category)
+                       ORDER BY (mode || '/' || category)
+                   ) AS lens_list
+            FROM signal_log
+            WHERE condition_id = ANY($4::TEXT[])
+            GROUP BY condition_id, direction
+        )
         SELECT s.condition_id, s.direction,
+               s.id                                  AS signal_log_id,
+               s.first_fired_at,
+               s.last_seen_at,
+               s.peak_trader_count                   AS signal_peak_trader_count,
+               s.peak_aggregate_usdc::numeric        AS signal_peak_aggregate_usdc,
+               s.signal_entry_spread_bps,
+               s.first_top_trader_entry_price::numeric AS first_top_trader_entry_price,
                s.liquidity_tier,
-               s.liquidity_at_signal_usdc::numeric AS liquidity_at_signal_usdc,
-               s.signal_entry_offer::numeric       AS signal_entry_offer,
+               s.liquidity_at_signal_usdc::numeric   AS liquidity_at_signal_usdc,
+               s.signal_entry_offer::numeric         AS signal_entry_offer,
                s.signal_entry_source,
                s.counterparty_warning,
                s.counterparty_count,
-               e.id                  AS exit_id,
+               l.lens_count,
+               l.lens_list,
+               e.id                                  AS exit_id,
                e.exited_at,
-               e.drop_reason         AS exit_drop_reason,
-               e.exit_bid_price::numeric AS exit_bid_price,
+               e.drop_reason                         AS exit_drop_reason,
+               e.exit_bid_price::numeric             AS exit_bid_price,
                e.exit_trader_count, e.peak_trader_count,
-               e.exit_aggregate_usdc::numeric AS exit_aggregate_usdc,
-               e.peak_aggregate_usdc::numeric AS peak_aggregate_usdc
+               e.exit_aggregate_usdc::numeric        AS exit_aggregate_usdc,
+               e.peak_aggregate_usdc::numeric        AS peak_aggregate_usdc,
+               e.event_type                          AS exit_event_type
         FROM signal_log s
         LEFT JOIN signal_exits e ON e.signal_log_id = s.id
+        LEFT JOIN lenses l USING (condition_id, direction)
         WHERE s.mode = $1 AND s.category = $2 AND s.top_n = $3
           AND s.condition_id = ANY($4::TEXT[])
         """,

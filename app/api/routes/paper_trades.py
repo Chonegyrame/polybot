@@ -109,6 +109,37 @@ async def open_paper_trade(
     }
 
 
+def _enrich_trade_for_display(
+    t: dict[str, Any], extra: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Add UI-friendly display fields to a paper_trade row without changing
+    the underlying schema. Adds `market_question`, `current_price`, and
+    derived `unrealized_pnl_usdc` (open trades only — null otherwise).
+    Original column names (entry_size_usdc, entry_at, exit_at, notes, ...)
+    stay on the row for back-compat with smoke tests; UI consumers read
+    the same data via these fields."""
+    market_question = extra.get("market_question") if extra else None
+    current_price = extra.get("current_price") if extra else None
+    unrealized: float | None = None
+    if t.get("status") == "open" and current_price is not None:
+        # Mark-to-market estimate — NOT a realized P&L number. Uses gross
+        # mid-style price difference scaled by share count, ignoring exit-
+        # side fees + slippage. Honest enough for the dashboard "current
+        # P&L" hint; the close path uses the full compute_realized_pnl
+        # for the actual settle.
+        entry_price = float(t.get("entry_price") or 0.0)
+        size_usdc = float(t.get("entry_size_usdc") or 0.0)
+        if entry_price > 0 and size_usdc > 0:
+            shares = size_usdc / entry_price
+            unrealized = (current_price - entry_price) * shares
+    return {
+        **t,
+        "market_question": market_question,
+        "current_price": current_price,
+        "unrealized_pnl_usdc": unrealized,
+    }
+
+
 @router.get("")
 async def list_trades(
     status: str | None = None,
@@ -119,7 +150,20 @@ async def list_trades(
             400, f"invalid status; must be one of {VALID_PAPER_TRADE_STATUSES}",
         )
     trades = await crud.list_paper_trades(conn, status=status)
-    return {"trades": trades, "count": len(trades)}
+    pairs = [
+        (t["condition_id"], "Yes" if t["direction"] == "YES" else "No")
+        for t in trades
+    ]
+    enrichment = await crud.get_paper_trade_display_enrichment(
+        conn, trade_pairs=pairs,
+    )
+    enriched = [
+        _enrich_trade_for_display(
+            t, enrichment.get((t["condition_id"], "Yes" if t["direction"] == "YES" else "No"))
+        )
+        for t in trades
+    ]
+    return {"trades": enriched, "count": len(enriched)}
 
 
 @router.get("/{trade_id}")
@@ -129,7 +173,13 @@ async def get_trade(
     t = await crud.get_paper_trade(conn, trade_id)
     if t is None:
         raise HTTPException(404, f"paper_trade {trade_id} not found")
-    return t
+    outcome = "Yes" if t["direction"] == "YES" else "No"
+    enrichment = await crud.get_paper_trade_display_enrichment(
+        conn, trade_pairs=[(t["condition_id"], outcome)],
+    )
+    return _enrich_trade_for_display(
+        t, enrichment.get((t["condition_id"], outcome)),
+    )
 
 
 @router.post("/{trade_id}/close")
