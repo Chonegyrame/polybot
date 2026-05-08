@@ -1526,3 +1526,45 @@ to verify and fix. See `review/SCRUTINIZER_2026-05-08.md`.
   categories, which the live data path already produces). Code
   review confirms the only fee-bearing consumers of `r.category`
   were these two lines.
+
+### F29 — Counterparty SQL missed `last_updated_at` 20-min TTL filter
+
+- **Status**: fixed
+- **Source**: `review/SCRUTINIZER_2026-05-08.md` second-pass —
+  Agents 1 + 2 of 3 each independently flagged it as a real bug
+  (~95% / ~60% confidence) but each dropped it on gate (c)
+  materiality. User chose to fix because the cross-agent overlap
+  meant two of three reviewers found the same issue, and the
+  one-line fix carries no risk.
+- **Files**: `app/services/counterparty.py:144`
+- **Error**: `find_counterparty_wallets` SQL filtered `p.size > 0`
+  and YES/NO outcomes but had no `last_updated_at >= NOW() -
+  INTERVAL '20 minutes'` clause. `signal_detector.py:293` already
+  applies that TTL on the same `positions` table to exclude rows
+  from failed/skipped fetches. Without it on the counterparty
+  side, a wallet whose 10-min position fetch failed kept
+  contributing its prior-cycle opposite-side row to the
+  counterparty count, even after the underlying position was
+  exited on Polymarket.
+- **Asymmetric direction**: failures preserve old rows (no
+  fresh upsert), so the bug **always inflates** the counterparty
+  count. Cannot deflate it.
+- **User-decision impact**: bear-case panel on the signal card
+  shows more "tracked wallets against you" than reality. Bounded
+  in normal API weather (1-2 stale wallets/cycle), but unbounded
+  during a Polymarket incident or weekend rate-limit storm —
+  exactly when the user most needs accurate counterparty data.
+- **Fix**: one-line addition mirroring signal_detector's pattern:
+  ```sql
+  AND p.last_updated_at >= NOW() - INTERVAL '20 minutes'
+  ```
+  Plus a docstring update on `find_counterparty_wallets`
+  documenting the TTL alignment so future reviewers don't
+  re-flag.
+- **Test**: no new test added — the fix is a one-line WHERE
+  clause that mirrors an existing, tested pattern in
+  signal_detector. Asserting on a synthetic stale-row scenario
+  would require fabricating positions with backdated
+  `last_updated_at`, which doesn't reflect any production code
+  path (only API-fetch failures produce stale rows, and those
+  are not deterministically reproducible in unit tests).

@@ -112,7 +112,10 @@ async def find_counterparty_wallets(
     Implementation: bulk SQL joins tracked-pool wallets to
     cluster_membership, then groups positions by entity (cluster_id if
     present, else raw proxy_wallet). Filtered to YES/NO outcomes only,
-    consistent with signal_detector.
+    consistent with signal_detector. Same 20-min `last_updated_at` TTL
+    as signal_detector — without it, a wallet whose position-fetch
+    failed mid-cycle keeps contributing its prior-cycle opposite-side
+    row and inflates the counterparty count.
     """
     pool_list = list(tracked_pool)
     if not pool_list:
@@ -141,6 +144,7 @@ async def find_counterparty_wallets(
         JOIN wallet_identity wi USING (proxy_wallet)
         WHERE p.condition_id = $3
           AND p.size > 0
+          AND p.last_updated_at >= NOW() - INTERVAL '20 minutes'
           AND LOWER(p.outcome) IN ('yes', 'no')
         GROUP BY wi.identity
         HAVING SUM(CASE WHEN LOWER(p.outcome) = LOWER($2) THEN p.current_value ELSE 0 END) > 0
