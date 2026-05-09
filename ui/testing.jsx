@@ -1,8 +1,8 @@
 // =============================================================
 // testing.jsx — Paper portfolio, Backtest, Diagnostics
 // =============================================================
-function Testing({ paperTrades, openMarket }) {
-  const [tab, setTab] = useState('portfolio');
+function Testing({ paperTrades, openMarket, closePaperTrade, initialTab }) {
+  const [tab, setTab] = useState(initialTab || 'portfolio');
   return (
     <>
       <div className="topbar">
@@ -17,7 +17,7 @@ function Testing({ paperTrades, openMarket }) {
           <button className={`tab ${tab==='backtest'?'on':''}`} onClick={() => setTab('backtest')}>Backtest</button>
           <button className={`tab ${tab==='diag'?'on':''}`} onClick={() => setTab('diag')}>Diagnostics</button>
         </div>
-        {tab === 'portfolio' && <PaperPortfolio trades={paperTrades} openMarket={openMarket} />}
+        {tab === 'portfolio' && <PaperPortfolio trades={paperTrades} openMarket={openMarket} closePaperTrade={closePaperTrade} />}
         {tab === 'backtest' && <Backtest />}
         {tab === 'diag' && <Diagnostics />}
       </div>
@@ -25,8 +25,48 @@ function Testing({ paperTrades, openMarket }) {
   );
 }
 
-function PaperPortfolio({ trades, openMarket }) {
+// Postgres NUMERIC fields come back as JSON strings; coerce for math + .toFixed.
+const _num = (v) => (v == null ? null : typeof v === 'number' ? v : parseFloat(v));
+function _normalizeTrade(t) {
+  return {
+    ...t,
+    entry_price: _num(t.entry_price),
+    entry_mid: _num(t.entry_mid),
+    entry_size_usdc: _num(t.entry_size_usdc) ?? 0,
+    entry_fee_usdc: _num(t.entry_fee_usdc) ?? 0,
+    entry_slippage_usdc: _num(t.entry_slippage_usdc) ?? 0,
+    exit_price: _num(t.exit_price),
+    realized_pnl_usdc: _num(t.realized_pnl_usdc),
+    unrealized_pnl_usdc: _num(t.unrealized_pnl_usdc),
+    current_price: _num(t.current_price),
+  };
+}
+
+function PaperPortfolio({ trades: rawTrades, openMarket, closePaperTrade }) {
+  const trades = useMemo(() => (rawTrades || []).map(_normalizeTrade), [rawTrades]);
   const [filter, setFilter] = useState('all');
+  // Styled close-confirmation: when set, the modal renders. null means closed.
+  const [tradeToClose, setTradeToClose] = useState(null);
+  const [closing, setClosing] = useState(false);
+  const [showToast, toastNode] = useToast();
+
+  async function handleConfirmClose() {
+    if (!tradeToClose || closing) return;
+    setClosing(true);
+    try {
+      await closePaperTrade(tradeToClose.id);
+      showToast('Paper trade closed', 'ok');
+      setTradeToClose(null);
+    } catch (e) {
+      // Server-side detail (e.g. "no live book available; cannot close at
+      // market right now") flows through via the apiPost error helper.
+      showToast(e.message || 'Could not close trade', 'bad');
+      setTradeToClose(null);
+    } finally {
+      setClosing(false);
+    }
+  }
+
   const filtered = trades.filter(t => filter === 'all' || (filter === 'open' && t.status === 'open') || (filter === 'closed' && t.status !== 'open'));
   const open = trades.filter(t => t.status === 'open');
   const closed = trades.filter(t => t.status !== 'open');
@@ -74,8 +114,8 @@ function PaperPortfolio({ trades, openMarket }) {
                   </td>
                   <td><span className={`dir-badge ${t.direction.toLowerCase()}`} style={{padding:'2px 8px',fontSize:11}}>{t.direction}</span></td>
                   <td className="num">{fmtUSD(t.entry_size_usdc)}</td>
-                  <td className="num muted">${t.effective_entry_price.toFixed(3)}</td>
-                  <td className="num">${t.current_price.toFixed(3)}</td>
+                  <td className="num muted">{t.entry_price != null ? `$${t.entry_price.toFixed(3)}` : '—'}</td>
+                  <td className="num">{(t.status === 'open' ? t.current_price : t.exit_price) != null ? `$${(t.status === 'open' ? t.current_price : t.exit_price).toFixed(3)}` : '—'}</td>
                   <td className={`num ${pnl >= 0 ? 'pos' : 'neg'}`}>
                     {fmtUSD(pnl,2)} <span className="muted">({fmtPctSigned(pnlPct)})</span>
                   </td>
@@ -86,13 +126,33 @@ function PaperPortfolio({ trades, openMarket }) {
                     {t.status === 'closed_manual' && <span className="chip">CLOSED</span>}
                   </td>
                   <td className="muted mono" style={{fontSize:11}}>{tsAgo(t.entry_at)}</td>
-                  <td className="muted">→</td>
+                  <td>
+                    {t.status === 'open' && closePaperTrade ? (
+                      <button
+                        className="btn ghost sm"
+                        onClick={(e) => { e.stopPropagation(); setTradeToClose(t); }}
+                        title="Manual close at current bid"
+                      >Close</button>
+                    ) : <span className="muted">→</span>}
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+
+      <ConfirmDialog
+        open={tradeToClose != null}
+        title="Close this paper trade?"
+        body={tradeToClose ? `${tradeToClose.market_question}  · ${tradeToClose.direction}  · ${fmtUSD(tradeToClose.entry_size_usdc)}. Closes at the current bid; backend computes the real exit price + fee at the moment you confirm.` : ''}
+        confirmLabel={closing ? 'Closing…' : 'Close trade'}
+        cancelLabel="Cancel"
+        tone="primary"
+        onConfirm={handleConfirmClose}
+        onCancel={() => { if (!closing) setTradeToClose(null); }}
+      />
+      {toastNode}
     </>
   );
 }
@@ -231,15 +291,19 @@ function Backtest() {
     }));
   }, [sliceRes.data]);
 
-  // /backtest/edge_decay
+  // /backtest/edge_decay — empty-safe default; never substitutes mock data
+  // when the backend is online and just returned empty cohorts.
   const decayPath = `/backtest/edge_decay?${qs}`;
-  const decayRes = useApi(decayPath, D.EDGE_DECAY_FULL);
-  const decay = decayRes.data || D.EDGE_DECAY_FULL;
+  const decayRes = useApi(decayPath, null);
+  const decay = decayRes.data || {
+    cohorts: [], weeks_of_data: 0, decay_warning: false,
+    insufficient_history: true, min_weeks_needed: 6, min_n_per_cohort: 5,
+  };
 
-  // /backtest/half_life
+  // /backtest/half_life — empty-safe default for the same reason.
   const halfLifePath = `/backtest/half_life${cat && cat !== 'overall' ? `?category=${cat}` : ''}`;
-  const halfLifeRes = useApi(halfLifePath, { buckets: D.HALF_LIFE });
-  const halfLife = (halfLifeRes.data?.buckets) || D.HALF_LIFE;
+  const halfLifeRes = useApi(halfLifePath, null);
+  const halfLife = halfLifeRes.data?.buckets || [];
 
   // Latency stats — embedded in /backtest/summary response when latency_profile is set.
   // Otherwise fall back to mock-by-profile.
@@ -252,15 +316,15 @@ function Backtest() {
   else if (sessionRuns >= 10) mTier = 'warn';
   else if (sessionRuns >= 5) mTier = 'soft';
 
-  // Prefer live slice if backend returned it, else fall back to mock buckets.
-  const sliceData = sliceFromBackend ?? (D.SLICE_DATA[slice] || []);
+  // Live slice data (no mock fallback — empty buckets render as empty state).
+  const sliceData = sliceFromBackend || [];
 
   return (
     <>
       <div className="card" style={{marginBottom:14}}>
         <div className="card-head">
           <h3>Cohort definition</h3>
-          <span className="muted mono" style={{fontSize:11}}>POST /backtest/run · {sessionRuns} runs this session</span>
+          <span className="muted mono" style={{fontSize:11}}>GET /backtest/summary · {sessionRuns} runs this session</span>
         </div>
         <div style={{padding:'14px',display:'grid',gridTemplateColumns:'repeat(3, 1fr)',gap:12}}>
           <Field label="Mode">
@@ -473,9 +537,9 @@ function Backtest() {
           <div className="kv-grid">
             <KV k="Win rate" v={fmtPct(bt.win_rate)} sub={`Naive [${fmtPct(bt.win_rate_ci_lo,0)}, ${fmtPct(bt.win_rate_ci_hi,0)}]`} />
             <KV k="Mean PnL/$" v={fmtPctSigned(bt.mean_pnl_per_dollar)} sub={`Naive [${fmtPctSigned(bt.pnl_ci_lo)}, ${fmtPctSigned(bt.pnl_ci_hi)}]`} kind={bt.mean_pnl_per_dollar>=0?'pos':'neg'} />
-            <KV k="Profit factor" v={bt.profit_factor.toFixed(2)} />
+            <KV k="Profit factor" v={bt.profit_factor != null ? bt.profit_factor.toFixed(2) : '—'} />
             <KV k="Max drawdown" v={fmtPctSigned(bt.max_drawdown)} kind="neg" />
-            <KV k="Median entry" v={`$${bt.median_entry_price.toFixed(2)}`} />
+            <KV k="Median entry" v={bt.median_entry_price != null ? `$${bt.median_entry_price.toFixed(2)}` : '—'} />
             <KV k="Median gap to SM" v={fmtPct(bt.median_gap_to_smart_money)} />
           </div>
           {showCorrections && (
@@ -484,7 +548,7 @@ function Backtest() {
               <CILine label="BH-FDR (recommended)"   lo={bt.corrections.bh_fdr_pnl_ci_lo}             hi={bt.corrections.bh_fdr_pnl_ci_hi}             tone="rec"/>
               <CILine label="Bonferroni (strict)"    lo={bt.corrections.bonferroni_pnl_ci_lo}         hi={bt.corrections.bonferroni_pnl_ci_hi}         tone="strict"/>
               <div className="muted" style={{fontSize:11,marginTop:8}}>
-                <span className="mono">bootstrap_p</span> = {(bt.pnl_bootstrap_p ?? 0.034).toFixed(3)} · two-sided · {bt.corrections.n_session_queries ?? sessionRuns} comparisons in family
+                <span className="mono">bootstrap_p</span> = {bt.pnl_bootstrap_p != null ? bt.pnl_bootstrap_p.toFixed(3) : '—'} · two-sided · {bt.corrections?.n_session_queries ?? sessionRuns} comparisons in family
               </div>
             </div>
           )}
@@ -540,10 +604,13 @@ function Backtest() {
           <thead>
             <tr>
               <th>Bucket</th><th>n_eff</th><th>Win rate</th><th>PnL/$</th>
-              <th>Naive CI</th><th>BH-FDR CI</th><th>Bonferroni CI</th><th>p</th>
+              <th>Naive CI</th><th>p</th>
             </tr>
           </thead>
           <tbody>
+            {sliceData.length === 0 && (
+              <tr><td colSpan="6" className="muted" style={{textAlign:'center',padding:'20px 0'}}>No data yet — slice buckets will populate once signals fire and resolve.</td></tr>
+            )}
             {sliceData.map((b, i) => (
               <tr key={i} className={b.underpowered?'row-dim':''}>
                 <td>
@@ -555,8 +622,6 @@ function Backtest() {
                 <td className="num">{b.win_rate==null?'—':fmtPct(b.win_rate)}</td>
                 <td className={`num ${b.mean_pnl_per_dollar==null?'muted':b.mean_pnl_per_dollar>=0?'pos':'neg'}`}>{b.mean_pnl_per_dollar==null?'—':fmtPctSigned(b.mean_pnl_per_dollar)}</td>
                 <td className="num muted mono" style={{fontSize:11}}>{b.pnl_ci_lo==null?'—':`[${fmtPctSigned(b.pnl_ci_lo)}, ${fmtPctSigned(b.pnl_ci_hi)}]`}</td>
-                <td className="num muted mono" style={{fontSize:11}}>{b.corrections.bh_fdr_pnl_ci_lo==null?'—':`[${fmtPctSigned(b.corrections.bh_fdr_pnl_ci_lo)}, ${fmtPctSigned(b.corrections.bh_fdr_pnl_ci_hi)}]`}</td>
-                <td className="num muted mono" style={{fontSize:11}}>{b.corrections.bonferroni_pnl_ci_lo==null?'—':`[${fmtPctSigned(b.corrections.bonferroni_pnl_ci_lo)}, ${fmtPctSigned(b.corrections.bonferroni_pnl_ci_hi)}]`}</td>
                 <td className="num mono">{b.pnl_bootstrap_p==null?'—':b.pnl_bootstrap_p.toFixed(3)}</td>
               </tr>
             ))}
@@ -812,6 +877,7 @@ function InsiderWallets() {
   const [offline, setOffline] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [draft, setDraft] = useState({ proxy_wallet: '', label: '', notes: '' });
+  const [showToast, toastNode] = useToast();
 
   const refresh = useCallback(() => {
     apiGet('/insider_wallets').then(
@@ -822,7 +888,7 @@ function InsiderWallets() {
   useEffect(() => { refresh(); }, [refresh]);
 
   const add = async () => {
-    if (!/^0x[a-fA-F0-9]{40}$/.test(draft.proxy_wallet)) { alert('Wallet must be 0x… 42 chars'); return; }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(draft.proxy_wallet)) { showToast('Wallet must be 0x… 42 chars', 'bad'); return; }
     try {
       await apiPost('/insider_wallets', { proxy_wallet: draft.proxy_wallet, label: draft.label || null, notes: draft.notes || null });
       refresh();
@@ -905,6 +971,7 @@ function InsiderWallets() {
           </div>
         </Modal>
       )}
+      {toastNode}
     </>
   );
 }

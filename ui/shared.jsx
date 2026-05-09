@@ -9,9 +9,23 @@ const D = window.POLYBOT_DATA;
 // PB.PAPER_TRADES, etc.) is used as a fallback when the backend is unreachable
 // so the UI is still usable in dev / when uvicorn isn't running.
 
+// Pull FastAPI's `detail` out of an error response so the UI can show what
+// actually went wrong instead of just the status code. Falls back to status
+// code + path when no detail is present.
+async function _apiErrorMessage(r, method, path) {
+  let detail = null;
+  try {
+    const body = await r.json();
+    if (body && typeof body.detail === 'string') detail = body.detail;
+  } catch { /* non-JSON body, ignore */ }
+  return detail
+    ? `${method} ${path} → ${r.status}: ${detail}`
+    : `${method} ${path} → ${r.status}`;
+}
+
 async function apiGet(path) {
   const r = await fetch(`${D.API_BASE}${path}`, { headers: { 'Accept': 'application/json' } });
-  if (!r.ok) throw new Error(`GET ${path} → ${r.status}`);
+  if (!r.ok) throw new Error(await _apiErrorMessage(r, 'GET', path));
   return await r.json();
 }
 async function apiPost(path, body) {
@@ -20,20 +34,22 @@ async function apiPost(path, body) {
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: body == null ? undefined : JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`POST ${path} → ${r.status}`);
+  if (!r.ok) throw new Error(await _apiErrorMessage(r, 'POST', path));
   return await r.json();
 }
 async function apiDelete(path) {
   const r = await fetch(`${D.API_BASE}${path}`, { method: 'DELETE' });
-  if (!r.ok) throw new Error(`DELETE ${path} → ${r.status}`);
+  if (!r.ok) throw new Error(await _apiErrorMessage(r, 'DELETE', path));
   return await r.json();
 }
 
-// React hook: fetch a JSON path, fall back to `mock` if backend is unreachable.
-// `path === null` means "don't fetch yet" (useful for lazy loads). The hook
-// re-fetches whenever the path string changes.
+// React hook: fetch a JSON path, fall back to `mock` ONLY if the backend
+// fetch errors. Initial state is always `data: null, source: 'pending'` so
+// nothing renders mock data on first paint (otherwise mock leaks visibly
+// while the real fetch is in flight). `path === null` means "don't fetch
+// yet" (useful for lazy loads). Re-fetches whenever the path string changes.
 function useApi(path, mock) {
-  const [state, setState] = useState({ data: mock ?? null, loading: path !== null, error: null, source: mock ? 'mock' : 'pending' });
+  const [state, setState] = useState({ data: null, loading: path !== null, error: null, source: 'pending' });
   useEffect(() => {
     if (path == null) return;
     let cancelled = false;
@@ -115,9 +131,9 @@ function Sparkline({ data, w = 80, h = 24, color }) {
 }
 
 // ---------- Sidebar ----------
-function Sidebar({ route, setRoute, status }) {
+function Sidebar({ route, setRoute }) {
   const items = [
-    { id: 'dashboard', label: 'Dashboard',  ic: I.feed, badge: 4 },
+    { id: 'dashboard', label: 'Dashboard',  ic: I.feed },
     { id: 'traders',   label: 'Top Traders', ic: I.traders },
     { id: 'testing',   label: 'Testing',    ic: I.beaker },
   ];
@@ -143,11 +159,9 @@ function Sidebar({ route, setRoute, status }) {
       <div className="nav-item" onClick={()=>setRoute('testing/backtest')}><span style={{width:16,height:16}}>{I.chart}</span><span className="nav-label">Backtest</span></div>
       <div className="nav-item" onClick={()=>setRoute('testing/diag')}><span style={{width:16,height:16}}>{I.pulse}</span><span className="nav-label">Diagnostics</span></div>
       <div className={`nav-item ${route==='insider'?'active':''}`} onClick={()=>setRoute('insider')}><span style={{width:16,height:16}}>{I.insider}</span><span className="nav-label">Insider wallets</span></div>
-      <div className="nav-item"><span style={{width:16,height:16}}>{I.cog}</span><span className="nav-label">Settings</span></div>
-      <div className="nav-item"><span style={{width:16,height:16}}>{I.help}</span><span className="nav-label">Help</span></div>
 
       <div className="sidebar-foot">
-        <HealthPillSide status={status} />
+        <HealthPillSide />
         <div className="user-card">
           <div className="avatar">AB</div>
           <div>
@@ -160,7 +174,7 @@ function Sidebar({ route, setRoute, status }) {
   );
 }
 
-function HealthPillSide({ status }) {
+function HealthPillSide() {
   const [open, setOpen] = useState(false);
   const ref = useRef();
   useEffect(() => {
@@ -169,20 +183,30 @@ function HealthPillSide({ status }) {
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
-  const v2 = D.SYSTEM_STATUS;
-  const z = v2.counters.zombie_drops_last_24h;
-  const sf = v2.components.stats_freshness;
-  const statsState = !sf.seeded ? 'unseeded' : (!sf.fresh ? 'stale' : 'fresh');
-  const statsHealth = statsState === 'fresh' ? 'green' : statsState === 'stale' ? 'amber' : 'red';
-  const overall = v2.overall_health;
+  const sys = useApi('/system/status', D.SYSTEM_STATUS);
+  const offlineNow = sys.source === 'mock' && sys.error;
+  const ready = sys.data != null;
+  const v2 = sys.data;
+  const z = ready ? v2.counters.zombie_drops_last_24h : null;
+  const sf = ready ? v2.components.stats_freshness : null;
+  const statsState = ready ? (!sf.seeded ? 'unseeded' : (!sf.fresh ? 'stale' : 'fresh')) : null;
+  const statsHealth = statsState === 'fresh' ? 'green' : statsState === 'stale' ? 'amber' : statsState === 'unseeded' ? 'red' : 'muted';
+  const overall = offlineNow ? 'red' : (ready ? v2.overall_health : 'muted');
+  const label = offlineNow
+    ? 'Offline — backend unreachable'
+    : !ready
+      ? 'Loading…'
+      : overall === 'green' ? 'All systems healthy'
+      : overall === 'amber' ? 'Degraded'
+      : 'System unhealthy';
   return (
     <div ref={ref} style={{ position: 'relative' }}>
-      <div className="health-pill-side" onClick={() => setOpen(o => !o)}>
+      <div className="health-pill-side" onClick={() => ready && setOpen(o => !o)} title={offlineNow ? 'Backend unreachable — showing mock data' : 'System status'}>
         <span className={`health-dot ${overall}`}></span>
-        <span>{overall === 'green' ? 'All systems healthy' : overall === 'amber' ? 'Degraded' : 'System unhealthy'}</span>
-        <span className="micro" style={{ marginLeft: 'auto' }}>{v2.components.position_refresh.minutes_since}m</span>
+        <span>{label}</span>
+        <span className="micro" style={{ marginLeft: 'auto' }}>{ready ? `${v2.components.position_refresh.minutes_since}m` : ''}</span>
       </div>
-      {open && (
+      {open && ready && (
         <div className="status-pop" style={{ top: 'auto', bottom: '100%', right: 0, left: 0, marginBottom: 6, marginTop: 0, minWidth: 320 }}>
           <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>System status · <span style={{textTransform:'uppercase'}}>{overall}</span></div>
           <StatusRow k="Last position refresh" v={`${v2.components.position_refresh.minutes_since}m ago`} dot={v2.components.position_refresh.health}/>
@@ -230,23 +254,49 @@ function Modal({ children, onClose }) {
 // ---------- toast ----------
 function useToast() {
   const [t, setT] = useState(null);
-  const show = (msg, kind='ok') => {
+  // Errors stick around longer so the user can actually read the server's
+  // explanation (vs success messages which can dismiss quickly).
+  const show = (msg, kind='ok', durationMs) => {
     setT({ msg, kind, id: Date.now() });
-    setTimeout(() => setT(null), 2400);
+    const ms = durationMs ?? (kind === 'bad' ? 6500 : 2400);
+    setTimeout(() => setT(null), ms);
   };
   const node = t ? (
     <div style={{
       position: 'fixed', bottom: 24, right: 24, zIndex: 200,
+      maxWidth: 420,
       background: 'var(--panel)', border: '1px solid var(--border-2)',
       padding: '10px 14px', borderRadius: 10,
-      boxShadow: 'var(--shadow-pop)', fontSize: 13,
+      boxShadow: 'var(--shadow-pop)', fontSize: 13, lineHeight: 1.45,
       color: t.kind === 'ok' ? 'var(--accent)' : t.kind === 'bad' ? 'var(--no)' : 'var(--text)',
     }}>{t.msg}</div>
   ) : null;
   return [show, node];
 }
 
+// ---------- ConfirmDialog ----------
+// Drop-in replacement for window.confirm() — styled to match the dashboard.
+// Used as <ConfirmDialog open={...} title="..." body="..." onConfirm={...}
+// onCancel={...} confirmLabel="Close" tone="primary" />.
+function ConfirmDialog({ open, title, body, confirmLabel = 'Confirm', cancelLabel = 'Cancel', tone = 'primary', onConfirm, onCancel }) {
+  if (!open) return null;
+  return (
+    <Modal onClose={onCancel}>
+      <div style={{ padding: '20px 22px 18px', minWidth: 340, maxWidth: 460 }}>
+        {title && <h3 style={{ margin: '0 0 10px', fontSize: 16 }}>{title}</h3>}
+        {body && (
+          <div className="muted" style={{ fontSize: 13, lineHeight: 1.5, marginBottom: 18 }}>{body}</div>
+        )}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+          <button className="btn ghost" onClick={onCancel}>{cancelLabel}</button>
+          <button className={`btn ${tone === 'danger' ? 'danger' : 'primary'}`} onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 Object.assign(window, {
   PB: D, fmtUSD, fmtPct, fmtPctSigned, fmtNum, truncWallet, tsAgo,
-  Sidebar, Modal, Sparkline, useToast, ICONS: I,
+  Sidebar, Modal, Sparkline, useToast, ConfirmDialog, ICONS: I,
 });

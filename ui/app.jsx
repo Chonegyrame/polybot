@@ -82,29 +82,62 @@ function App() {
     }
   }
 
+  async function closePaperTrade(tradeId) {
+    // POST /paper_trades/{id}/close — backend closes at current bid, sets
+    // status='closed_manual', exit_reason='manual_close'. Re-fetch the list
+    // to pick up the canonical updated row.
+    // Errors are re-thrown so the calling component can render a styled
+    // toast (no more native browser alert() popups).
+    try {
+      await apiPost(`/paper_trades/${tradeId}/close`, null);
+      const resp = await apiGet('/paper_trades');
+      setPaperTrades(resp.trades || []);
+      setPaperTradesOffline(false);
+    } catch (e) {
+      console.warn('Paper trade close failed:', e.message);
+      throw e;
+    }
+  }
+
   return (
     <div className="app">
-      <Sidebar route={route} setRoute={setRoute} status={PB.SYSTEM_STATUS} />
+      <Sidebar route={route} setRoute={setRoute} />
       <main className="main">
-        {route === 'dashboard' && (
-          <Dashboard
-            state={signalState} setState={setSignalState}
-            openTrader={openTrader} openMarket={openMarket}
-          />
-        )}
-        {route === 'traders' && <TradersPage openTrader={openTrader} />}
-        {route === 'testing' && <Testing paperTrades={paperTrades} openMarket={openMarket} />}
-        {route === 'insider' && <InsiderWallets />}
+        <ErrorBoundary key={route}>
+          {route === 'dashboard' && (
+            <Dashboard
+              state={signalState} setState={setSignalState}
+              openTrader={openTrader} openMarket={openMarket}
+            />
+          )}
+          {route === 'traders' && <TradersPage openTrader={openTrader} />}
+          {route.startsWith('testing') && (
+            <Testing
+              key={route}
+              paperTrades={paperTrades}
+              openMarket={openMarket}
+              closePaperTrade={closePaperTrade}
+              initialTab={route === 'testing/backtest' ? 'backtest' : route === 'testing/diag' ? 'diag' : 'portfolio'}
+            />
+          )}
+          {route === 'insider' && <InsiderWallets />}
+        </ErrorBoundary>
       </main>
-      {trader && <TraderModal wallet={trader} onClose={() => setTrader(null)} openMarket={openMarket} />}
+      {trader && (
+        <ErrorBoundary key={`trader-${trader}`}>
+          <TraderModal wallet={trader} onClose={() => setTrader(null)} openMarket={openMarket} />
+        </ErrorBoundary>
+      )}
       {marketCtx && (
-        <MarketView
-          conditionId={marketCtx.conditionId}
-          presetDirection={marketCtx.direction}
-          onClose={() => setMarketCtx(null)}
-          openTrader={(w) => { setMarketCtx(null); setTrader(w); }}
-          onPaperTrade={placePaperTrade}
-        />
+        <ErrorBoundary key={`market-${marketCtx.conditionId}`}>
+          <MarketView
+            conditionId={marketCtx.conditionId}
+            presetDirection={marketCtx.direction}
+            onClose={() => setMarketCtx(null)}
+            openTrader={(w) => { setMarketCtx(null); setTrader(w); }}
+            onPaperTrade={placePaperTrade}
+          />
+        </ErrorBoundary>
       )}
       <TweaksPanel title="Tweaks">
         <TweakSection label="Accent color" />
@@ -185,7 +218,6 @@ function TopTradersFullPage({ mode, category, openTrader }) {
           <tr>
             <th style={{width:50}}>#</th>
             <th>Trader</th>
-            <th>Class</th>
             <th>PnL</th>
             <th>ROI</th>
             <th>Volume</th>
@@ -209,7 +241,6 @@ function TopTradersFullPage({ mode, category, openTrader }) {
                   {t.verified_badge && <span className="chip ok" style={{padding:'1px 6px',fontSize:9}}>✓</span>}
                 </div>
               </td>
-              <td><span className="chip" style={{textTransform:'uppercase',fontSize:10}}>directional</span></td>
               <td className="num pos">{fmtUSD(t.pnl)}</td>
               <td className="num">{fmtPct(t.roi)}</td>
               <td className="num muted">{fmtUSD(t.vol)}</td>
@@ -230,5 +261,28 @@ function hexToRgb(hex) {
   return m ? `${parseInt(m[1],16)}, ${parseInt(m[2],16)}, ${parseInt(m[3],16)}` : null;
 }
 
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error('UI crash:', error, info?.componentStack); }
+  reset = () => this.setState({ error: null });
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <div style={{padding:'48px 32px',maxWidth:760,margin:'40px auto',color:'var(--text-1)'}}>
+        <h2 style={{marginTop:0}}>Something broke on this page</h2>
+        <p className="muted" style={{fontSize:13.5,lineHeight:1.55}}>
+          The rest of the app is fine — only the panel you opened threw. The error is logged to the
+          browser console (F12) for debugging.
+        </p>
+        <pre style={{background:'var(--bg-2)',border:'1px solid var(--border)',padding:12,borderRadius:6,fontSize:12,overflow:'auto',maxHeight:200,whiteSpace:'pre-wrap'}}>
+          {String(this.state.error?.message || this.state.error)}
+        </pre>
+        <button className="btn primary" onClick={this.reset} style={{marginTop:14}}>Reset</button>
+      </div>
+    );
+  }
+}
+
 const root = ReactDOM.createRoot(document.getElementById('root'));
-root.render(<App />);
+root.render(<ErrorBoundary><App /></ErrorBoundary>);

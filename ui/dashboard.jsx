@@ -3,7 +3,6 @@
 // =============================================================
 
 function Dashboard({ state, setState, openTrader, openMarket }) {
-  const [showStatus, setShowStatus] = useState(false);
   // Live: GET /signals/active. Re-fetches whenever mode/category/top_n change.
   // category=overall is sent to the backend (it returns ALL markets); UI no longer
   // filters client-side because the backend is authoritative on category.
@@ -29,37 +28,47 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
     return s;
   }, [liveSignals, sigsRes.source, state.category, state.sort]);
 
-  const newCount = filtered.filter(s => s.is_new).length;
+  // Live freshness from /system/status — drives the "refreshed Xm ago" subtitle.
+  const sysRes = useApi('/system/status', PB.SYSTEM_STATUS);
+  const minutesSince = sysRes.data?.components?.position_refresh?.minutes_since;
+  const refreshedLabel = minutesSince == null
+    ? 'refresh time unknown'
+    : minutesSince < 1
+      ? 'refreshed just now'
+      : `refreshed ${Math.round(minutesSince)}m ago`;
 
   return (
     <>
       <div className="topbar">
         <div>
           <h1>Signals · <span style={{color:'var(--text-3)'}}>{PB.CATEGORY_LABELS[state.category]}</span></h1>
-          <div className="topbar-sub">live consensus from top {state.top_n} {PB.MODES.find(m=>m.id===state.mode).label.toLowerCase()} traders · refreshed 4m ago</div>
+          <div className="topbar-sub">live consensus from top {state.top_n} {PB.MODES.find(m=>m.id===state.mode).label.toLowerCase()} traders · {refreshedLabel}</div>
         </div>
-        <div className="topbar-actions">
-          {newCount > 0 && (
-            <span className="chip ok">
-              <span style={{width:6,height:6,borderRadius:'50%',background:'var(--accent)'}}/>
-              {newCount} new since 14:42 · <a style={{color:'var(--accent)',textDecoration:'underline',marginLeft:4,cursor:'pointer'}}>Mark all read</a>
-            </span>
-          )}
-          <DashboardHealthPill loading={sigsRes.loading} offline={sigsRes.source === 'mock' && sigsRes.error}/>
-        </div>
+        <div className="topbar-actions"></div>
       </div>
 
       <div className="content">
         <SignalControls state={state} setState={setState} />
         <div className="signals-feed">
-          {filtered.length === 0 ? (
+          {sigsRes.loading && sigsRes.data == null ? (
+            <div className="empty-state">
+              <div className="ic">/* loading */</div>
+              <h4>Loading signals…</h4>
+            </div>
+          ) : filtered.length === 0 ? (
             <div className="empty-state">
               <div className="ic">/* no_signals */</div>
               <h4>No signals firing in this view right now.</h4>
               <p>Try widening top-N, switching to Overall, or check back in 10 minutes.</p>
             </div>
           ) : filtered.map(sig => (
-            <SignalCard key={sig.signal_log_id} sig={sig} openMarket={openMarket} openTrader={openTrader} />
+            <SignalCard
+              key={sig.signal_log_id ?? `${sig.condition_id}-${sig.direction}`}
+              sig={sig}
+              topN={state.top_n}
+              openMarket={openMarket}
+              openTrader={openTrader}
+            />
           ))}
         </div>
 
@@ -68,27 +77,6 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
         </div>
       </div>
     </>
-  );
-}
-
-function DashboardHealthPill({ loading, offline }) {
-  // Live system status — polls every 60s. Falls back to PB.SYSTEM_STATUS mock when offline.
-  const sys = useApi('/system/status', PB.SYSTEM_STATUS);
-  // Auto-refresh every 60s
-  const [tick, setTick] = useState(0);
-  useEffect(() => { const id = setInterval(() => setTick(t => t + 1), 60_000); return () => clearInterval(id); }, []);
-  // Re-fetch on tick by adding the tick to the path (cheap cache-buster)
-  // Actually simpler: bump a remount key — but we'd need to lift state. Keep it as one-shot for now;
-  // the topbar refreshes when the user clicks/navigates. 60s polling is a Phase 2 polish.
-  void tick;
-  const offlineNow = offline || (sys.source === 'mock' && sys.error);
-  const health = offlineNow ? 'red' : (sys.data?.overall_health || 'amber');
-  const label = offlineNow ? 'OFFLINE — backend not reachable' : (loading || sys.loading) ? 'LOADING' : health === 'green' ? 'HEALTHY' : health === 'amber' ? 'DEGRADED' : 'UNHEALTHY';
-  return (
-    <button className="btn ghost sm" title={offlineNow ? 'Backend unreachable — using mock data' : 'System status'}>
-      <span className={`health-dot ${health}`}/>
-      <span style={{fontFamily:'var(--font-mono)',fontSize:11}}>{label}</span>
-    </button>
   );
 }
 
@@ -137,9 +125,14 @@ function SignalControls({ state, setState }) {
   );
 }
 
-function SignalCard({ sig, openMarket, openTrader }) {
+function SignalCard({ sig, topN, openMarket, openTrader }) {
   const [expanded, setExpanded] = useState(false);
-  const isStale = (Date.now() - new Date(sig.last_seen_at).getTime()) > 4 * 3600 * 1000;
+  // Candidate = signal computed live but never logged in signal_log (happens when
+  // the user slides top_n away from the default 50 — see /signals/active route).
+  // Candidates have no first_fired_at / last_seen_at / peak_trader_count yet.
+  const isCandidate = sig.signal_log_id == null;
+  const isStale = !isCandidate && sig.last_seen_at != null
+    && (Date.now() - new Date(sig.last_seen_at).getTime()) > 4 * 3600 * 1000;
   const gap = sig.gap_to_smart_money;
   const gapKind = gap < 0.05 ? 'ok' : gap < 0.20 ? 'warn' : 'bad';
   const gapLabel = gap < 0.05 ? 'EARLY · GAP OPEN' : gap < 0.20 ? 'REACHABLE' : 'LIKELY MOVED';
@@ -148,7 +141,7 @@ function SignalCard({ sig, openMarket, openTrader }) {
   if (sig.has_exited) cardClasses.push('exited');
   if (isStale && !sig.has_exited) cardClasses.push('stale');
   if (sig.counterparty_count >= 3) cardClasses.push('counterparty-conflict');
-  if (gap < 0.05 && !isStale && sig.lens_count >= 3 && sig.counterparty_count === 0) cardClasses.push('fresh-best');
+  if (gap != null && gap < 0.05 && !isStale && sig.lens_count >= 3 && sig.counterparty_count === 0) cardClasses.push('fresh-best');
 
   // bound skew by lower of headcount/dollar
   const boundSkew = Math.min(sig.direction_skew, sig.direction_dollar_skew);
@@ -159,14 +152,14 @@ function SignalCard({ sig, openMarket, openTrader }) {
         <div>
           <div className="signal-meta">
             <span className="chip">{PB.CATEGORY_LABELS[sig.market_category]}</span>
-            {sig.is_new && <span className="chip ok">NEW</span>}
+            {isCandidate && <span className="chip info" title={`Computed live at top-N=${topN}; not in signal_log yet`}>📋 CANDIDATE · TOP-N={topN}</span>}
             {sig.has_insider && <span className="chip purple">◉ INSIDER INVOLVED</span>}
             {sig.lens_count > 1 && <span className="chip info">CONFIRMED BY {sig.lens_count} LENSES</span>}
             <span className="chip" title={`Entry source: ${sig.signal_entry_source}`}>
               {sig.signal_entry_source === 'clob_l2' ? 'L2 BOOK' : sig.signal_entry_source === 'gamma_fallback' ? 'GAMMA FALLBACK' : 'NO ENTRY'}
             </span>
-            <span className="chip">{sig.liquidity_tier.toUpperCase()} BOOK · {fmtUSD(sig.liquidity_at_signal_usdc)}</span>
-            <span className="chip">{tsAgo(sig.first_fired_at)}</span>
+            {sig.liquidity_tier && <span className="chip">{sig.liquidity_tier.toUpperCase()} BOOK · {fmtUSD(sig.liquidity_at_signal_usdc)}</span>}
+            {sig.first_fired_at && <span className="chip">{tsAgo(sig.first_fired_at)}</span>}
             {isStale && <span className="chip warn">STALE</span>}
             {sig.counterparty_count >= 3 && <span className="chip bad">⚠ 3+ TOP TRADERS OPPOSING</span>}
             {sig.counterparty_count >= 1 && sig.counterparty_count < 3 && <span className="chip warn">⚠ {sig.counterparty_count} OPPOSING</span>}
@@ -182,19 +175,19 @@ function SignalCard({ sig, openMarket, openTrader }) {
         <div className={`exit-banner ${sig.exit_event.event_type}`}>
           <span style={{display:'flex'}}>{ICONS.warning}</span>
           <div>
-            <div><b>Smart money {sig.exit_event.event_type === 'trim' ? 'trimming' : 'exited'}</b> at ${sig.exit_event.exit_bid_price.toFixed(2)} · {tsAgo(sig.exit_event.exited_at)}</div>
+            <div><b>Smart money {sig.exit_event.event_type === 'trim' ? 'trimming' : 'exited'}</b>{sig.exit_event.exit_bid_price != null ? ` at $${Number(sig.exit_event.exit_bid_price).toFixed(2)}` : ''} · {tsAgo(sig.exit_event.exited_at)}</div>
             <div style={{color:'var(--text-2)',marginTop:3,fontSize:12}} className="mono">
-              traders {sig.exit_event.peak_trader_count} → {sig.exit_event.exit_trader_count} · aggregate {fmtUSD(sig.exit_event.peak_aggregate_usdc)} → {fmtUSD(sig.exit_event.exit_aggregate_usdc)} · drop on {sig.exit_event.drop_reason.replace('_',' ')}
+              traders {sig.exit_event.peak_trader_count} → {sig.exit_event.exit_trader_count} · aggregate {fmtUSD(sig.exit_event.peak_aggregate_usdc)} → {fmtUSD(sig.exit_event.exit_aggregate_usdc)}{sig.exit_event.drop_reason ? ` · drop on ${sig.exit_event.drop_reason.replace('_',' ')}` : ''}
             </div>
           </div>
         </div>
       )}
 
       <div className="signal-stats">
-        <Stat label="Trader count" value={`${sig.trader_count} of ${sig.top_n}`} sub={`peak ${sig.peak_trader_count}`} />
+        <Stat label="Trader count" value={`${sig.trader_count} of ${topN ?? '?'}`} sub={sig.peak_trader_count != null ? `peak ${sig.peak_trader_count}` : ''} />
         <Stat label="Aggregate USDC" value={fmtUSD(sig.aggregate_usdc)} sub={`avg portfolio ${fmtPct(sig.avg_portfolio_fraction)}`} />
-        <Stat label="Current price" value={`$${sig.current_price.toFixed(2)}`} sub={`smart money entry $${sig.avg_entry_price.toFixed(2)}`} />
-        <Stat label="Entry offer" value={`$${sig.signal_entry_offer.toFixed(2)}`} sub={`spread ${sig.signal_entry_spread_bps}bps`} />
+        <Stat label="Current price" value={sig.current_price != null ? `$${Number(sig.current_price).toFixed(2)}` : '—'} sub={sig.avg_entry_price != null ? `smart money entry $${Number(sig.avg_entry_price).toFixed(2)}` : ''} />
+        <Stat label="Entry offer" value={sig.signal_entry_offer != null ? `$${Number(sig.signal_entry_offer).toFixed(2)}` : '—'} sub={sig.signal_entry_spread_bps != null ? `spread ${sig.signal_entry_spread_bps}bps` : 'no live quote'} />
         <div className="stat">
           <div className="stat-label">Gap to smart money</div>
           <div className="stat-value" style={{color: gapKind==='ok'?'var(--accent)':gapKind==='warn'?'var(--amber)':'var(--no)'}}>
@@ -211,7 +204,7 @@ function SignalCard({ sig, openMarket, openTrader }) {
             {expanded ? '▾' : '▸'} {expanded ? 'Hide' : 'Show'} contributors
           </a>
           <span className="muted">·</span>
-          <span className="mono muted">{sig.lens_list.slice(0, 2).join(' · ')}{sig.lens_list.length > 2 ? ` · +${sig.lens_list.length - 2}` : ''}</span>
+          <span className="mono muted">{(sig.lens_list || []).slice(0, 2).join(' · ')}{(sig.lens_list || []).length > 2 ? ` · +${sig.lens_list.length - 2}` : ''}</span>
         </div>
         <div className="tags">
           <button className="btn sm" onClick={(e) => { e.stopPropagation(); openMarket(sig.condition_id, sig.direction); }}>
@@ -253,6 +246,32 @@ function ContributorsPanel({ sig, openTrader }) {
   const mock = sig.signal_log_id ? PB.CONTRIBUTORS[sig.signal_log_id] : null;
   const res = useApi(path, mock);
   const data = res.data;
+
+  // Candidate-signal fallback: no signal_log_id → no rich contributors endpoint.
+  // Show the bare wallet list from `sig.contributing_wallets` so the user can
+  // at least click through to each trader's profile.
+  if (!sig.signal_log_id) {
+    const wallets = sig.contributing_wallets || [];
+    return (
+      <div className="contributors-panel">
+        <div className="contrib-section">
+          <h4>Contributors · {wallets.length} wallets on {sig.direction} · {fmtUSD(sig.aggregate_usdc)} aggregate</h4>
+          <div className="muted" style={{fontSize:12,padding:'4px 12px 8px'}}>
+            Candidate signal (top-N ≠ 50) — detailed breakdown unavailable until logged. Wallets listed below; click to view each trader's profile.
+          </div>
+          {wallets.map(w => (
+            <div className="contrib-row" key={w}>
+              <div className="name" onClick={() => openTrader(w)}>
+                <span className="mono">{w}</span>
+              </div>
+              <button className="btn sm ghost" onClick={() => openTrader(w)}>Profile →</button>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   if (res.loading) {
     return <div className="contributors-panel"><div className="contrib-section"><h4>Loading contributors…</h4></div></div>;
   }
@@ -333,6 +352,7 @@ function TopTradersPanel({ state, openTrader }) {
   const allTraders = res.data?.traders || [];
   // Show up to 15 in the dashboard preview panel.
   const traders = allTraders.slice(0, Math.min(Math.max(allTraders.length, 5), 15));
+  const initialLoad = res.loading && res.data == null;
   return (
     <div className="card">
       <div className="card-head">
@@ -342,6 +362,7 @@ function TopTradersPanel({ state, openTrader }) {
         </div>
         <span className="chip mono">{traders.length} of {state.top_n}</span>
       </div>
+      {initialLoad && <div className="card-pad muted">Loading traders…</div>}
       <table className="table">
         <thead>
           <tr>

@@ -1,21 +1,48 @@
 // =============================================================
 // market-view.jsx — Per-market trading view + Paper trade form
 // =============================================================
+
+// Postgres NUMERIC fields come back as JSON strings; coerce so .toFixed/math work.
+const _mvNum = (v) => (v == null ? null : typeof v === 'number' ? v : parseFloat(v));
+const _normByOutcome = (o) => o && ({
+  ...o,
+  aggregate_usdc: _mvNum(o.aggregate_usdc),
+  avg_entry_price: _mvNum(o.avg_entry_price),
+  current_price: _mvNum(o.current_price),
+});
+const _normTrader = (r) => r && ({
+  ...r,
+  size: _mvNum(r.size),
+  avg_entry_price: _mvNum(r.avg_entry_price),
+  cash_pnl_usdc: _mvNum(r.cash_pnl_usdc),
+  percent_pnl: _mvNum(r.percent_pnl),
+  portfolio_fraction: _mvNum(r.portfolio_fraction),
+});
+const _normSignal = (r) => r && ({
+  ...r,
+  peak_trader_count: _mvNum(r.peak_trader_count),
+  peak_aggregate_usdc: _mvNum(r.peak_aggregate_usdc),
+  signal_entry_offer: _mvNum(r.signal_entry_offer),
+});
+
 function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaperTrade }) {
   // Live: GET /markets/{condition_id}. Backend returns {market, tracked_positions_by_outcome,
   // tracked_positions_per_trader, signal_history}. orderbook + fills are NOT yet on the
   // backend (Phase 2 — the trading_view endpoint), so we fall back to mock data for those.
   const mockDetail = PB.MARKET_DETAIL[conditionId] || PB.MARKET_DETAIL['0x8f3a...c1'];
   const res = useApi(conditionId ? `/markets/${conditionId}` : null, mockDetail);
+  // Only render once live data arrives (or backend is confirmed offline). Otherwise
+  // the panel would flash mockDetail's market title + tracked positions for ~100ms.
+  const earlyState = (res.loading && res.data == null) ? 'loading' : null;
   const live = res.data || {};
   const detail = {
     market: live.market || mockDetail.market,
     // Backend doesn't ship orderbook/fills — keep mock so the trade panel still shows depth+slippage estimates.
     orderbook: mockDetail.orderbook,
     fills: mockDetail.fills,
-    tracked_positions_by_outcome: live.tracked_positions_by_outcome || mockDetail.tracked_positions_by_outcome,
-    tracked_positions_per_trader: live.tracked_positions_per_trader || mockDetail.tracked_positions_per_trader,
-    signal_history: live.signal_history || mockDetail.signal_history,
+    tracked_positions_by_outcome: (live.tracked_positions_by_outcome || mockDetail.tracked_positions_by_outcome).map(_normByOutcome),
+    tracked_positions_per_trader: (live.tracked_positions_per_trader || mockDetail.tracked_positions_per_trader).map(_normTrader),
+    signal_history: (live.signal_history || mockDetail.signal_history).map(_normSignal),
   };
   const { market, orderbook, fills, tracked_positions_by_outcome, tracked_positions_per_trader, signal_history } = detail;
   const [tab, setTab] = useState('signal');
@@ -43,19 +70,25 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
   }, [size, side, orderbook]);
 
   function placeTrade() {
+    // Backend (POST /paper_trades) accepts only these five fields. It
+    // computes the real entry price + fee + slippage from live CLOB at
+    // trade time; the UI must NOT lie about those numbers.
     onPaperTrade({
       condition_id: conditionId,
-      market_question: market.question,
       direction: side,
       entry_size_usdc: size,
-      effective_entry_price: fillPlan.avgPrice,
-      current_price: side === 'YES' ? market.condition_id ? 0.67 : 0.5 : 0.33,
-      entry_fee_usdc: fillPlan.fee,
-      entry_slippage_usdc: fillPlan.slipBps,
-      notes: reasoning,
-      signal_log_id: 9821,
+      signal_log_id: null,  // TODO: thread real signal_log_id when opened from a signal card
+      notes: reasoning || null,
     });
     showToast(`Paper trade placed · ${fmtUSD(size)} ${side}`, 'ok');
+  }
+
+  if (earlyState === 'loading') {
+    return (
+      <Modal onClose={onClose}>
+        <div className="modal-head"><div><h2 className="muted">Loading market…</h2></div><button className="modal-close" onClick={onClose}>{ICONS.x}</button></div>
+      </Modal>
+    );
   }
 
   return (
@@ -66,7 +99,6 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
             <span className="chip">{PB.CATEGORY_LABELS[market.event_category]}</span>
             <span className="chip mono">{market.condition_id}</span>
             <span className="chip">closes {new Date(market.end_date).toLocaleDateString()}</span>
-            <span className="chip">vol {fmtUSD(market.total_volume_usdc)}</span>
           </div>
           <h2>{market.question}</h2>
         </div>
@@ -75,33 +107,38 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
 
       <div className="modal-body">
         <div className="market-grid">
-          {/* LEFT: signal + orderbook + fills */}
+          {/* LEFT: signal + tracked positions + history. Order book and Recent
+              fills tabs are hidden until backend ships them (Phase 2) — the
+              mock fallback would just be misleading fake data otherwise. */}
           <div>
             <div className="tabs">
-              {['signal','orderbook','fills','traders','history'].map(t => (
+              {['signal','traders','history'].map(t => (
                 <button key={t} className={`tab ${tab===t?'on':''}`} onClick={() => setTab(t)}>
-                  {t === 'signal' ? 'Signal context' : t === 'orderbook' ? 'Order book' : t === 'fills' ? 'Recent fills' : t === 'traders' ? 'Tracked positions' : 'Signal history'}
+                  {t === 'signal' ? 'Signal context' : t === 'traders' ? 'Tracked positions' : 'Signal history'}
                 </button>
               ))}
             </div>
 
-            {tab === 'signal' && <SignalContext detail={detail} />}
-            {tab === 'orderbook' && <OrderBook ob={orderbook} />}
-            {tab === 'fills' && <FillsTable fills={fills} />}
+            {tab === 'signal' && <SignalContext detail={detail} direction={presetDirection} />}
             {tab === 'traders' && <TrackedPositionsTable rows={tracked_positions_per_trader} byOutcome={tracked_positions_by_outcome} openTrader={openTrader} />}
             {tab === 'history' && <SignalHistoryTable rows={signal_history} />}
           </div>
 
-          {/* RIGHT: trade panel */}
+          {/* RIGHT: trade panel — live order-book is Phase 2; fill estimates would
+              be fake until then, so we hide them and let the backend compute
+              entry price + fee + slippage at trade time. */}
           <div className="trade-panel">
+            <div className="callout warn" style={{marginBottom:14,fontSize:12,lineHeight:1.5}}>
+              <b>Preview</b> — fill price not shown live. Backend will compute the real
+              entry price, fee, and slippage from CLOB at the moment you place the trade.
+            </div>
+
             <div className="trade-side">
               <button className={`trade-side-btn yes ${side==='YES'?'on':''}`} onClick={() => setSide('YES')}>
                 <span style={{fontSize:11,fontWeight:600,letterSpacing:'0.1em'}}>BUY YES</span>
-                <span style={{fontSize:22,fontWeight:700,marginTop:4}}>$0.{Math.round(orderbook.yes.asks[0].price*100)}</span>
               </button>
               <button className={`trade-side-btn no ${side==='NO'?'on':''}`} onClick={() => setSide('NO')}>
                 <span style={{fontSize:11,fontWeight:600,letterSpacing:'0.1em'}}>BUY NO</span>
-                <span style={{fontSize:22,fontWeight:700,marginTop:4}}>$0.{Math.round((1-orderbook.yes.bids[0].price)*100)}</span>
               </button>
             </div>
 
@@ -115,16 +152,6 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
               </div>
             </div>
 
-            <div className="trade-summary">
-              <SumRow k="Fill estimate" v={fillPlan.fullyFilled ? 'fully filled' : `partial (${fmtUSD(fillPlan.totalSpent / fillPlan.avgPrice || 0,0)} of ${fmtUSD(size)})`} />
-              <SumRow k="Effective avg" v={`$${fillPlan.avgPrice.toFixed(4)}`} />
-              <SumRow k="Slippage" v={`${fillPlan.slipBps} bps`} kind={fillPlan.slipBps > 100 ? 'warn' : null} />
-              <SumRow k="Fee (2%)" v={fmtUSD(fillPlan.fee, 2)} />
-              <SumRow k="Total cost" v={fmtUSD(fillPlan.totalSpent + fillPlan.fee, 2)} />
-              <SumRow k="Max payout" v={fmtUSD(size, 2)} kind="ok" />
-              <SumRow k="Max loss" v={fmtUSD(fillPlan.totalSpent + fillPlan.fee, 2)} kind="bad" />
-            </div>
-
             <div style={{marginTop:14}}>
               <div className="trade-label">Thesis (optional)</div>
               <textarea value={reasoning} onChange={e=>setReasoning(e.target.value)} placeholder="Why this trade? Cluster A whales, low gap..." className="select" style={{width:'100%',minHeight:64,resize:'vertical',fontFamily:'var(--font-sans)'}}/>
@@ -134,7 +161,7 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
               Place paper trade · {fmtUSD(size,0)} {side}
             </button>
             <div className="muted" style={{fontSize:11,marginTop:8,textAlign:'center',fontFamily:'var(--font-mono)'}}>
-              POST /paper-trades · paper account, no real funds
+              POST /paper_trades · paper account, no real funds
             </div>
           </div>
         </div>
@@ -148,20 +175,27 @@ function SumRow({ k, v, kind }) {
   return <div className="sum-row"><span className="muted">{k}</span><span className={kind === 'ok' ? 'pos' : kind === 'bad' ? 'neg' : kind === 'warn' ? 'warn' : ''}>{v}</span></div>;
 }
 
-function SignalContext({ detail }) {
-  const tracked = detail.tracked_positions_by_outcome.find(o => o.outcome === 'Yes');
+function SignalContext({ detail, direction }) {
+  // Use the signal's actual direction (YES or NO) to find the matching outcome.
+  // API returns outcomes as "Yes" / "No" (capitalized).
+  const targetOutcome = direction === 'NO' ? 'No' : 'Yes';
+  const tracked = detail.tracked_positions_by_outcome.find(o => o.outcome === targetOutcome);
+  if (!tracked) {
+    return (
+      <div className="card card-pad">
+        <h3 style={{marginBottom:12}}>Smart-money consensus</h3>
+        <div className="muted">No tracked smart-money positions on {targetOutcome.toUpperCase()} for this market yet.</div>
+      </div>
+    );
+  }
   return (
     <div className="card card-pad">
       <h3 style={{marginBottom:12}}>Smart-money consensus</h3>
       <div className="kv-grid">
-        <KV k="On YES" v={`${tracked.trader_count} traders`} kind="pos" />
+        <KV k={`On ${targetOutcome.toUpperCase()}`} v={`${tracked.trader_count} traders`} kind="pos" />
         <KV k="Aggregate" v={fmtUSD(tracked.aggregate_usdc)} />
-        <KV k="Avg entry" v={`$${tracked.avg_entry_price.toFixed(2)}`} />
-        <KV k="Current" v={`$${tracked.current_price.toFixed(2)}`} />
-      </div>
-      <div style={{marginTop:14, padding:'12px 14px',background:'var(--bg-3)',borderRadius:8,border:'1px solid var(--border)',fontSize:13,lineHeight:1.6}}>
-        <b style={{color:'var(--accent)'}}>Why this is a signal:</b> 5 lenses confirm — top crypto specialists and absolute leaderboard agree YES.
-        Smart money entered around $0.42, current offer $0.69. Gap is ~3% — still reachable. No top-trader counterparty on NO.
+        <KV k="Avg entry" v={tracked.avg_entry_price != null ? `$${tracked.avg_entry_price.toFixed(2)}` : '—'} />
+        <KV k="Current" v={tracked.current_price != null ? `$${tracked.current_price.toFixed(2)}` : '—'} />
       </div>
     </div>
   );
@@ -231,8 +265,8 @@ function TrackedPositionsTable({ rows, byOutcome, openTrader }) {
                 <td><span className={`dir-badge ${o.outcome.toLowerCase()}`} style={{padding:'2px 8px',fontSize:11}}>{o.outcome.toUpperCase()}</span></td>
                 <td className="num">{o.trader_count}</td>
                 <td className="num">{fmtUSD(o.aggregate_usdc)}</td>
-                <td className="num muted">${o.avg_entry_price.toFixed(2)}</td>
-                <td className="num">${o.current_price.toFixed(2)}</td>
+                <td className="num muted">{o.avg_entry_price != null ? `$${o.avg_entry_price.toFixed(2)}` : '—'}</td>
+                <td className="num">{o.current_price != null ? `$${o.current_price.toFixed(2)}` : '—'}</td>
               </tr>
             ))}
           </tbody>
@@ -243,7 +277,7 @@ function TrackedPositionsTable({ rows, byOutcome, openTrader }) {
           <thead><tr><th>Trader</th><th>Side</th><th>Size</th><th>Entry</th><th>P&L</th><th>%port</th><th>First seen</th></tr></thead>
           <tbody>
             {rows.map(r => (
-              <tr key={r.proxy_wallet} className="row-clickable" onClick={() => openTrader(r.proxy_wallet)}>
+              <tr key={`${r.proxy_wallet}-${r.outcome}`} className="row-clickable" onClick={() => openTrader(r.proxy_wallet)}>
                 <td>
                   <div style={{display:'flex',alignItems:'center',gap:6}}>
                     {r.user_name || <span className="mono muted">{r.proxy_wallet}</span>}
@@ -252,9 +286,9 @@ function TrackedPositionsTable({ rows, byOutcome, openTrader }) {
                   </div>
                 </td>
                 <td><span className={`dir-badge ${r.outcome.toLowerCase()}`} style={{padding:'2px 8px',fontSize:11}}>{r.outcome.toUpperCase()}</span></td>
-                <td className="num">{fmtUSD(r.size)}</td>
-                <td className="num muted">${r.avg_entry_price.toFixed(2)}</td>
-                <td className={`num ${r.cash_pnl_usdc >= 0 ? 'pos' : 'neg'}`}>{fmtUSD(r.cash_pnl_usdc)} <span className="muted">({fmtPctSigned(r.percent_pnl)})</span></td>
+                <td className="num">{fmtUSD(r.current_value_usdc)}</td>
+                <td className="num muted">{r.avg_entry_price != null ? `$${r.avg_entry_price.toFixed(2)}` : '—'}</td>
+                <td className={`num ${r.cash_pnl_usdc >= 0 ? 'pos' : 'neg'}`}>{fmtUSD(r.cash_pnl_usdc)} <span className="muted">({r.percent_pnl != null ? `${Number(r.percent_pnl) >= 0 ? '+' : ''}${Number(r.percent_pnl).toFixed(1)}%` : '—'})</span></td>
                 <td className="num">{fmtPct(r.portfolio_fraction)}</td>
                 <td className="muted mono" style={{fontSize:11}}>{tsAgo(r.first_seen_at)}</td>
               </tr>
@@ -281,7 +315,7 @@ function SignalHistoryTable({ rows }) {
               <td className="muted mono" style={{fontSize:11}}>{tsAgo(r.first_fired_at)}</td>
               <td className="num">{r.peak_trader_count}</td>
               <td className="num">{fmtUSD(r.peak_aggregate_usdc)}</td>
-              <td className="num muted">${r.signal_entry_offer.toFixed(2)}</td>
+              <td className="num muted">{r.signal_entry_offer != null ? `$${r.signal_entry_offer.toFixed(2)}` : '—'}</td>
             </tr>
           ))}
         </tbody>
