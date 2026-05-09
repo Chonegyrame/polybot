@@ -408,7 +408,18 @@ async def _rank_specialist(
               AND ls.order_by = 'PNL'
               AND ls.vol >= $3
               AND ls.pnl > 0
-              AND ls.proxy_wallet IN (SELECT proxy_wallet FROM active_recently)
+              -- Pass 6: drop the monthly-leaderboard recency cut when
+              -- trader_category_stats is seeded AND fresh -- the F9
+              -- last_trade_at gate below provides a proper 60d recency check
+              -- with much better coverage than Polymarket's 30-day monthly
+              -- leaderboard slice (which capped pool sizes at 7-20 per
+              -- category). Until stats seed, fall back to the old
+              -- monthly-presence filter so Specialist never runs without
+              -- ANY recency check.
+              AND (
+                  (stats_seeded.has_data AND stats_fresh.is_fresh)
+                  OR ls.proxy_wallet IN (SELECT proxy_wallet FROM active_recently)
+              )
               -- B5 sample-size floor: only enforce once stats are seeded
               -- AND fresh (Pass 5 #6).
               AND (

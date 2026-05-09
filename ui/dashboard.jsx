@@ -18,7 +18,11 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
     }
     const sortMap = {
       gap:    (a,b) => (a.gap_to_smart_money ?? 1) - (b.gap_to_smart_money ?? 1),
-      fresh:  (a,b) => new Date(b.first_fired_at || 0) - new Date(a.first_fired_at || 0),
+      // Cascade: first_fired_at (logged) → last_seen_at → first_top_trader_first_seen_at
+      // (always populated). Without this cascade, candidate signals (top_n != 50)
+      // have first_fired_at = null and the sort silently degenerates to API order.
+      fresh:  (a,b) => new Date(b.first_fired_at || b.last_seen_at || b.first_top_trader_first_seen_at || 0)
+                     - new Date(a.first_fired_at || a.last_seen_at || a.first_top_trader_first_seen_at || 0),
       lens:   (a,b) => (b.lens_count || 0) - (a.lens_count || 0),
       traders:(a,b) => b.trader_count - a.trader_count,
       agg:    (a,b) => b.aggregate_usdc - a.aggregate_usdc,
@@ -27,6 +31,30 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
     s.sort(sortMap[state.sort] || sortMap.gap);
     return s;
   }, [liveSignals, sigsRes.source, state.category, state.sort]);
+
+  // Event-grouping V1: walk the sorted list, cluster signals that share an
+  // event_id (2+ children only), and emit an event-header marker before the
+  // group's first occurrence. Singletons render as today.
+  const renderItems = useMemo(() => {
+    const eventCounts = {};
+    for (const s of filtered) {
+      if (s.event_id) eventCounts[s.event_id] = (eventCounts[s.event_id] || 0) + 1;
+    }
+    const items = [];
+    const seen = new Set();
+    for (const s of filtered) {
+      if (s.event_id && eventCounts[s.event_id] >= 2) {
+        if (seen.has(s.event_id)) continue;  // already emitted as part of group
+        seen.add(s.event_id);
+        const children = filtered.filter(x => x.event_id === s.event_id);
+        items.push({ kind: 'event_header', event_id: s.event_id, children });
+        for (const c of children) items.push({ kind: 'signal', signal: c });
+      } else {
+        items.push({ kind: 'signal', signal: s });
+      }
+    }
+    return items;
+  }, [filtered]);
 
   // Live freshness from /system/status — drives the "refreshed Xm ago" subtitle.
   // Polls every 60s so the staleness counter doesn't freeze at page-load time.
@@ -62,14 +90,22 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
               <h4>No signals firing in this view right now.</h4>
               <p>Try widening top-N, switching to Overall, or check back in 10 minutes.</p>
             </div>
-          ) : filtered.map(sig => (
-            <SignalCard
-              key={sig.signal_log_id ?? `${sig.condition_id}-${sig.direction}`}
-              sig={sig}
-              topN={state.top_n}
-              openMarket={openMarket}
-              openTrader={openTrader}
-            />
+          ) : renderItems.map(item => (
+            item.kind === 'event_header' ? (
+              <EventHeader
+                key={`eh-${item.event_id}`}
+                eventId={item.event_id}
+                children={item.children}
+              />
+            ) : (
+              <SignalCard
+                key={item.signal.signal_log_id ?? `${item.signal.condition_id}-${item.signal.direction}`}
+                sig={item.signal}
+                topN={state.top_n}
+                openMarket={openMarket}
+                openTrader={openTrader}
+              />
+            )
           ))}
         </div>
 
@@ -153,6 +189,9 @@ function SignalCard({ sig, topN, openMarket, openTrader }) {
         <div>
           <div className="signal-meta">
             <span className="chip">{PB.CATEGORY_LABELS[sig.market_category]}</span>
+            {sig.market_category === 'sports' && (
+              <LiveSportsChip conditionId={sig.condition_id} />
+            )}
             {isCandidate && <span className="chip info" title={`Computed live at top-N=${topN}; not in signal_log yet`}>📋 CANDIDATE · TOP-N={topN}</span>}
             {sig.has_insider && <span className="chip purple">◉ INSIDER INVOLVED</span>}
             {sig.lens_count > 1 && <span className="chip info">CONFIRMED BY {sig.lens_count} LENSES</span>}
@@ -392,6 +431,201 @@ function TopTradersPanel({ state, openTrader }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+// Live sports fixture chip on SignalCard for category=='sports' markets.
+// Backed by GET /markets/{cid}/live_status, which fuzzy-matches the market
+// question against ESPN's scoreboard. Silently omits when ESPN can't match.
+//
+// Polling:
+//   - Fetches once on mount, then every 60s WHILE the card is on-screen.
+//   - Uses IntersectionObserver to pause polling when scrolled out of view.
+//   - When the card comes back into view, immediately re-fetches so the
+//     chip can't be more than 60s stale by the time the user looks at it.
+function LiveSportsChip({ conditionId }) {
+  const [data, setData] = useState(null);     // FixtureStatus or null
+  const [tried, setTried] = useState(false);  // hide-on-failure guard
+  // Callback ref so we re-attach the observer whenever the underlying DOM
+  // node changes (it does, since we re-render different spans depending on
+  // state). Without this, IO observes a stale detached node.
+  const observerRef = useRef(null);
+  const visible = useRef(false);
+  const inflight = useRef(false);
+  const timerRef = useRef(null);
+
+  // Stable fetch callback so the IO callback can call it without retriggering.
+  const fetchOnce = useCallback(async () => {
+    if (inflight.current) return;
+    inflight.current = true;
+    try {
+      const res = await fetch(`${D.API_BASE}/markets/${conditionId}/live_status`);
+      if (res.status === 404) { setData(null); setTried(true); return; }
+      if (!res.ok)            { setTried(true); return; }
+      const body = await res.json();
+      setData(body); setTried(true);
+    } catch {
+      setTried(true);
+    } finally {
+      inflight.current = false;
+    }
+  }, [conditionId]);
+
+  // Initial fetch on mount.
+  useEffect(() => { fetchOnce(); }, [fetchOnce]);
+
+  // Cleanup on unmount: stop timer + disconnect observer.
+  useEffect(() => () => {
+    if (timerRef.current != null) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (observerRef.current != null) { observerRef.current.disconnect(); observerRef.current = null; }
+  }, []);
+
+  // Callback ref: attach IntersectionObserver when chip-with-content node
+  // mounts; re-attach if React swaps the DOM node.
+  const attachObserver = useCallback((node) => {
+    if (observerRef.current != null) {
+      observerRef.current.disconnect();
+      observerRef.current = null;
+    }
+    if (node == null || !('IntersectionObserver' in window)) return;
+    const io = new IntersectionObserver(entries => {
+      const ent = entries[0];
+      if (!ent) return;
+      const startTimer = () => {
+        if (timerRef.current != null) return;
+        timerRef.current = setInterval(fetchOnce, 60_000);
+      };
+      const stopTimer = () => {
+        if (timerRef.current != null) { clearInterval(timerRef.current); timerRef.current = null; }
+      };
+      if (ent.isIntersecting && !visible.current) {
+        visible.current = true;
+        fetchOnce();          // fresh data on re-entry
+        startTimer();
+      } else if (!ent.isIntersecting && visible.current) {
+        visible.current = false;
+        stopTimer();
+      }
+    }, { rootMargin: '100px' });
+    io.observe(node);
+    observerRef.current = io;
+  }, [fetchOnce]);
+
+  // Hide entirely when no fixture matched (or fetch failed). The doc spec
+  // explicitly accepts partial coverage -- silently omit beats wrong-data.
+  // Until the first fetch returns we render nothing (no visible loader chip
+  // to avoid flicker on every sports card).
+  if (!tried || !data) return null;
+
+  const { state, kickoff_at, current_minute, home_team, away_team,
+          home_score, away_score, short_detail, sport } = data;
+  const scoreStr = (home_score != null && away_score != null)
+    ? `${home_score}-${away_score}`
+    : null;
+
+  let label, kind;
+  if (state === 'pre') {
+    const ms = new Date(kickoff_at).getTime() - Date.now();
+    if (ms <= 0) {
+      label = '⚽ KICKOFF';
+      kind = 'ok';
+    } else {
+      const totalMin = Math.round(ms / 60000);
+      const h = Math.floor(totalMin / 60);
+      const m = totalMin % 60;
+      label = `⚽ KICKOFF in ${h > 0 ? `${h}h ${m}m` : `${m}m`}`;
+      kind = '';
+    }
+  } else if (state === 'in') {
+    if (sport === 'soccer' && current_minute != null) {
+      label = `⚽ LIVE · ${current_minute}'${scoreStr ? ` · ${scoreStr}` : ''}`;
+    } else if (scoreStr) {
+      label = `⚽ LIVE${short_detail ? ` · ${short_detail}` : ''} · ${scoreStr}`;
+    } else {
+      label = `⚽ LIVE${short_detail ? ` · ${short_detail}` : ''}`;
+    }
+    kind = 'ok';
+  } else if (state === 'ht') {
+    label = `⚽ HT${scoreStr ? ` · ${scoreStr}` : ''}`;
+    kind = 'warn';
+  } else if (state === 'post') {
+    label = `⚽ FT${scoreStr ? ` · ${scoreStr}` : ''}`;
+    kind = '';
+  } else {
+    return null;
+  }
+
+  const title = `${home_team} vs ${away_team}${short_detail ? ` · ${short_detail}` : ''}`;
+  return (
+    <span ref={attachObserver} className={`chip ${kind}`} title={title}>
+      {label}
+    </span>
+  );
+}
+
+// Event-grouping V1: small header strip rendered above 2+ child signals that
+// share an event_id. Sums what's safe to sum (aggregate USDC) and dedupes
+// what isn't (smart-money headcount via union of contributing_wallets). Tags
+// a primary thesis when one direction holds 70%+ of the aggregate.
+function EventHeader({ eventId, children }) {
+  // Dedup contributing wallets across all children -> entity-level headcount.
+  const walletSet = new Set();
+  let aggSum = 0;
+  let yesAgg = 0;
+  let noAgg = 0;
+  const directions = new Set();
+  for (const c of children) {
+    aggSum += Number(c.aggregate_usdc || 0);
+    if (c.direction === 'YES') yesAgg += Number(c.aggregate_usdc || 0);
+    if (c.direction === 'NO')  noAgg  += Number(c.aggregate_usdc || 0);
+    directions.add(c.direction);
+    for (const w of (c.contributing_wallets || [])) walletSet.add(w);
+  }
+  const dedupedHeadcount = walletSet.size;
+
+  // Primary thesis label: one side holds 70%+ of the aggregate. Mixed
+  // direction children mean the aggregate sum *can* overstate net capital
+  // (NO on child A and YES on child B can express the same outcome thesis),
+  // so we surface the caveat in the muted footer line.
+  const thesisDir = aggSum > 0
+    ? (yesAgg / aggSum >= 0.70 ? 'YES'
+       : noAgg / aggSum >= 0.70 ? 'NO'
+       : null)
+    : null;
+  const isMixed = directions.size > 1;
+
+  return (
+    <div className="event-header" style={{
+      background: 'var(--panel-2, var(--panel))',
+      border: '1px solid var(--border)',
+      borderRadius: 8,
+      padding: '10px 14px',
+      marginBottom: 6,
+      display: 'flex',
+      alignItems: 'center',
+      gap: 12,
+      flexWrap: 'wrap',
+    }}>
+      <span className="chip" style={{background:'rgba(155,140,255,0.16)',color:'#b6a8ff',border:'1px solid rgba(155,140,255,0.35)'}}>
+        {isMixed ? 'MULTI-OUTCOME EVENT' : 'EVENT GROUP'}
+      </span>
+      <span style={{fontSize:13,color:'var(--text-1)'}}>
+        <b>{children.length} child signals</b> tracked on the same event
+      </span>
+      <span className="muted mono" style={{fontSize:11.5}}>
+        {dedupedHeadcount} unique smart-money {dedupedHeadcount === 1 ? 'wallet' : 'wallets'} (deduped) · {fmtUSD(aggSum)} combined aggregate
+      </span>
+      {thesisDir && (
+        <span className={`chip ${thesisDir === 'YES' ? 'ok' : 'bad'}`}>
+          PRIMARY THESIS: {thesisDir}
+        </span>
+      )}
+      {isMixed && (
+        <span className="muted" style={{fontSize:11,fontStyle:'italic',width:'100%',marginTop:2}}>
+          Combined aggregate may overstate net capital — NO on one child + YES on another can encode the same outcome thesis. See per-child detail below.
+        </span>
+      )}
     </div>
   );
 }

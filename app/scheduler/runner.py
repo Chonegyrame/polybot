@@ -36,6 +36,7 @@ from app.scheduler.jobs import (
     compute_trader_category_stats,
     daily_leaderboard_snapshot,
     detect_sybil_clusters_in_pool,
+    heal_unavailable_signal_books,
     record_signal_price_snapshots,
     refresh_positions_then_log_signals,
 )
@@ -117,6 +118,19 @@ def build_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
+    # Heal job: retry CLOB book capture for signals stuck on
+    # signal_entry_source='unavailable'. 30-min cadence keeps Polymarket API
+    # load low while still draining the pool over time. Each row that heals
+    # leaves the candidate set, so cost is naturally bounded.
+    scheduler.add_job(
+        heal_unavailable_signal_books,
+        trigger=IntervalTrigger(minutes=30),
+        id="heal_unavailable_books",
+        name="Retry book capture for signal_entry_source='unavailable' rows",
+        misfire_grace_time=600,
+        replace_existing=True,
+    )
+
     return scheduler
 
 
@@ -135,6 +149,9 @@ async def run_forever() -> None:
     scheduler = build_scheduler()
     scheduler.start()
     _log_jobs(scheduler)
+
+    # Same startup catch-up as the FastAPI lifespan path.
+    asyncio.create_task(_startup_position_refresh())
 
     try:
         # Block until cancelled. asyncio.Event() that's never set is the
@@ -163,11 +180,31 @@ async def lifespan_scheduler() -> AsyncIterator[AsyncIOScheduler]:
     scheduler = build_scheduler()
     scheduler.start()
     _log_jobs(scheduler)
+
+    # Startup catch-up for the 10-min position refresh: APScheduler waits a full
+    # interval after start before first fire, so after a sleep+resume or restart
+    # data stays stale up to 10 minutes. Kick a one-shot run in the background
+    # so the API is reachable immediately and positions refresh in parallel.
+    # `max_instances=1` on the job prevents racing the next scheduled tick.
+    asyncio.create_task(_startup_position_refresh())
+
     try:
         yield scheduler
     finally:
         log.info("shutting down scheduler (lifespan exit)...")
         scheduler.shutdown(wait=False)
+
+
+async def _startup_position_refresh() -> None:
+    """One-shot at lifespan startup so positions are fresh immediately,
+    not after waiting a full 10-min interval. Errors are logged and swallowed
+    -- the next scheduled tick will retry."""
+    try:
+        log.info("startup position-refresh + signal log kicking off...")
+        await refresh_positions_then_log_signals()
+        log.info("startup position-refresh complete")
+    except Exception as e:  # noqa: BLE001
+        log.warning("startup position-refresh failed (next tick will retry): %s", e)
 
 
 def _log_jobs(scheduler: AsyncIOScheduler) -> None:

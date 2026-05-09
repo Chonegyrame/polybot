@@ -42,6 +42,15 @@ async function apiDelete(path) {
   if (!r.ok) throw new Error(await _apiErrorMessage(r, 'DELETE', path));
   return await r.json();
 }
+async function apiPatch(path, body) {
+  const r = await fetch(`${D.API_BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: body == null ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await _apiErrorMessage(r, 'PATCH', path));
+  return await r.json();
+}
 
 // React hook: fetch a JSON path, fall back to `mock` ONLY if the backend
 // fetch errors. Initial state is always `data: null, source: 'pending'` so
@@ -142,10 +151,11 @@ function Sparkline({ data, w = 80, h = 24, color }) {
 }
 
 // ---------- Sidebar ----------
-function Sidebar({ route, setRoute }) {
+function Sidebar({ route, setRoute, newsUnread = 0 }) {
   const items = [
     { id: 'dashboard', label: 'Dashboard',  ic: I.feed },
     { id: 'traders',   label: 'Top Traders', ic: I.traders },
+    { id: 'news',      label: 'News',        ic: I.bell, badge: newsUnread > 0 ? newsUnread : null },
     { id: 'testing',   label: 'Testing',    ic: I.beaker },
   ];
   return (

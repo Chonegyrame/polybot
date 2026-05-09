@@ -292,6 +292,14 @@ async def _aggregate_positions(
           AND p.size > 0
           AND p.last_updated_at >= NOW() - INTERVAL '20 minutes'
           AND ($2::TEXT IS NULL OR e.category = $2::TEXT)
+          -- "Effectively resolved" filter: drop markets that Polymarket hasn't
+          -- formally closed but are dead in practice (waiting on UMA, sat at
+          -- the price extreme for weeks). Two heuristics, OR'd:
+          --   (a) end_date passed by 7+ days regardless of `closed` flag
+          --   (b) cur_price outside [0.02, 0.92] — no tradeable depth, no edge.
+          -- Both sides of a binary fail (b) together because YES at 0.99 ↔ NO at 0.01.
+          AND (m.end_date IS NULL OR m.end_date >= NOW() - INTERVAL '7 days')
+          AND (p.cur_price IS NULL OR p.cur_price BETWEEN 0.02 AND 0.92)
     ),
     -- Pass 5 #1: identity-collapse the per-wallet positions before the
     -- per-direction aggregate. A 4-wallet sybil cluster with $20k on each

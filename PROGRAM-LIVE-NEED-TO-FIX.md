@@ -17,74 +17,184 @@ Items below: open ones first, then completed (with date).
 
 ## Open
 
-### NEW — Event-level grouping for related child markets
+### NEW — Per-market price chart in MarketView
 
-**Severity:** C (missing functionality / wrong mental model — signals from
-the same underlying event are presented as unrelated)
-**Where:** dashboard signal feed, with V1.1 also touching TraderModal
+**Severity:** C (missing functionality — current MarketView shows one
+`current_price` number with no history; user can't tell if smart money
+entered at a local low, near top, or after a flat run).
+**Where:** MarketView modal, new section.
 
-**The gap.** Polymarket models multi-outcome events (3-way moneylines,
-multi-team / multi-candidate races) as a *parent event* with multiple
-*binary child markets*, each with its own `condition_id`. Our signal
-detector and dashboard treat each child completely independently. As a
-result, signals on the same underlying event show up as separate cards,
-their stats don't combine, and the same trader's full event-level
-position is split across cards with no grouping.
+**The gap.** When you click into a market, you see the live price as a
+single number plus the smart-money entry price as a second number. No
+chart. You cannot answer:
+- Did smart money enter at the local low or after a run-up?
+- How volatile has this market been?
+- Did the price already react to whatever news triggered the signal,
+  or is the move still in front of you?
 
-**Concrete case seen 2026-05-09.** "Cagliari vs Udinese" Serie A match.
-Two separate binary children both fired signals — `Will Cagliari win?
-NO` ($129k aggregate, 5 traders) and `Will Udinese win? YES` ($311k
-aggregate, 7 traders). Same set of smart-money wallets (`swisstony`,
-`GamblingIsAllYouNeed`, `SemyonMarmeladov`, etc.) appears across both
-because they're expressing one consistent thesis: Udinese will win this
-match. Their combined event-level capital deployed on that thesis is
-~$440k across 9 unique wallets, but the dashboard surfaces it as two
-unrelated signals worth $129k and $311k. Anyone reading the dashboard
-without realizing the two markets are linked is missing the bigger
-picture.
+Without this, signals are evaluated in a vacuum. This is the single
+biggest information gap vs Celsa for actually deciding whether to bet.
 
-#### V1 — Event-grouping header strip (small, high-value)
+**The fix.** Polymarket's gamma-api exposes `/prices-history?market=...&interval={1m,1h,1d}`.
+- New backend endpoint `GET /markets/{condition_id}/price_history?interval=1d`
+  proxies the gamma call (cache 60s per condition_id+interval).
+- New `PriceHistoryChart` component in MarketView. SVG line chart.
+- Overlay markers:
+  - Smart-money average entry price (horizontal dashed line)
+  - Signal first_fired_at timestamp (vertical line, green)
+  - Signal last_seen_at / exit timestamp (vertical line, amber/red)
+  - Today's marker
+- Interval toggle: 1h / 1d / 1w / 1m / all-time
 
-- Modify `/signals/active` response to include `event_id` per signal
-  (already in DB, just expose it).
-- Group signals client-side by `event_id`. For groups with 2+ signals,
-  render a small `EventHeader` component above the related cards.
-- Each child SignalCard renders unchanged underneath the header — same
-  layout, same chips, same modal click-through, same paper-trade flow.
-- Header content:
-  - **Event title** — derived from market questions (e.g.,
-    "Cagliari vs Udinese · 2026-05-09") plus a "MATCH" / "MULTI-OUTCOME"
-    chip.
-  - **Child-signal count** — "2 child signals tracked"
-  - **Unique smart-money headcount** — deduped across children. The
-    fact that swisstony appears on both child markets counts as 1 wallet
-    at the event level.
-  - **Aggregate sum** — sum of child aggregates with a one-line footnote
-    that this may overstate net capital because a NO position on one
-    child can overlap a YES position on another (e.g., NO Cagliari pays
-    on draw OR Udinese-wins; YES Udinese pays only on Udinese-wins).
-  - **Primary thesis line** — when 70%+ of aggregate aligns with one
-    underlying outcome, label that outcome (e.g., "Primary thesis:
-    UDINESE WINS"). Omit when no clean consensus exists.
-- For single-child markets the header doesn't render — feed looks
-  identical to today.
+**Scope:**
+- ~50 lines backend (route + 60s cache)
+- ~150 lines frontend (component + SVG rendering, no charting library)
+- Could use Sparkline pattern from shared.jsx as starting point
 
-Backend: ~30 lines (expose `event_id`, optional `/events/{event_id}/summary`
-helper).
-Frontend: ~100-150 lines (one new component, client-side grouping).
-**No changes to SignalCard, TraderModal, signal_log schema, backtests,
-or paper-trade flow in V1.**
+**Out of scope:** candlestick view, volume bars, drawing tools.
 
-#### V1.1 — Per-trader match-level book in TraderModal
+---
 
-The biggest "useful info I can't currently see" missing from V1 alone is
-combined per-trader event exposure. Currently if you click swisstony from
-the Cagliari card you see only his Cagliari positions; click from the
-Udinese card you see only his Udinese positions. You have to manually
-add them up to see his real match exposure.
+### NEW — Markets browser + search (sidebar tab)
 
-V1.1 (modal-only change, no dashboard impact):
+**Severity:** C (missing functionality — user can only see markets that
+have an active signal; can't browse or search the full market universe).
+**Where:** new sidebar tab parallel to News, new page component, hits
+gamma-api directly.
 
+**The gap.** Three blind spots:
+1. You hear about a market on Twitter and want to look it up here. No way
+   to do that today — the dashboard only shows markets with active signals.
+2. You can't see what markets are about to fire (watchlist signals exist
+   in the DB but no UI surface — see watchlist tab item below).
+3. You can't browse politics/sports/crypto markets that aren't yet on
+   smart money's radar.
+
+**The fix.** New sidebar item "Markets" -> new MarketsPage component.
+- Backend: new `GET /markets/browse?category=&search=&sort=&limit=` that
+  proxies/wraps gamma-api's `/markets` endpoint with our preferred filters.
+  Server-side cache 60s per query string.
+- UI: search box + filter chips (category, time-to-end, volume, liquidity,
+  sort by). Each result row: market question, category, end_date,
+  current_price, 24h volume, "view" button (opens MarketView modal).
+- Lazy pagination — load 50 at a time, fetch more on scroll.
+- Click any row -> existing MarketView modal opens (reuses everything).
+
+**Scope:** ~100 lines backend, ~250 lines frontend. Reuses MarketView for
+detail.
+
+**Out of scope:** saved searches, alerting on watchlist crossings (could
+extend later with the existing `/system/status`-style email pattern).
+
+---
+
+### NEW — Watchlist tab (sidebar)
+
+**Severity:** C (missing functionality — backend already detects + persists
+watchlist signals at looser thresholds; no UI surface consumes them).
+**Where:** new sidebar tab parallel to News.
+
+**The gap.** The signal detector already produces a "watchlist" tier with
+looser eligibility floors:
+- `WATCHLIST_MIN_TRADER_COUNT = 2` (vs 5 for official)
+- `WATCHLIST_MIN_AGGREGATE_USDC = $5,000` (vs $25,000 for official)
+- Same direction skew floors
+
+Watchlist rows are persisted to `watchlist_signals` and there's a crud
+helper `list_watchlist_signals(mode, category, top_n)` reading them. But
+nothing in the UI shows them. Pre-signal markets — markets where smart
+money is starting to build but hasn't yet hit the official floor — are
+exactly the kind of thing you'd want to know about, since they might
+fire the next 10-min cycle.
+
+**The fix.** New sidebar tab "Watchlist" -> new WatchlistPage component.
+- Backend: existing `list_watchlist_signals` exposed via new route
+  `GET /signals/watchlist?mode=&category=&top_n=`. Same enrichment as
+  `/signals/active` (market_question, category, current_price).
+- UI: same SignalCard layout as dashboard, with a `WATCHLIST` chip and
+  "X traders below the official floor" subtitle. Sortable.
+- 60s auto-poll while mounted (same cadence as Dashboard).
+
+**Scope:** ~30 lines backend (route only — crud + detection logic
+already exist), ~100 lines frontend (new page component, reuses SignalCard).
+
+**Why this is the cheapest win on the list.** Most of the work already
+shipped — this is just exposing data that's already being computed and
+persisted on every refresh cycle.
+
+---
+
+### NEW — Per-trader recent trades + entry timestamps on open positions
+
+**Severity:** C (missing functionality — when you open TraderModal you
+see snapshot positions only, no fill timestamps or what they're trading
+right now).
+**Where:** TraderModal, new endpoint + new section + inline timestamp on
+open positions table.
+
+**The gap.** Two related blind spots:
+1. **No actual entry timestamps on open positions.** The "Open positions"
+   table shows size, avg price, current value, PnL — but no "when did
+   they buy this." The DB has `positions.first_seen_at` (when our
+   scheduler first observed the position), but that's biased late by up
+   to one snapshot interval. Worse, it doesn't tell you anything about
+   whether the position was opened weeks ago or 30 minutes ago.
+2. **No view of recent activity.** You can't see what a trader is
+   *currently doing* — only what positions they currently hold. A
+   trader who just opened 5 new positions in the last hour vs a trader
+   who hasn't traded in 2 weeks look identical in TraderModal today.
+
+**The design — lazy fetch with server cache.**
+
+Single new backend endpoint `GET /traders/{wallet}/recent_trades?limit=100`.
+- Backend route handler:
+  1. Check 5-min in-process cache keyed on wallet address.
+  2. On hit, return cached trades.
+  3. On miss, fetch from Polymarket data-api `/trades?proxy_wallet=...&limit=...`,
+     cache, return.
+- Pull-only design: no scheduled job, no background polling. The endpoint
+  only fires when the user opens TraderModal.
+
+**Why lazy not continuous.** Continuous tracking would mean polling
+trades for all 50-100 tracked wallets on every refresh cycle = 300-600
+extra Polymarket calls per hour, plus storage, plus a diff/dedup layer.
+Lazy tops out at ~30-50 distinct traders per heavy session, hard-capped
+by the 5-min server cache. Less than 3% extra Polymarket traffic vs the
+existing scheduler load.
+
+**UI consumers — both powered by the same single fetch:**
+
+- **Inline entry timestamps on Open Positions table.** For each row,
+  scan trades for the first BUY matching `(condition_id, direction)`.
+  Show as "entered 3h ago · $0.45" replacing the imprecise
+  `first_seen_at` value. Falls back to `first_seen_at` if no matching
+  trade is found in the last 100 trades (very old positions).
+- **New "Recent activity" section in TraderModal.** Shows the trader's
+  recent fills sorted newest-first as compact rows
+  ("BUY YES · $0.45 · 12k contracts · Manchester United · 3h ago").
+  Click a row -> opens MarketView for that condition_id+direction.
+
+**Scope:** ~50 lines backend (route + cache), ~150 lines frontend
+(extend TraderModal, new RecentTradesSection component).
+
+**Out of scope:** cross-trader comparison view, trade aggregation per
+market (single-fill display for V1), saved/exportable per-trader history.
+
+---
+
+### Event-level grouping V1.1 — per-trader match book in TraderModal
+
+**Status:** deferred (V1 shipped 2026-05-09).
+**Where:** TraderModal positions section.
+
+V1 (event header strip on the dashboard) shipped. V1.1 is the natural
+follow-up that closes the "is this trader actually winning or losing on
+this match overall" question — currently if you click a wallet from the
+Cagliari card you see only Cagliari positions; click from the Udinese
+card you see only Udinese positions, and you have to manually add them
+up to see real match exposure.
+
+**Spec (unchanged from V1 doc):**
 - When a trader has positions on multiple children of the same event,
   add a **"Match book · Cagliari vs Udinese"** section in TraderModal
   showing all positions across all linked children, with:
@@ -95,21 +205,20 @@ V1.1 (modal-only change, no dashboard impact):
     −3.6%").
 - Detection: query positions for `proxy_wallet` joined to `markets` →
   `events`, group by `event_id`, surface groups with 2+ children.
-- Modal-only change — the trader-modal currently fetches per-wallet
-  data; just add the event-grouping pass on the response. Doesn't
-  affect any other view.
 
-This makes the "is this trader actually winning or losing on this match
-overall" question answerable at a glance. Currently the answer can be
-*opposite-direction* from what either single-child position shows
-(e.g., Cagliari +3% vs Udinese −25% nets to roughly −4% overall — very
-different feel from either piece in isolation).
+Modal-only change. Pick this up once V1 has been in use long enough to
+confirm the format is the right one.
 
-#### Backtest implications — note for V2 / future
+---
 
-Backtest math is currently keyed on (condition_id, direction). When we
-start placing real-money trades on event-grouped signals, this becomes
-a real correctness issue:
+### Backtest event-level signal attribution (V2)
+
+**Status:** deferred (correctness issue, not a blocker until real money is
+on the line).
+
+Backtest math is currently keyed on (condition_id, direction). The
+event-grouping work surfaces a real correctness issue once event-level
+trading becomes a thing:
 
 - A "Udinese wins" thesis expressed via two children (NO Cagliari +
   YES Udinese) gets recorded as **two independent signals** in
@@ -117,332 +226,15 @@ a real correctness issue:
   attributions in the backtest. Statistically these are correlated
   outcomes — one underlying bet — so the backtest's effective sample
   size, win rate variance, and CIs all overstate confidence.
-- The cleanest fix is event-level signal attribution (one signal_log
-  row per (event_id, outcome) instead of per (condition_id, direction)).
-  That's a schema migration + backtest engine rework — too heavy for
-  V1.
-- Lighter-weight V1.5 option: add a nullable `thesis_id` column on
+- Cleanest fix: event-level signal attribution (one signal_log row per
+  (event_id, outcome) instead of per (condition_id, direction)).
+  Schema migration + backtest engine rework — too heavy until real
+  trades depend on it.
+- Lighter-weight V1.5 option: nullable `thesis_id` column on
   `paper_trades` so the user (or a heuristic) can mark "this is the
   same thesis as paper trade #N." Backtest can then group by thesis_id
   when computing performance, deduping correlated trades. Doesn't
   touch signal_log; opt-in tagging.
-
-Deferred for now, but flagged so it doesn't get rediscovered the hard
-way once event-level trading becomes a thing.
-
-#### Out of scope (V2+)
-
-- Per-outcome grid in the event header (Cagliari wins / Draw /
-  Udinese wins with smart money per outcome).
-- "Best child to trade" hint at order time.
-- Multi-trade dedup at place-trade time ("you're already on this
-  thesis via paper trade #N — confirm?").
-- Methodology work for properly combining NO-A + YES-B payoff matrices
-  in the aggregate USDC display.
-
-**Priority:** medium-high. V1 is small and removes a real source of
-confusion (today's Cagliari/Udinese case). V1.1 follows naturally and
-is the single biggest "useful new info" once V1 ships. Both are
-low-risk; backtest tagging can wait until real money is on the line.
-
----
-
-### NEW — Live sports timer + score on signal cards (Tier 2)
-
-**Severity:** D (UX enhancement — current state shows only `closes 2026-05-09`,
-not whether the match is pre-game / live / over)
-**Where:** new backend service + new endpoint + chip on SignalCard
-([dashboard.jsx:152-166](ui/dashboard.jsx:152))
-
-**The gap.** Sports signals show a market resolution date but no live-game
-context. The Liverpool–Chelsea (1-1, 90') and Manchester United examples
-made this concrete: when you're considering a trade, knowing whether the
-match is at kickoff, half-time, 78 minutes in, or over is *the* most
-important context for sports markets, and the dashboard shows none of it.
-Currently the only way to find out is leaving the app and Googling.
-
-**The feature.**
-- Detect that a market is sports (`category === 'sports'`).
-- Look up the underlying fixture from a free sports data API.
-- Surface as a chip on the SignalCard, e.g. `⚽ LIVE · 43' · 1-1` or
-  `⚽ KICKOFF in 2h 14m` or `⚽ FT · 1-2`.
-- If the lookup fails (no fixture match, API down, unsupported sport),
-  silently omit the chip — falling back to the current behavior is fine.
-  User has explicitly accepted partial coverage as acceptable.
-
-**API choice.** Three plausible free options to evaluate:
-- **ESPN hidden API** (no auth, JSON endpoints). Comprehensive coverage
-  across major leagues; unofficial, so could break without notice.
-- **TheSportsDB** (free, public). Solid for major football leagues + NBA +
-  NFL; lighter live-data freshness than ESPN.
-- **football-data.org** (free tier, 10 req/min with API key). Cleaner
-  contract, narrower scope (mostly European football).
-
-Recommend ESPN as the primary with TheSportsDB as a fallback for soccer-
-specific gaps. Build the service with a swappable provider interface so
-we can change providers without touching call sites.
-
-**Backend sketch.**
-- New service: `app/services/sports_meta.py`
-  - `async def lookup_fixture(market_question: str, end_date: date)
-     -> FixtureStatus | None`
-  - Internal regex parses `Will <Team> win on YYYY-MM-DD?` pattern (most
-    common format). Falls back to fuzzy team-name match against the day's
-    fixture list.
-  - Returns `FixtureStatus(league, kickoff_at, status, current_minute,
-    home_team, away_team, home_score, away_score)` or `None` on no match.
-- New endpoint: `GET /markets/{condition_id}/live_status`
-  - Returns `FixtureStatus` JSON or 404 if no fixture detected.
-  - Cache hot — live state can change minute-by-minute but doesn't need
-    sub-30s freshness for our purpose. 60s in-memory cache per
-    `condition_id` is plenty.
-- Cache the *fixture mapping* (condition_id → fixture_id) much longer
-  (24h) — it's stable per market.
-
-**UI integration.**
-- New component `LiveSportsChip` on SignalCard, only rendered when
-  `category === 'sports'` and `/markets/{cid}/live_status` returns 200.
-- States to render:
-  - **Pre-game**: `⚽ KICKOFF in {countdown}` — small green chip
-  - **Live**: `⚽ LIVE · {minute}' · {home_score}-{away_score}` — pulsing
-    accent color, refreshes every 60s while card is mounted
-  - **Half-time**: `⚽ HT · {score}` — amber chip
-  - **Full-time / over**: `⚽ FT · {score}` — neutral chip; signal is
-    effectively done
-- Add a small refresh tick: when card is in the viewport, re-fetch live
-  status every 60s. When off-screen, stop polling. (IntersectionObserver
-  pattern.)
-
-**Known limitations the user has accepted up front:**
-- Cup ties / multi-leg ties / friendlies might miss the regex/match.
-- Sports outside major leagues (e-sports, niche cricket leagues, etc.)
-  unlikely to be matched by the chosen providers.
-- Markets with non-standard question phrasing ("Will the home team
-  cover -1.5?" or aggregated season props) won't map to a single fixture
-  and should silently omit the chip.
-- Live data has a 30-90s lag from real time on most free APIs. Not a
-  problem for our use case; we're not running a live trading desk.
-
-**Out of scope for V1 of this feature:**
-- Tier 3 deep integration (persistent live feed, min-by-min chart
-  overlay, score timeline). Save for later if/when sports trading
-  becomes the primary use case.
-- Non-sports time context (e.g., countdown for a political market).
-  Could be added separately as a Tier 1 "closes in X" chip — trivial
-  since `end_date` is already on every market — but not bundled here.
-- Multi-match aggregation chips (e.g., a tournament-winner market that
-  depends on multiple games today). Way more complex; punt.
-
-**Priority:** medium. Cosmetic in the strict sense, but for sports
-specifically this changes the trading-decision quality more than any
-other UI improvement on the open list.
-
----
-
-### NEW — News tab: two-card activity + lost-signals view
-
-**Severity:** C (missing functionality — backend data exists, no UI consumes it)
-**Where:** new sidebar route `news`, new page component, plus a small new
-backend endpoint for the lost-signals query
-
-**The gap.** Two related blind spots in the current UI:
-
-1. **Silent exits below the floor.** The exit detector writes to `signal_exits`
-   whenever a fired signal sees ≥25% drop in `trader_count` or `aggregate_usdc`
-   (TRIM, amber) or ≥50% (EXIT, red — also auto-closes any open paper trades).
-   The dashboard surfaces these inline via the `exit-banner` *only while the
-   signal is still in `/signals/active`*. The moment the drop pushes the
-   signal below any eligibility floor —
-   - `trader_count >= 5` ([signal_detector.py:34](app/services/signal_detector.py:34))
-   - `aggregate_usdc >= $25k` (`MIN_AGGREGATE_USDC`)
-   - `|YES − NO| / total >= 0.6` (`MIN_NET_DIRECTION_SKEW`)
-   - positions refreshed within last 20 min
-
-   — the signal disappears from the live feed, taking its banner with it. By
-   construction the worst exits are the ones the dashboard hides.
-
-2. **Rolled-off signals you had a paper trade on.** If you placed a paper
-   trade on a signal and that signal later rolled off (market resolved,
-   smart money left, headcount fell), there's currently no surface that says
-   "your trade's underlying signal is gone — here's what happened." The
-   trade lives in Paper Portfolio, the resolution status flips eventually,
-   but the *story* of how the signal died is invisible. Concrete case
-   2026-05-09: user placed a paper trade on the Manchester United market,
-   match ended, all sports signals rolled off, no way to see what happened
-   to any of them from the dashboard.
-
-**The feature — a News page with two cards.**
-
-#### Card A — "What's happening" (recent activity feed)
-
-Newest-first stream of notable events across the system. One row per event:
-
-- **New signal fired** — a signal that wasn't in the active feed before
-  (`first_fired_at` within window). Chip: `NEW SIGNAL` (green).
-- **Smart money trim** — `signal_exits.event_type = 'trim'`. Chip:
-  `TRIM` (amber) + drop summary.
-- **Smart money exit** — `signal_exits.event_type = 'exit'`. Chip:
-  `EXIT` (red) + drop summary. Includes auto-close mention if the user
-  has an affected paper trade.
-- **Paper trade auto-resolved** — your trade just closed via the daily
-  resolution job. Chip: `RESOLVED` + final P&L.
-- **Whale fill** — when the whale-detector ships, fills bigger than #2
-  position threshold show up here. Chip: `⚡ WHALE +$X`.
-
-Each row shows market question, direction, time-ago, and the relevant
-metric delta. Click through to the relevant view (signal still active →
-dashboard scroll-and-highlight; signal rolled off → market modal).
-
-#### Card B — "Lost signals" (rolled-off in the last X hours)
-
-Signals that *were* in `/signals/active` but aren't anymore, sorted by when
-they disappeared (most recent first). One row per lost signal:
-
-- **Market question + direction** — same compact format as a SignalCard.
-- **Last seen** — `tsAgo(last_seen_at)`.
-- **Peak stats** — `peak_trader_count`, `peak_aggregate_usdc`, last
-  recorded `current_price`.
-- **Best-guess "why" label** — derived server-side from signal_log +
-  markets + signal_exits state. Detection rules:
-  - `markets.resolved_outcome != null` → `Market resolved {OUTCOME}`
-  - `markets.closed = true` (no resolved_outcome yet) → `Market closed`
-  - Recent `signal_exits` row with `event_type='exit'` → `Smart money exited`
-  - Recent `signal_exits` row with `event_type='trim'` (and now off feed)
-    → `Trimmed below floor`
-  - `current_price > 0.97` or `< 0.03` and end_date passed → `Effectively
-    resolved` (UMA-pending case from the related doc item)
-  - Otherwise → `No longer firing` (honest unknown)
-- **⚠ Open paper trade chip** — if the user has any open paper trade on
-  this `(condition_id, direction)`, bubble the row to the top of Card B
-  with a warning chip. Click → opens the market modal with both the lost-
-  signal context and the paper trade row.
-- **View market button** — opens MarketView modal so the user can drill
-  into last tracked positions, signal history, and (when we have it)
-  resolution outcome.
-
-#### Click-through behavior
-
-- **Card A row, signal still active**: route to `dashboard`, scroll to
-  and briefly highlight the matching SignalCard (match by `signal_log_id`).
-  Border-pulse animation for ~2s.
-- **Card A row, signal rolled off**: open MarketView modal for the
-  `condition_id` + `direction`. Pin the relevant context (exit banner,
-  resolution status, etc) at the top.
-- **Card B row**: always opens MarketView modal — the signal isn't in
-  the dashboard to scroll to.
-
-#### Backend — new endpoint needed
-
-`GET /signals/lost?hours=72` returns the lost-signal list. Query:
-
-1. Take all `signal_log` rows with `last_seen_at >= NOW() - INTERVAL '$hours hours'`.
-2. Filter to those whose `(condition_id, direction)` is **not** in the
-   current `detect_signals()` output for ANY (mode, category, top_n)
-   combination — i.e. genuinely off all feeds, not just the user's
-   current view.
-3. For each, compute the "why" label using the rules above (LEFT JOIN
-   markets for resolved/closed flags, LEFT JOIN signal_exits for recent
-   trim/exit, etc).
-4. Optionally LEFT JOIN paper_trades to flag rows the user has an open
-   trade on (`open_paper_trade_id` per row, null if none).
-
-Existing `/signals/exits/recent` is still used for Card A's trim/exit
-items. New endpoint is for Card B.
-
-#### Filtering / time window
-
-Default 72h window with a small dropdown (24h / 72h / 7d). Anything older
-you find via the market modal directly.
-
-#### Notification badge
-
-Sidebar carries an unread count. State persisted in localStorage
-(`news_last_seen_at`); count = combined new entries across both cards
-since `news_last_seen_at`. Cleared the moment the user opens the page.
-No backend changes needed.
-
-#### Polling
-
-Auto-refresh every 60s while the News tab is mounted. The detection jobs
-run on a 10-min cadence — anything faster is wasted work.
-
-#### Out of scope for V1 of this feature
-
-- Email / push notifications (Resend already wired for daily heartbeat,
-  can extend in V2).
-- Per-row filtering by category / mode / direction.
-- "Mark individual items read" — only the global last-seen marker.
-- Whale-fill events (planned in the separate whale-detector item; merge
-  into Card A once that table exists).
-- Per-trader exit events (right now we surface signal-level exits;
-  individual wallets exiting positions is too noisy for V1).
-
-**Priority:** high. This is the only fix for both the silent-exit case
-*and* the "what happened to my paper trade's signal" question. Backend is
-one new endpoint (~50 lines in crud + route); UI is one new page with two
-list components.
-
----
-
-### NEW — Effectively-resolved markets still firing as active signals
-
-**The gap.** Backend trusts Polymarket's `markets.closed` and
-`markets.resolved_outcome` flags as the only test for "is this market still
-live." But Polymarket sometimes leaves both flags as `false` / `null` for
-weeks after a market is *practically* settled — typically political markets
-waiting on UMA oracle resolution or manual interpretation.
-
-**Concrete example seen 2026-05-09.** "Will the next Prime Minister of
-Hungary be Péter Magyar?" — `end_date: 2026-04-12` (passed ~a month ago),
-`closed: false`, `resolved_outcome: null`, but `current_price: 0.999`
-(everyone agrees YES). 15 wallets still hold $1.2M+ YES exposure. Signal
-detector counts this as live and shows it as a fresh candidate signal
-on the dashboard. There's zero edge — the contracts are redemption
-tickets at this point, no tradeable spread.
-
-**The fix.** In `signal_detector.py`, filter out markets where any of:
-- `current_price > 0.97` or `current_price < 0.03` (price is at the
-  resolution extreme — no tradeable depth, no edge)
-- `end_date < NOW() - INTERVAL '7 days'` (end date long passed,
-  regardless of formal Polymarket flags)
-
-Both can be `AND` or `OR` — the OR version is more aggressive but catches
-more zombie markets. Worth a quick sanity check on a sample of historical
-markets to make sure neither condition false-positives on genuinely-active
-markets near resolution.
-
----
-
-### NEW — "Sort by Freshness" is a no-op for candidate signals
-
-**The gap.** UI sorts by `first_fired_at`:
-
-```js
-fresh: (a,b) => new Date(b.first_fired_at || 0) - new Date(a.first_fired_at || 0)
-```
-
-Candidate signals (top_n ≠ 50) have `first_fired_at = null` → falls back
-to `0` (epoch 1970). When the dashboard shows mostly-or-all candidates
-(any top_n != 50), every comparison returns 0 and the sort degenerates
-to whatever order the API returned. The "Freshness (newest)" sort
-silently does nothing.
-
-**The fix.** Cascade through fallbacks per signal:
-1. `first_fired_at` (when logged)
-2. `last_seen_at` (when logged but first_fired_at missing — shouldn't
-   happen but defensive)
-3. `first_top_trader_first_seen_at` (always populated — earliest moment
-   any tracked trader was seen on this market)
-
-That last field is on every signal regardless of logged/candidate status,
-so it gives candidates a meaningful sort key.
-
-Single-line change in [ui/dashboard.jsx](ui/dashboard.jsx):
-
-```js
-fresh: (a,b) => new Date(b.first_fired_at || b.first_top_trader_first_seen_at || 0)
-              - new Date(a.first_fired_at || a.first_top_trader_first_seen_at || 0),
-```
 
 ---
 
@@ -524,44 +316,9 @@ entity multiple times. Worth checking when this gets investigated:
 
 ---
 
-### NEW — Drop the 30d monthly-leaderboard requirement from Specialist mode
-
-**The gap.** Specialist mode currently requires a wallet to appear in
-Polymarket's `time_period='month'` leaderboard for the category — that's a
-30-day window driven by Polymarket's API. Combined with the all-time
-leaderboard intersection + positive PnL filter + contamination exclusion,
-this leaves only **7-20 specialists per category** (Politics 12, Sports 20,
-Crypto 10, Culture 12, Tech 7, Finance 16). Many otherwise-eligible
-specialists who didn't make Polymarket's tight monthly cut are excluded.
-
-**Current code path.** `_rank_specialist` at
-[app/services/trader_ranker.py:322](app/services/trader_ranker.py:322)
-includes an `active_recently` CTE that filters wallets to those present in
-the latest monthly leaderboard. The base SELECT then joins on this CTE.
-
-**What we already have for recency.** A separate 60-day filter exists at
-the same call site: `last_trade_at >= NOW() - INTERVAL '60 days'` keyed on
-`RECENCY_MAX_DAYS = 60`. It's currently bypassed because
-`trader_category_stats` is `unseeded`, but as soon as the nightly stats
-job runs once, that 60d gate kicks in.
-
-**The fix.** Remove the `active_recently` CTE and its join. The 60d
-last-trade-at gate (already coded) becomes the sole recency check.
-Polymarket only exposes day/week/month/all windows — no 60d option — so
-this is the only path to a 60d effective window without adding a new
-data source.
-
-**Expected impact.** Pool sizes ~doubles per category (rough estimate).
-More headcount per signal, slightly more dilution of "specialty" identity.
-Caveat: only works once `trader_category_stats` is seeded; before that,
-removing the monthly-leaderboard filter would leave Specialist with no
-recency check at all (problematic). Solution: either gate this change
-on `stats_freshness.seeded = true`, or run the seed job manually before
-shipping.
-
----
-
 ### NEW — Windowed ROI for Specialist ranking (improves top-end quality)
+
+**Status:** deferred — heavy data dependency.
 
 **The gap.** Specialist mode ranks by Bayesian-shrunk ROI = `pnl / vol`
 computed over **all-time** category volume. A trader with 3 years of
@@ -589,9 +346,9 @@ The trades-table path is cleaner but requires a backfill job to ingest
 historical trades for all top traders.
 
 **Why this is the lever for "top of ladder feels weak."** The
-recency-loosening item above expands the POOL (more wallets); this item
-improves RANKING WITHIN the pool (better top-end). They're independent
-and complementary.
+recency-loosening (Specialist 30d-leaderboard drop, shipped 2026-05-09)
+expanded the POOL (more wallets); this item improves RANKING WITHIN the
+pool (better top-end). They're independent and complementary.
 
 **Out of scope for V1 of this feature:**
 - Letting users pick the window length per query (cohort design choice
@@ -601,53 +358,9 @@ and complementary.
 
 ---
 
-### NEW — Heal job for stale `signal_entry_source = 'unavailable'` rows
-
-**The gap.** When a signal first fires, the system tries once to capture
-the at-fire-time CLOB book. If that fetch fails (book empty, network blip,
-crossed/locked book), the row is marked `signal_entry_source = 'unavailable'`
-and the entry-pricing fields stay null forever. There's no retry job.
-
-**Current scale.** 6 of 23 active signals (26%) are in this state. All 6
-fired on 2026-05-04 — system launch day, when CLOB capture was patchy.
-
-**Why it's not just cosmetic.** A signal with null `signal_entry_offer`
-gets silently excluded from every backtest calculation that touches entry
-math:
-- Gap-to-smart-money (formula needs entry_offer ÷ smart_money_avg)
-- Latency profiles (1-3min / 5-10min / 12-20min / 30-60min — simulate
-  late-entry pricing starting from entry_offer)
-- Half-life convergence (the +5/+15/+30/+60/+120 min table)
-- Win rate, profit factor, mean PnL/$ (backend explicitly filters
-  `signal_entry_source != 'unavailable'` —
-  [app/services/backtest_engine.py:703](app/services/backtest_engine.py:703))
-
-So 26% of signals contribute zero to the backtest. The remaining 74% are
-self-selected to whichever signals happened to fire during a healthy
-CLOB window — sample bias.
-
-**The fix.** New scheduler job, every ~30 min:
-1. `SELECT id, condition_id, direction FROM signal_log
-    WHERE signal_entry_source = 'unavailable'`
-2. For each, call the existing `_capture_book_for_signal` again.
-3. If the book is now reachable, the existing UPDATE path
-   ([app/db/crud.py:1784](app/db/crud.py:1784)) writes the real
-   entry_offer / liquidity_tier / spread fields and flips source to
-   `clob_l2`.
-4. If still unreachable, leave the row alone and try again next cycle.
-
-Pure backend, ~40 lines in `app/scheduler/jobs.py`. No UI changes —
-the dashboard's existing rendering paths (entry offer, gap, etc.) already
-populate from these fields.
-
-**Why "every ~30 min" not faster.** Each job iteration costs one CLOB
-HTTP call per stale signal. With 6 stale rows that's nothing, but as
-signal_log grows we don't want to hammer Polymarket. Once a row heals
-it leaves the pool; pool size is naturally bounded.
-
----
-
 ### NEW — Whale-fill detector on active-signal markets
+
+**Status:** deferred — separate session-sized feature.
 
 **The gap.** Current detector is steady-state — counts top-50 traders on a
 side and their aggregate. Doesn't catch a single big new bet. A whale could
@@ -690,46 +403,140 @@ need to maintain a wallet-cache or scan all holders.
 - Identifying new whales by name (their `user_name` may be null if they're
   not classified — UI falls back to the address).
 
----
-
-### NEW — Load flicker: mock signals briefly visible before live data arrives
-
-**Severity:** D (cosmetic)
-**Where:** [ui/dashboard.jsx](ui/dashboard.jsx) — `useApi('/signals/active', { signals: PB.SIGNALS })` and a few other call sites
-
-**Problem.** `useApi(path, mock)` initializes state with the mock data so the
-UI has something to render during the in-flight fetch. On first paint of the
-Dashboard you see fake signals like "Will Bitcoin hit $200k by end of 2026?",
-"Will the Lakers make the 2026 NBA Finals?" with smart-money trimming
-banners — for ~1 second until the real `/signals/active` response replaces
-them. Same pattern in TopTradersPanel, TraderModal, Sidebar pill, Backtest
-metrics: mock data flashes during initial load.
-
-**Fix.** Pass `null` (not the mock) as the second arg to `useApi` for any
-endpoint that's expected to be reachable. The tradeoff: no offline fallback,
-but the app never lies on first paint. If we want to keep offline support,
-add a `loading` gate before rendering rows so the empty state shows instead
-of mock during the first fetch.
-
-**Priority:** medium. Cosmetic flicker, but undermines trust on every page
-load.
-
----
-
-### #22 (was) — Insider Wallets — only Add and Delete; cannot edit label or notes
-
-**Severity:** C (missing functionality)
-**Where:** [ui/testing.jsx](ui/testing.jsx) — `InsiderWallets`
-
-**Problem.** Once a wallet is added, you can't edit its label or notes
-without deleting and re-adding. Backend only has POST/GET/DELETE; no PATCH.
-
-**Fix.** Either ship a PATCH endpoint and edit-in-place affordance, or
-accept the delete + re-add workflow as the design.
+When this lands, merge into News tab Card A as a `⚡ WHALE +$X` row.
 
 ---
 
 ## Completed
+
+### ~~Live sports timer + score on signal cards (Tier 2)~~  *(2026-05-09)*
+
+ESPN scoreboard provider in [app/services/sports_meta.py](app/services/sports_meta.py)
+fuzzy-matches market questions ("Will Cagliari win on 2026-05-09?")
+against the day's fixture list across 10 soccer leagues + NBA / NFL /
+MLB / NHL. New endpoint `GET /markets/{condition_id}/live_status`
+returns `{state, kickoff_at, home_team, away_team, home_score,
+away_score, current_minute, ...}`. Cache: 24h for fixture mapping per
+condition_id, 60s for live status per fixture_id.
+
+UI: `LiveSportsChip` in [ui/dashboard.jsx](ui/dashboard.jsx) renders
+above each sports SignalCard. States: `KICKOFF in Xh Ym` (pre),
+`LIVE · 43'` or `LIVE · 1-1` (in-game), `HT · 1-1`, `FT · 2-1`. Polls
+every 60s with IntersectionObserver gating — observer pauses when
+card scrolls off-screen and re-fetches on re-entry. Silently omits
+the chip when ESPN returns no match; user explicitly accepted partial
+coverage.
+
+### ~~Event-level grouping V1 — header strip~~  *(2026-05-09)*
+
+`/signals/active` already exposed `event_id` per signal (it's on the
+Signal dataclass). New `EventHeader` component in
+[ui/dashboard.jsx](ui/dashboard.jsx) is rendered immediately above 2+
+child signals that share an event_id. Shows:
+- Child-signal count
+- Deduped smart-money headcount (union of `contributing_wallets`
+  across children — the same wallet on both children counts once)
+- Aggregate sum across children with the overstatement caveat
+- Primary thesis chip when 70%+ of aggregate aligns with one direction
+
+Singletons render unchanged. V1.1 (per-trader match book in
+TraderModal) and V2 (backtest event-level attribution) deferred —
+see Open.
+
+### ~~News tab — two-card activity + lost-signals view~~  *(2026-05-09)*
+
+New backend endpoint `GET /signals/lost?hours=72` in
+[app/api/routes/signals.py](app/api/routes/signals.py) — returns signals
+that fired in the last 72h but stopped firing on every (mode, category,
+top_n) combo. Each row carries a "why" label (Market resolved /
+Effectively resolved / Smart money exited / Trimmed below floor /
+No longer firing) computed server-side from markets + signal_exits +
+recent positions state. Open paper trades on a (cid, direction) are
+flagged via `open_paper_trade_id`.
+
+New page in [ui/news.jsx](ui/news.jsx):
+- **Card A** "What's happening" — recent trim/exit events from
+  `/signals/exits/recent?hours=72`, sorted newest-first
+- **Card B** "Lost signals" — rolled-off signals with the why label,
+  bubbled to top when there's an open paper trade. Click-to-dismiss
+  individual rows (localStorage); 3-day auto-purge happens naturally
+  via the `?hours=72` default
+- Sidebar badge counts unread items vs `news_last_seen_at` localStorage;
+  cleared whenever the user opens the page (and stays cleared while
+  they're on it, even as new items poll in)
+- 60s auto-poll while mounted; one shared poll for both Sidebar badge
+  and NewsPage to avoid double-fetching
+
+### ~~Effectively-resolved markets still firing as active signals~~  *(2026-05-09)*
+
+Filter added in [app/services/signal_detector.py](app/services/signal_detector.py)
+`pool_positions` CTE: drops markets where `end_date < NOW() - 7 days` OR
+`cur_price` is outside `[0.02, 0.92]`. Caught the Hungary Magyar PM case
+(price 0.999, end_date a month past, formal `closed=false`). Both sides
+of a binary fail the price filter together (YES at 0.99 ↔ NO at 0.01),
+so no asymmetric removal. Lost signals so filtered out show up under News
+tab Card B with the "Effectively resolved" why label.
+
+### ~~"Sort by Freshness" no-op for candidate signals~~  *(2026-05-09)*
+
+[ui/dashboard.jsx](ui/dashboard.jsx) `fresh` sort comparator now cascades
+through `first_fired_at → last_seen_at → first_top_trader_first_seen_at`
+so candidate signals (top_n != 50, where `first_fired_at` is null) get
+a meaningful sort key.
+
+### ~~Drop 30d monthly-leaderboard requirement from Specialist mode~~  *(2026-05-09)*
+
+[app/services/trader_ranker.py](app/services/trader_ranker.py)
+`_rank_specialist`: the `active_recently` (monthly leaderboard presence)
+filter is now bypassed when `trader_category_stats` is seeded AND fresh,
+falling back to the existing F9 60-day `last_trade_at` gate as the sole
+recency check. Defensively keeps the old filter active when stats are
+unseeded so Specialist never runs without ANY recency check. Pool size
+roughly doubles per category once the nightly stats job has run.
+
+### ~~Heal job for stale `signal_entry_source = 'unavailable'` rows~~  *(2026-05-09)*
+
+New scheduler job `heal_unavailable_signal_books` in
+[app/scheduler/jobs.py](app/scheduler/jobs.py), wired in
+[app/scheduler/runner.py](app/scheduler/runner.py) on a 30-min interval.
+Re-fetches the CLOB book for any `signal_log` row stuck on
+`signal_entry_source = 'unavailable'`; if the book is now reachable,
+writes the real entry_offer / liquidity_tier / spread fields and flips
+source to `clob_l2`. If still unreachable, leaves the row alone for the
+next pass.
+
+### ~~Insider Wallets — edit label / notes in place~~  *(2026-05-09)*
+
+New `PATCH /insider_wallets/{proxy_wallet}` endpoint with a true UPDATE
+(no COALESCE — passing NULL clears the field). New
+`update_insider_wallet` crud helper. UI:
+[ui/testing.jsx](ui/testing.jsx) `InsiderWallets` got an "edit" button per
+row that opens a styled modal pre-filled with the current label/notes;
+saving sends both fields via `apiPatch` (new helper in shared.jsx).
+
+### ~~Startup catch-up for position refresh~~  *(2026-05-09)*
+
+`lifespan_scheduler` (and `run_forever`) in [app/scheduler/runner.py](app/scheduler/runner.py)
+now spawn a non-blocking `_startup_position_refresh` task immediately
+after `scheduler.start()`. Without this, the 10-min interval waited a
+full cycle on startup so data stayed stale up to 10 minutes after a
+sleep+resume or restart. `max_instances=1` on the scheduled job
+prevents racing the next regular tick.
+
+### ~~Load flicker: mock signals briefly visible before live data arrives~~  *(2026-05-09)*
+
+`useApi(path, mock)` was initializing state with the mock so first paint
+flashed fake signals (Bitcoin $200k, Lakers NBA Finals, etc.) before the
+real fetch resolved. Reworked so initial state is `data: null,
+source: 'pending'` and mock is only used as offline-fallback when fetch
+errors. Components updated to render loading shells instead. Closed in
+commit 6cc5677.
+
+### ~~NEW — Duplicate React key warning in TrackedPositionsTable~~  *(2026-05-08)*
+
+When a single wallet has positions on both YES and NO sides of the same
+market (hedged), `key={r.proxy_wallet}` collided. Changed to
+`key={r.proxy_wallet}-${r.outcome}}`. Console warning gone.
 
 ### ~~#1 — Manual close button for paper trades~~  *(2026-05-08)*
 
@@ -833,12 +640,6 @@ shows "Insufficient data — only 0 of 6 weeks captured."
 Resolved as part of the trade-panel rewrite. The `n_adjusted=0 ·
 n_fallback=N` line still renders with the chip beneath; left as-is since
 it's adjacent to the latency selector and self-explanatory in context.
-
-### ~~NEW — Duplicate React key warning in TrackedPositionsTable~~  *(2026-05-08)*
-
-When a single wallet has positions on both YES and NO sides of the same
-market (hedged), `key={r.proxy_wallet}` collided. Changed to
-`key={r.proxy_wallet}-${r.outcome}}`. Console warning gone.
 
 ---
 

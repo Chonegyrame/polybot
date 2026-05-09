@@ -223,6 +223,104 @@ async def get_recent_exits(
     }
 
 
+def _why_label_for_lost(row: dict[str, Any]) -> tuple[str, str | None]:
+    """Returns (label, detail) — best-guess explanation for why a signal
+    rolled off the active feed. Order matters: most-specific first.
+
+    Heuristic, not authoritative — labels are derived server-side from
+    markets/exit/position state at query time, so they update as the world
+    changes (a signal labelled "No longer firing" today may flip to "Market
+    resolved YES" once the resolution lands).
+    """
+    if row.get("resolved_outcome"):
+        return (f"Market resolved {row['resolved_outcome']}",
+                "settlement complete; redemption only")
+    if row.get("market_closed"):
+        return ("Market closed", "no longer accepting trades")
+    cur = row.get("recent_cur_price")
+    if cur is not None and (cur > 0.92 or cur < 0.02):
+        return ("Effectively resolved",
+                f"price sat at ${cur:.2f}; no tradeable depth left")
+    end_date = row.get("end_date")
+    if end_date is not None:
+        from datetime import datetime, timezone, timedelta
+        if end_date < datetime.now(timezone.utc) - timedelta(days=7):
+            return ("Effectively resolved",
+                    "end date passed >7 days ago; awaiting formal resolution")
+    last_exit_type = row.get("last_exit_event_type")
+    if last_exit_type == "exit":
+        return ("Smart money exited",
+                "trader headcount or aggregate USDC dropped >=50%")
+    if last_exit_type == "trim":
+        return ("Trimmed below floor",
+                "trader headcount or aggregate USDC dropped >=25%; signal then fell off")
+    return ("No longer firing", "trader/aggregate dropped below detection floors")
+
+
+@router.get("/lost")
+async def get_lost_signals(
+    hours: int = Query(72, ge=1, le=168, description="Look-back window in hours; default 3 days"),
+    limit: int = Query(200, ge=1, le=500),
+    conn: asyncpg.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Signals that fired within the look-back window but stopped firing on
+    every (mode, category, top_n) combo. Powers the News tab Card B.
+
+    The default 72h window also serves as the "auto-purge" mechanism — older
+    signals fall out of the result set naturally, so dismissed-but-not-yet-
+    purged items will disappear after 3 days even if the user never returns
+    to the page. Client-side dismissal lives in localStorage; this endpoint
+    makes no backend write.
+    """
+    rows = await crud.list_lost_signals(conn, hours=hours, limit=limit)
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        why_label, why_detail = _why_label_for_lost(r)
+        out.append({
+            "signal_log_id": r["signal_log_id"],
+            "condition_id": r["condition_id"],
+            "direction": r["direction"],
+            "market_question": r["market_question"],
+            "market_slug": r["market_slug"],
+            "market_category": r["market_category"],
+            "event_id": r["event_id"],
+            "first_fired_at": (
+                r["first_fired_at"].isoformat()
+                if r["first_fired_at"] is not None else None
+            ),
+            "last_seen_at": (
+                r["last_seen_at"].isoformat()
+                if r["last_seen_at"] is not None else None
+            ),
+            "peak_trader_count": r["peak_trader_count"],
+            "peak_aggregate_usdc": r["peak_aggregate_usdc"],
+            "smart_money_entry_price": r["smart_money_entry_price"],
+            "signal_entry_offer": r["signal_entry_offer"],
+            "recent_cur_price": r["recent_cur_price"],
+            "market_closed": r["market_closed"],
+            "resolved_outcome": r["resolved_outcome"],
+            "end_date": (
+                r["end_date"].isoformat()
+                if r["end_date"] is not None else None
+            ),
+            "last_exit_event_type": r["last_exit_event_type"],
+            "last_exit_at": (
+                r["last_exit_at"].isoformat()
+                if r["last_exit_at"] is not None else None
+            ),
+            "open_paper_trade_id": r["open_paper_trade_id"],
+            "why_label": why_label,
+            "why_detail": why_detail,
+        })
+
+    return {
+        "window_hours": hours,
+        "count": len(out),
+        "lost_signals": out,
+    }
+
+
 @router.get("/{signal_log_id}/contributors")
 async def get_signal_contributors(
     signal_log_id: int,

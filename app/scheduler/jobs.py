@@ -1650,6 +1650,115 @@ async def record_signal_price_snapshots() -> PriceSnapshotResult:
     )
 
 
+@dataclass
+class HealEntrySourceResult:
+    candidates_evaluated: int
+    healed_clob_l2: int
+    still_unavailable: int
+    failures: list[tuple[int, str]] = field(default_factory=list)
+    duration_seconds: float = 0.0
+
+
+async def heal_unavailable_signal_books() -> HealEntrySourceResult:
+    """Retry CLOB book capture for signals stuck on signal_entry_source='unavailable'.
+
+    When a signal first fires and the at-fire-time book capture fails (book empty,
+    network blip, crossed/locked book), the row is left with a NULL entry_offer
+    and source='unavailable' forever -- no retry path. The backtest engine then
+    silently excludes those rows (see backtest_engine.py:703), biasing the sample
+    to whichever signals fired during a healthy CLOB window.
+
+    This job retries the capture every ~30 min. Once a row heals it leaves the
+    candidate pool, so cost is naturally bounded by how many failed-at-fire rows
+    are still alive on the active feed.
+    """
+    started = datetime.now(timezone.utc)
+    log.info("=== heal_unavailable_signal_books ===")
+
+    candidates_evaluated = 0
+    healed_clob_l2 = 0
+    still_unavailable = 0
+    failures: list[tuple[int, str]] = []
+
+    pool = await init_pool(min_size=1, max_size=2)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, condition_id, direction
+            FROM signal_log
+            WHERE signal_entry_source = 'unavailable'
+            ORDER BY first_fired_at DESC
+            """
+        )
+    log.info("  %d signal_log row(s) flagged 'unavailable'", len(rows))
+
+    if not rows:
+        duration = (datetime.now(timezone.utc) - started).total_seconds()
+        return HealEntrySourceResult(
+            candidates_evaluated=0, healed_clob_l2=0, still_unavailable=0,
+            failures=[], duration_seconds=duration,
+        )
+
+    async with PolymarketClient() as pm:
+        for r in rows:
+            candidates_evaluated += 1
+            sid = int(r["id"])
+            cid = r["condition_id"]
+            direction = r["direction"] or "YES"
+
+            # Token lookup -- short-lived conn; release before HTTP.
+            async with pool.acquire() as conn:
+                yes_token, no_token = await crud.get_market_clob_tokens(conn, cid)
+            token_id = yes_token if direction == "YES" else no_token
+            if not token_id:
+                still_unavailable += 1
+                continue
+
+            try:
+                book = await pm.get_orderbook(token_id)
+            except Exception as e:  # noqa: BLE001
+                log.warning("  book fetch raised for sid=%s token=%s: %s",
+                            sid, token_id[:12], e)
+                failures.append((sid, repr(e)))
+                still_unavailable += 1
+                continue
+
+            metrics = compute_book_metrics(book, direction)
+
+            # Skip the write if the book is still unavailable -- leave the row
+            # alone so the next pass tries again. Only write when we actually
+            # have something better to record.
+            if not getattr(metrics, "available", False):
+                still_unavailable += 1
+                continue
+
+            async with pool.acquire() as conn:
+                try:
+                    await crud.persist_book_snapshot_and_pricing(
+                        conn, sid, token_id, direction, metrics
+                    )
+                    healed_clob_l2 += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("  persist failed for sid=%s: %s", sid, e)
+                    failures.append((sid, repr(e)))
+                    still_unavailable += 1
+
+    duration = (datetime.now(timezone.utc) - started).total_seconds()
+    log.info(
+        "=== heal done in %.1fs -- evaluated %d, healed %d to clob_l2, "
+        "%d still unavailable, %d failures ===",
+        duration, candidates_evaluated, healed_clob_l2, still_unavailable,
+        len(failures),
+    )
+    return HealEntrySourceResult(
+        candidates_evaluated=candidates_evaluated,
+        healed_clob_l2=healed_clob_l2,
+        still_unavailable=still_unavailable,
+        failures=failures,
+        duration_seconds=duration,
+    )
+
+
 async def catch_up_snapshot_if_stale(max_age_hours: int = 24) -> SnapshotResult | None:
     """Run a snapshot only if the most recent one is older than `max_age_hours`.
 

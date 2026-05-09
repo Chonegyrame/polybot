@@ -30,6 +30,14 @@ class CreateInsiderWalletRequest(BaseModel):
     notes: str | None = None
 
 
+class UpdateInsiderWalletRequest(BaseModel):
+    """PATCH body. Both fields are passed through directly -- send NULL to
+    clear, send a string to set. The UI's edit-in-place form sends both
+    every time, pre-filled with the current values."""
+    label: str | None = None
+    notes: str | None = None
+
+
 def _serialise(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "proxy_wallet": row["proxy_wallet"],
@@ -64,6 +72,20 @@ async def add_wallet(
         label=req.label,
         notes=req.notes,
     )
+    return _serialise(row)
+
+
+@router.patch("/{proxy_wallet}")
+async def update_wallet(
+    proxy_wallet: str,
+    req: UpdateInsiderWalletRequest,
+    conn: asyncpg.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    row = await crud.update_insider_wallet(
+        conn, proxy_wallet.lower(), label=req.label, notes=req.notes,
+    )
+    if row is None:
+        raise HTTPException(404, f"insider wallet {proxy_wallet} not found")
     return _serialise(row)
 
 

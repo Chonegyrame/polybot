@@ -16,6 +16,10 @@ function App() {
   });
   const [trader, setTrader] = useState(null);
   const [marketCtx, setMarketCtx] = useState(null);
+  // News feed (Card A activity + Card B lost signals). Owned at App level so
+  // the sidebar badge and the NewsPage share one polling timer instead of
+  // two when the user is on the News tab.
+  const newsFeed = useNewsBadge();
   // Paper trades: fetched live from GET /paper_trades, with mock fallback.
   // `placePaperTrade` POSTs to backend then re-fetches; offline writes go local.
   const [paperTrades, setPaperTrades] = useState(PB.PAPER_TRADES);
@@ -101,7 +105,7 @@ function App() {
 
   return (
     <div className="app">
-      <Sidebar route={route} setRoute={setRoute} />
+      <Sidebar route={route} setRoute={setRoute} newsUnread={newsFeed.unread} />
       <main className="main">
         <ErrorBoundary key={route}>
           {route === 'dashboard' && (
@@ -111,6 +115,7 @@ function App() {
             />
           )}
           {route === 'traders' && <TradersPage openTrader={openTrader} />}
+          {route === 'news' && <NewsPage feed={newsFeed} openMarket={openMarket} />}
           {route.startsWith('testing') && (
             <Testing
               key={route}

@@ -1854,6 +1854,27 @@ async def delete_insider_wallet(
     return result.endswith(" 1")
 
 
+async def update_insider_wallet(
+    conn: asyncpg.Connection,
+    proxy_wallet: str,
+    label: str | None,
+    notes: str | None,
+) -> dict[str, Any] | None:
+    """Replace label and notes for an existing wallet. Unlike upsert, this
+    sets the columns directly (no COALESCE), so passing NULL clears the field.
+    Returns the updated row, or None if the wallet doesn't exist."""
+    row = await conn.fetchrow(
+        """
+        UPDATE insider_wallets
+        SET label = $2, notes = $3
+        WHERE proxy_wallet = $1
+        RETURNING proxy_wallet, label, notes, added_at, last_seen_at
+        """,
+        proxy_wallet, label, notes,
+    )
+    return dict(row) if row else None
+
+
 async def list_insider_wallet_proxies(conn: asyncpg.Connection) -> list[str]:
     """Just the list of proxy wallets — used to extend the position-refresh pool
     so insiders are tracked even if they don't appear on any leaderboard top-N."""
@@ -2227,6 +2248,116 @@ async def list_watchlist_signals(
         ORDER BY w.aggregate_usdc DESC
         """,
         mode, category, top_n,
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_lost_signals(
+    conn: asyncpg.Connection,
+    *,
+    hours: int,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Signals that fired within the last `hours` but stopped firing on every
+    (mode, category, top_n) combo (i.e. genuinely off all feeds).
+
+    "Stopped firing" = the latest last_seen_at across all combos for that
+    (cid, direction) is older than 20 minutes. The position-refresh job is
+    on a 10-min cadence, so 20 min covers two clean misses regardless of
+    which mode produced the most recent fire.
+
+    For each lost (cid, direction) we pick the signal_log row with the
+    highest peak_aggregate_usdc as the canonical representative -- that's
+    the version of the signal the user most likely remembers. Joins markets,
+    signal_exits (latest event), and paper_trades (any open user trade on
+    this side) so the route can render a complete row without follow-ups.
+
+    Returns rows sorted by latest_last_seen_at DESC (most-recently-vanished
+    first). Caller (/signals/lost route) computes the "why" label in Python
+    so the rules stay readable.
+    """
+    rows = await conn.fetch(
+        """
+        WITH latest_seen AS (
+            SELECT
+                condition_id, direction,
+                MAX(last_seen_at) AS latest_last_seen_at
+            FROM signal_log
+            GROUP BY condition_id, direction
+        ),
+        lost AS (
+            SELECT condition_id, direction, latest_last_seen_at
+            FROM latest_seen
+            WHERE latest_last_seen_at >= NOW() - make_interval(hours => $1)
+              AND latest_last_seen_at <  NOW() - INTERVAL '20 minutes'
+        ),
+        chosen AS (
+            -- Pick the signal_log row with the largest peak_aggregate_usdc
+            -- per (cid, direction). Ties broken by earliest first_fired_at.
+            SELECT DISTINCT ON (sl.condition_id, sl.direction)
+                sl.id AS signal_log_id,
+                sl.condition_id, sl.direction,
+                sl.first_fired_at, sl.last_seen_at,
+                sl.peak_trader_count, sl.peak_aggregate_usdc,
+                sl.first_top_trader_entry_price,
+                sl.signal_entry_offer
+            FROM signal_log sl
+            JOIN lost l USING (condition_id, direction)
+            ORDER BY
+                sl.condition_id, sl.direction,
+                sl.peak_aggregate_usdc DESC NULLS LAST,
+                sl.first_fired_at ASC
+        )
+        SELECT
+            c.signal_log_id, c.condition_id, c.direction,
+            c.first_fired_at, c.last_seen_at,
+            c.peak_trader_count, c.peak_aggregate_usdc::float AS peak_aggregate_usdc,
+            c.first_top_trader_entry_price::float AS smart_money_entry_price,
+            c.signal_entry_offer::float AS signal_entry_offer,
+            m.question AS market_question,
+            m.slug AS market_slug,
+            e.category AS market_category,
+            m.event_id,
+            m.closed AS market_closed,
+            m.resolved_outcome,
+            m.end_date,
+            -- Latest cur_price observed across positions on this side
+            -- (gives us the "where did it end up" price for the why label
+            -- and the row display).
+            (
+                SELECT AVG(p.cur_price)::float
+                FROM positions p
+                WHERE p.condition_id = c.condition_id
+                  AND UPPER(p.outcome) = c.direction
+                  AND p.last_updated_at >= NOW() - INTERVAL '7 days'
+            ) AS recent_cur_price,
+            -- Latest signal_exits row on this signal_log row (could be 'trim'
+            -- or 'exit'). Used for the why label.
+            (
+                SELECT se.event_type FROM signal_exits se
+                WHERE se.signal_log_id = c.signal_log_id
+                ORDER BY se.exited_at DESC LIMIT 1
+            ) AS last_exit_event_type,
+            (
+                SELECT se.exited_at FROM signal_exits se
+                WHERE se.signal_log_id = c.signal_log_id
+                ORDER BY se.exited_at DESC LIMIT 1
+            ) AS last_exit_at,
+            -- Open paper trade on this (cid, direction). NULL if none.
+            (
+                SELECT pt.id FROM paper_trades pt
+                WHERE pt.condition_id = c.condition_id
+                  AND pt.direction = c.direction
+                  AND pt.status = 'open'
+                ORDER BY pt.entry_at DESC LIMIT 1
+            ) AS open_paper_trade_id
+        FROM chosen c
+        LEFT JOIN markets m ON m.condition_id = c.condition_id
+        LEFT JOIN events e ON e.id = m.event_id
+        ORDER BY c.last_seen_at DESC
+        LIMIT $2
+        """,
+        hours, limit,
     )
     return [dict(r) for r in rows]
 

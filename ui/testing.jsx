@@ -872,11 +872,16 @@ function DiagRow({ label, health, last, detail }) {
 // Insider Wallets page (tracked-wallet management)
 // ============================================================
 function InsiderWallets() {
-  // Live: GET /insider_wallets. POST to add, DELETE to remove. Mock fallback for offline browsing.
+  // Live: GET /insider_wallets. POST to add, PATCH to edit, DELETE to remove.
+  // Mock fallback for offline browsing.
   const [list, setList] = useState(D.INSIDER_WALLETS);
   const [offline, setOffline] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [draft, setDraft] = useState({ proxy_wallet: '', label: '', notes: '' });
+  // Edit-in-place state. `editing` is the wallet address (or null), `editDraft`
+  // is the form payload pre-filled from the row when the modal opens.
+  const [editing, setEditing] = useState(null);
+  const [editDraft, setEditDraft] = useState({ label: '', notes: '' });
   const [showToast, toastNode] = useToast();
 
   const refresh = useCallback(() => {
@@ -898,6 +903,23 @@ function InsiderWallets() {
       setList(L => [{ ...draft, added_at: new Date().toISOString(), last_seen_at: null }, ...L]);
     }
     setShowAdd(false); setDraft({ proxy_wallet: '', label: '', notes: '' });
+  };
+  const beginEdit = (w) => {
+    setEditing(w.proxy_wallet);
+    setEditDraft({ label: w.label || '', notes: w.notes || '' });
+  };
+  const saveEdit = async () => {
+    try {
+      await apiPatch(`/insider_wallets/${editing}`, {
+        label: editDraft.label || null,
+        notes: editDraft.notes || null,
+      });
+      refresh();
+    } catch (e) {
+      console.warn('Insider edit failed:', e.message);
+      showToast(`Edit failed: ${e.message}`, 'bad');
+    }
+    setEditing(null);
   };
   const remove = async (w) => {
     try {
@@ -941,7 +963,10 @@ function InsiderWallets() {
                   <td className="muted" style={{maxWidth:340,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.notes}</td>
                   <td className="muted mono" style={{fontSize:11}}>{tsAgo(w.added_at)}</td>
                   <td className="muted mono" style={{fontSize:11}}>{w.last_seen_at?tsAgo(w.last_seen_at):'never'}</td>
-                  <td><button className="btn ghost sm" onClick={()=>remove(w.proxy_wallet)}>remove</button></td>
+                  <td style={{display:'flex',gap:6}}>
+                    <button className="btn ghost sm" onClick={()=>beginEdit(w)}>edit</button>
+                    <button className="btn ghost sm" onClick={()=>remove(w.proxy_wallet)}>remove</button>
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -967,6 +992,29 @@ function InsiderWallets() {
             <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
               <button className="btn ghost" onClick={()=>setShowAdd(false)}>Cancel</button>
               <button className="btn primary" onClick={add}>Add wallet</button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {editing && (
+        <Modal onClose={()=>setEditing(null)}>
+          <div className="modal-head">
+            <h3>Edit insider wallet</h3>
+            <button className="icon-btn" onClick={()=>setEditing(null)}>{I.x}</button>
+          </div>
+          <div style={{padding:18,display:'grid',gap:12}}>
+            <Field label="Wallet (read-only)">
+              <input className="input mono" value={editing} readOnly disabled/>
+            </Field>
+            <Field label="Label">
+              <input className="input" value={editDraft.label} onChange={e=>setEditDraft({...editDraft,label:e.target.value})} placeholder="e.g. NBA insider"/>
+            </Field>
+            <Field label="Notes">
+              <textarea className="input" rows="3" value={editDraft.notes} onChange={e=>setEditDraft({...editDraft,notes:e.target.value})} placeholder="Why are you tracking this wallet?"/>
+            </Field>
+            <div style={{display:'flex',justifyContent:'flex-end',gap:8}}>
+              <button className="btn ghost" onClick={()=>setEditing(null)}>Cancel</button>
+              <button className="btn primary" onClick={saveEdit}>Save</button>
             </div>
           </div>
         </Modal>
