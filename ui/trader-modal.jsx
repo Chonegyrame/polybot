@@ -1,7 +1,7 @@
 // =============================================================
 // trader-modal.jsx — Trader drill-down (Section 4)
 // =============================================================
-function TraderModal({ wallet, onClose, openMarket }) {
+function TraderModal({ wallet, onClose, onBack, openMarket }) {
   // Live: GET /traders/{wallet}. Mock fallback (assembled from PB.TRADER_DETAIL
   // or the top-traders list) is used only if the backend errors — never on
   // first paint — so we don't flash fake values before live arrives.
@@ -35,7 +35,13 @@ function TraderModal({ wallet, onClose, openMarket }) {
   if (res.loading && res.data == null) {
     return (
       <Modal onClose={onClose}>
-        <div className="modal-head"><div><h2 className="muted">Loading trader…</h2></div><button className="modal-close" onClick={onClose}>{ICONS.x}</button></div>
+        <div className="modal-head">
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            {onBack && <button className="modal-back" title="Back" onClick={onBack}>←</button>}
+            <h2 className="muted">Loading trader…</h2>
+          </div>
+          <button className="modal-close" onClick={onClose}>{ICONS.x}</button>
+        </div>
       </Modal>
     );
   }
@@ -43,7 +49,8 @@ function TraderModal({ wallet, onClose, openMarket }) {
   return (
     <Modal onClose={onClose}>
       <div className="modal-head">
-        <div className="trader-head">
+        <div className="trader-head" style={{display:'flex',alignItems:'center',gap:12}}>
+          {onBack && <button className="modal-back" title="Back" onClick={onBack}>←</button>}
           <div className="avatar" style={{background:'linear-gradient(135deg,#00d97e,#048b56)',color:'#04241b'}}>
             {(p.user_name || 'X')[0]}
           </div>

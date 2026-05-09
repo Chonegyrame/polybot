@@ -2252,6 +2252,133 @@ async def list_watchlist_signals(
     return [dict(r) for r in rows]
 
 
+async def list_browseable_markets(
+    conn: asyncpg.Connection,
+    *,
+    search: str | None = None,
+    category: str | None = None,
+    status: str = "all",       # "active" | "resolved" | "all"
+    sort: str = "smart_money", # "smart_money" | "trader_count" | "current_price" | "end_date" | "alpha"
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    """Markets browser: every market in our local DB joined with smart-money
+    aggregation per side. Returns (rows, total_count) so the UI can paginate.
+
+    Aggregation is sybil-cluster-collapsed via the same pattern signal_detector
+    uses: each (cluster_id or wallet) counts once toward trader_count, and
+    aggregate_usdc sums current_value across all collapsed positions.
+
+    "Smart money" here means the union of all wallets in the positions table
+    (top-N pool + insider wallets) -- not signal-grade, just "any tracked
+    wallet has touched this market."
+    """
+    where = ["1=1"]
+    args: list[Any] = []
+
+    if search:
+        args.append(f"%{search.lower()}%")
+        where.append(f"LOWER(m.question) LIKE ${len(args)}")
+    if category:
+        args.append(category)
+        where.append(f"e.category = ${len(args)}")
+    if status == "active":
+        where.append("m.closed = FALSE AND m.resolved_outcome IS NULL")
+    elif status == "resolved":
+        where.append("(m.closed = TRUE OR m.resolved_outcome IS NOT NULL)")
+
+    sort_sql = {
+        "smart_money": "smart_money_total_usdc DESC NULLS LAST",
+        "trader_count": "smart_money_trader_count DESC NULLS LAST",
+        "current_price": "current_price DESC NULLS LAST",
+        "end_date": "m.end_date ASC NULLS LAST",
+        "alpha": "LOWER(m.question) ASC",
+    }.get(sort, "smart_money_total_usdc DESC NULLS LAST")
+
+    args.extend([limit, offset])
+    limit_idx = len(args) - 1
+    offset_idx = len(args)
+
+    sql = f"""
+    WITH identities AS (
+        -- Cluster-collapsed positions across the entire tracked pool.
+        SELECT
+            p.condition_id,
+            p.outcome,
+            COALESCE(cm.cluster_id::text, p.proxy_wallet) AS identity,
+            p.size, p.current_value, p.cur_price
+        FROM positions p
+        LEFT JOIN cluster_membership cm USING (proxy_wallet)
+        WHERE p.size > 0
+          AND p.last_updated_at >= NOW() - INTERVAL '1 day'
+    ),
+    market_agg AS (
+        SELECT
+            condition_id,
+            COUNT(DISTINCT identity)                                     AS trader_count,
+            SUM(current_value)::float                                     AS total_usdc,
+            SUM(current_value) FILTER (WHERE UPPER(outcome) = 'YES')::float AS yes_usdc,
+            SUM(current_value) FILTER (WHERE UPPER(outcome) = 'NO')::float  AS no_usdc,
+            COUNT(DISTINCT identity) FILTER (WHERE UPPER(outcome) = 'YES') AS yes_traders,
+            COUNT(DISTINCT identity) FILTER (WHERE UPPER(outcome) = 'NO')  AS no_traders,
+            AVG(cur_price)::float                                         AS current_price
+        FROM identities
+        GROUP BY condition_id
+    ),
+    base AS (
+        SELECT
+            m.condition_id,
+            m.question,
+            m.slug,
+            m.event_id,
+            m.end_date,
+            m.closed,
+            m.resolved_outcome,
+            e.category,
+            e.title AS event_title,
+            COALESCE(ma.trader_count, 0)            AS smart_money_trader_count,
+            COALESCE(ma.total_usdc, 0)              AS smart_money_total_usdc,
+            ma.yes_usdc                              AS smart_money_yes_usdc,
+            ma.no_usdc                               AS smart_money_no_usdc,
+            ma.yes_traders                           AS smart_money_yes_traders,
+            ma.no_traders                            AS smart_money_no_traders,
+            ma.current_price
+        FROM markets m
+        LEFT JOIN events e ON e.id = m.event_id
+        LEFT JOIN market_agg ma ON ma.condition_id = m.condition_id
+        WHERE {' AND '.join(where)}
+    )
+    SELECT *, COUNT(*) OVER () AS _total_count
+    FROM base
+    ORDER BY {sort_sql}
+    LIMIT ${limit_idx} OFFSET ${offset_idx}
+    """
+    rows = await conn.fetch(sql, *args)
+    if not rows:
+        return [], 0
+    total = int(rows[0]["_total_count"])
+    out = []
+    for r in rows:
+        d = dict(r)
+        d.pop("_total_count", None)
+        out.append(d)
+    return out, total
+
+
+async def list_event_ids_in_db(
+    conn: asyncpg.Connection, event_ids: list[str],
+) -> set[str]:
+    """Return the subset of `event_ids` that exist in our local events table.
+    Used to flag Trending rows as TRACKED vs NO SMART MONEY."""
+    if not event_ids:
+        return set()
+    rows = await conn.fetch(
+        "SELECT id FROM events WHERE id = ANY($1::text[])",
+        event_ids,
+    )
+    return {r["id"] for r in rows}
+
+
 async def list_lost_signals(
     conn: asyncpg.Connection,
     *,

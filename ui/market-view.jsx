@@ -25,7 +25,7 @@ const _normSignal = (r) => r && ({
   signal_entry_offer: _mvNum(r.signal_entry_offer),
 });
 
-function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaperTrade }) {
+function MarketView({ conditionId, presetDirection, onClose, onBack, openTrader, onPaperTrade }) {
   // Live: GET /markets/{condition_id}. Backend returns {market, tracked_positions_by_outcome,
   // tracked_positions_per_trader, signal_history}. orderbook + fills are NOT yet on the
   // backend (Phase 2 — the trading_view endpoint), so we fall back to mock data for those.
@@ -97,7 +97,13 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
   if (earlyState === 'loading') {
     return (
       <Modal onClose={onClose}>
-        <div className="modal-head"><div><h2 className="muted">Loading market…</h2></div><button className="modal-close" onClick={onClose}>{ICONS.x}</button></div>
+        <div className="modal-head">
+          <div style={{display:'flex',alignItems:'center',gap:8}}>
+            {onBack && <button className="modal-back" title="Back" onClick={onBack}>←</button>}
+            <h2 className="muted">Loading market…</h2>
+          </div>
+          <button className="modal-close" onClick={onClose}>{ICONS.x}</button>
+        </div>
       </Modal>
     );
   }
@@ -105,13 +111,16 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
   return (
     <Modal onClose={onClose}>
       <div className="modal-head">
-        <div>
-          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
-            <span className="chip">{PB.CATEGORY_LABELS[market.event_category]}</span>
-            <span className="chip mono">{market.condition_id}</span>
-            <span className="chip">closes {new Date(market.end_date).toLocaleDateString()}</span>
+        <div style={{display:'flex',alignItems:'flex-start',gap:10,flex:1,minWidth:0}}>
+          {onBack && <button className="modal-back" title="Back" onClick={onBack} style={{marginTop:2}}>←</button>}
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
+              <span className="chip">{PB.CATEGORY_LABELS[market.event_category]}</span>
+              <span className="chip mono">{market.condition_id}</span>
+              <span className="chip">closes {new Date(market.end_date).toLocaleDateString()}</span>
+            </div>
+            <h2>{market.question}</h2>
           </div>
-          <h2>{market.question}</h2>
         </div>
         <button className="modal-close" onClick={onClose}>{ICONS.x}</button>
       </div>

@@ -155,6 +155,7 @@ function Sidebar({ route, setRoute, newsUnread = 0 }) {
   const items = [
     { id: 'dashboard', label: 'Dashboard',  ic: I.feed },
     { id: 'traders',   label: 'Top Traders', ic: I.traders },
+    { id: 'markets',   label: 'Markets',     ic: I.bag },
     { id: 'news',      label: 'News',        ic: I.bell, badge: newsUnread > 0 ? newsUnread : null },
     { id: 'testing',   label: 'Testing',    ic: I.beaker },
   ];

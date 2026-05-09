@@ -16,6 +16,10 @@ function App() {
   });
   const [trader, setTrader] = useState(null);
   const [marketCtx, setMarketCtx] = useState(null);
+  // Modal navigation stack. Each entry is the context we navigated AWAY FROM
+  // when opening a new modal. `goBack()` pops one and restores it. `closeAll()`
+  // (the × button) wipes the stack along with the current modal.
+  const [navStack, setNavStack] = useState([]);
   // News feed (Card A activity + Card B lost signals). Owned at App level so
   // the sidebar badge and the NewsPage share one polling timer instead of
   // two when the user is on the News tab.
@@ -47,12 +51,46 @@ function App() {
   }, [t.accent, t.density]);
 
   function openTrader(wallet) {
+    // If switching FROM another modal (a market view OR a different trader),
+    // push the current context onto the back-stack so we can restore it.
+    if (marketCtx) {
+      setNavStack(s => [...s, { kind: 'market', ...marketCtx }]);
+    } else if (trader && trader !== wallet) {
+      setNavStack(s => [...s, { kind: 'trader', wallet: trader }]);
+    }
     setTrader(wallet);
     setMarketCtx(null);
   }
   function openMarket(conditionId, direction) {
+    if (trader) {
+      setNavStack(s => [...s, { kind: 'trader', wallet: trader }]);
+    } else if (marketCtx && marketCtx.conditionId !== conditionId) {
+      setNavStack(s => [...s, { kind: 'market', ...marketCtx }]);
+    }
     setMarketCtx({ conditionId, direction });
     setTrader(null);
+  }
+  function goBack() {
+    setNavStack(s => {
+      if (s.length === 0) {
+        // Stack empty -- treat back as close-all so the user always exits cleanly.
+        setTrader(null); setMarketCtx(null);
+        return s;
+      }
+      const prev = s[s.length - 1];
+      if (prev.kind === 'trader') {
+        setTrader(prev.wallet); setMarketCtx(null);
+      } else {
+        setMarketCtx({ conditionId: prev.conditionId, direction: prev.direction });
+        setTrader(null);
+      }
+      return s.slice(0, -1);
+    });
+  }
+  function closeAll() {
+    setTrader(null);
+    setMarketCtx(null);
+    setNavStack([]);
   }
   async function placePaperTrade(trade) {
     // Try POST /paper_trades to the backend. Server validates + computes effective entry,
@@ -115,6 +153,7 @@ function App() {
             />
           )}
           {route === 'traders' && <TradersPage openTrader={openTrader} />}
+          {route === 'markets' && <MarketsPage openMarket={openMarket} />}
           {route === 'news' && <NewsPage feed={newsFeed} openMarket={openMarket} />}
           {route.startsWith('testing') && (
             <Testing
@@ -130,7 +169,12 @@ function App() {
       </main>
       {trader && (
         <ErrorBoundary key={`trader-${trader}`}>
-          <TraderModal wallet={trader} onClose={() => setTrader(null)} openMarket={openMarket} />
+          <TraderModal
+            wallet={trader}
+            onClose={closeAll}
+            onBack={navStack.length > 0 ? goBack : null}
+            openMarket={openMarket}
+          />
         </ErrorBoundary>
       )}
       {marketCtx && (
@@ -138,8 +182,9 @@ function App() {
           <MarketView
             conditionId={marketCtx.conditionId}
             presetDirection={marketCtx.direction}
-            onClose={() => setMarketCtx(null)}
-            openTrader={(w) => { setMarketCtx(null); setTrader(w); }}
+            onClose={closeAll}
+            onBack={navStack.length > 0 ? goBack : null}
+            openTrader={openTrader}
             onPaperTrade={placePaperTrade}
           />
         </ErrorBoundary>
