@@ -29,7 +29,8 @@ function Dashboard({ state, setState, openTrader, openMarket }) {
   }, [liveSignals, sigsRes.source, state.category, state.sort]);
 
   // Live freshness from /system/status — drives the "refreshed Xm ago" subtitle.
-  const sysRes = useApi('/system/status', PB.SYSTEM_STATUS);
+  // Polls every 60s so the staleness counter doesn't freeze at page-load time.
+  const sysRes = useApi('/system/status', PB.SYSTEM_STATUS, { pollMs: 60_000 });
   const minutesSince = sysRes.data?.components?.position_refresh?.minutes_since;
   const refreshedLabel = minutesSince == null
     ? 'refresh time unknown'

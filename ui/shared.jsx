@@ -48,24 +48,35 @@ async function apiDelete(path) {
 // nothing renders mock data on first paint (otherwise mock leaks visibly
 // while the real fetch is in flight). `path === null` means "don't fetch
 // yet" (useful for lazy loads). Re-fetches whenever the path string changes.
-function useApi(path, mock) {
+//
+// Optional third arg `{ pollMs }` enables auto-refresh: pass `pollMs: 60_000`
+// to re-fetch every 60s. Used for system-status indicators that should not
+// be frozen at page-load time.
+function useApi(path, mock, { pollMs } = {}) {
   const [state, setState] = useState({ data: null, loading: path !== null, error: null, source: 'pending' });
   useEffect(() => {
     if (path == null) return;
     let cancelled = false;
-    setState(s => ({ ...s, loading: true, error: null }));
-    apiGet(path).then(
-      (data) => { if (!cancelled) setState({ data, loading: false, error: null, source: 'live' }); },
-      (e) => {
-        if (cancelled) return;
-        // Backend unreachable — keep mock data, surface error so UI can show "offline" badge.
-        // eslint-disable-next-line no-console
-        console.warn(`API offline for ${path}:`, e.message || e);
-        setState({ data: mock ?? null, loading: false, error: String(e.message || e), source: 'mock' });
-      }
-    );
+    const doFetch = () => {
+      setState(s => ({ ...s, loading: true, error: null }));
+      apiGet(path).then(
+        (data) => { if (!cancelled) setState({ data, loading: false, error: null, source: 'live' }); },
+        (e) => {
+          if (cancelled) return;
+          // Backend unreachable — keep mock data, surface error so UI can show "offline" badge.
+          // eslint-disable-next-line no-console
+          console.warn(`API offline for ${path}:`, e.message || e);
+          setState({ data: mock ?? null, loading: false, error: String(e.message || e), source: 'mock' });
+        }
+      );
+    };
+    doFetch();
+    if (pollMs && pollMs > 0) {
+      const id = setInterval(doFetch, pollMs);
+      return () => { cancelled = true; clearInterval(id); };
+    }
     return () => { cancelled = true; };
-  }, [path]);
+  }, [path, pollMs]);
   return state;  // { data, loading, error, source }
 }
 
@@ -183,7 +194,7 @@ function HealthPillSide() {
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, [open]);
-  const sys = useApi('/system/status', D.SYSTEM_STATUS);
+  const sys = useApi('/system/status', D.SYSTEM_STATUS, { pollMs: 60_000 });
   const offlineNow = sys.source === 'mock' && sys.error;
   const ready = sys.data != null;
   const v2 = sys.data;

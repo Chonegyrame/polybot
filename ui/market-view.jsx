@@ -50,6 +50,17 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
   const [size, setSize] = useState(500);
   const [reasoning, setReasoning] = useState('');
   const [showToast, toastNode] = useToast();
+  // Live YES/NO bid+ask from Polymarket CLOB. Polled every 30s while modal is
+  // open. Falls back to nulls if a side's book is empty/crossed (rendered as —).
+  const liveQuoteRes = useApi(
+    conditionId ? `/markets/${conditionId}/live_quote` : null,
+    null,
+    { pollMs: 30_000 },
+  );
+  const liveQuote = liveQuoteRes.data;
+  const yesAsk = liveQuote?.yes?.ask;
+  const noAsk = liveQuote?.no?.ask;
+  const sideAsk = side === 'YES' ? yesAsk : noAsk;
 
   const fillPlan = useMemo(() => {
     const levels = side === 'YES' ? orderbook.yes.asks : orderbook.yes.bids.map(b => ({...b, price: 1 - b.price}));
@@ -128,17 +139,41 @@ function MarketView({ conditionId, presetDirection, onClose, openTrader, onPaper
               be fake until then, so we hide them and let the backend compute
               entry price + fee + slippage at trade time. */}
           <div className="trade-panel">
+            {/* Live YES/NO ask prices, polled every 30s via /markets/{id}/live_quote.
+                Lets the user evaluate both sides without leaving the app.
+                Falls back to "—" if a side's book is empty/crossed. */}
+            <div className="card card-pad" style={{marginBottom:12,padding:'10px 12px'}}>
+              <div className="trade-label" style={{margin:0,marginBottom:6,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <span>Live quote</span>
+                <span className="muted" style={{fontSize:10,fontWeight:400,textTransform:'none',letterSpacing:0}}>
+                  {liveQuoteRes.loading && !liveQuote ? 'fetching…' : liveQuote ? 'refreshes 30s' : 'unavailable'}
+                </span>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,fontSize:12}}>
+                <div>
+                  <div className="muted" style={{fontSize:10,letterSpacing:'0.06em'}}>YES</div>
+                  <div style={{fontSize:16,fontWeight:600,color:'var(--yes)'}}>{yesAsk != null ? `$${yesAsk.toFixed(2)}` : '—'}</div>
+                  <div className="muted mono" style={{fontSize:10}}>{liveQuote?.yes?.bid != null && liveQuote?.yes?.ask != null ? `${liveQuote.yes.bid.toFixed(2)} / ${liveQuote.yes.ask.toFixed(2)}` : '—'}</div>
+                </div>
+                <div>
+                  <div className="muted" style={{fontSize:10,letterSpacing:'0.06em'}}>NO</div>
+                  <div style={{fontSize:16,fontWeight:600,color:'var(--no)'}}>{noAsk != null ? `$${noAsk.toFixed(2)}` : '—'}</div>
+                  <div className="muted mono" style={{fontSize:10}}>{liveQuote?.no?.bid != null && liveQuote?.no?.ask != null ? `${liveQuote.no.bid.toFixed(2)} / ${liveQuote.no.ask.toFixed(2)}` : '—'}</div>
+                </div>
+              </div>
+            </div>
+
             <div className="callout warn" style={{marginBottom:14,fontSize:12,lineHeight:1.5}}>
-              <b>Preview</b> — fill price not shown live. Backend will compute the real
-              entry price, fee, and slippage from CLOB at the moment you place the trade.
+              <b>Preview</b> — fill price not shown live for size. Backend computes
+              the real entry price, fee, and slippage from CLOB at trade time.
             </div>
 
             <div className="trade-side">
               <button className={`trade-side-btn yes ${side==='YES'?'on':''}`} onClick={() => setSide('YES')}>
-                <span style={{fontSize:11,fontWeight:600,letterSpacing:'0.1em'}}>BUY YES</span>
+                <span style={{fontSize:11,fontWeight:600,letterSpacing:'0.1em'}}>BUY YES{yesAsk != null ? ` · $${yesAsk.toFixed(2)}` : ''}</span>
               </button>
               <button className={`trade-side-btn no ${side==='NO'?'on':''}`} onClick={() => setSide('NO')}>
-                <span style={{fontSize:11,fontWeight:600,letterSpacing:'0.1em'}}>BUY NO</span>
+                <span style={{fontSize:11,fontWeight:600,letterSpacing:'0.1em'}}>BUY NO{noAsk != null ? ` · $${noAsk.toFixed(2)}` : ''}</span>
               </button>
             </div>
 
