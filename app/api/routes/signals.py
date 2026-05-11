@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any
@@ -303,6 +304,82 @@ async def get_lost_signals(
         "window_hours": hours,
         "count": len(out),
         "lost_signals": out,
+    }
+
+
+@router.get("/recent")
+async def get_recent_signals(
+    hours: int = Query(24, ge=1, le=168, description="Look-back window for first_fired_at; default 24h"),
+    limit: int = Query(200, ge=1, le=500),
+    conn: asyncpg.Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """Signals that first fired within the last `hours` (across any mode /
+    category / top_n combo). Powers the News tab "New signals" card.
+
+    One row per (condition_id, direction). `fired_in` lists the combos that
+    are CURRENTLY still firing this signal (last_seen_at within last 20 min);
+    empty array means the signal arrived and already dropped off every combo.
+    Sorted by first_fired_at DESC so the freshest arrival is at the top.
+    """
+    rows = await crud.list_recent_signals(conn, hours=hours, limit=limit)
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        # asyncpg returns jsonb as a TEXT payload unless a codec is registered;
+        # parse defensively so the route works regardless.
+        fired_in_raw = r["fired_in"]
+        if isinstance(fired_in_raw, str):
+            try:
+                fired_in = json.loads(fired_in_raw)
+            except (json.JSONDecodeError, TypeError):
+                fired_in = []
+        elif isinstance(fired_in_raw, list):
+            fired_in = fired_in_raw
+        else:
+            fired_in = []
+
+        out.append({
+            "signal_log_id": r["signal_log_id"],
+            "condition_id": r["condition_id"],
+            "direction": r["direction"],
+            "market_question": r["market_question"],
+            "market_slug": r["market_slug"],
+            "market_category": r["market_category"],
+            "event_id": r["event_id"],
+            "first_fired_at": (
+                r["first_fired_at"].isoformat()
+                if r["first_fired_at"] is not None else None
+            ),
+            "last_seen_at": (
+                r["last_seen_at"].isoformat()
+                if r["last_seen_at"] is not None else None
+            ),
+            "peak_trader_count": r["peak_trader_count"],
+            "peak_aggregate_usdc": r["peak_aggregate_usdc"],
+            "smart_money_entry_price": r["smart_money_entry_price"],
+            "signal_entry_offer": r["signal_entry_offer"],
+            "signal_entry_spread_bps": r["signal_entry_spread_bps"],
+            "liquidity_tier": r["liquidity_tier"],
+            "recent_cur_price": r["recent_cur_price"],
+            "market_closed": r["market_closed"],
+            "resolved_outcome": r["resolved_outcome"],
+            "end_date": (
+                r["end_date"].isoformat()
+                if r["end_date"] is not None else None
+            ),
+            "fired_in": fired_in,
+            "is_still_firing": len(fired_in) > 0,
+            "last_exit_event_type": r["last_exit_event_type"],
+            "last_exit_at": (
+                r["last_exit_at"].isoformat()
+                if r["last_exit_at"] is not None else None
+            ),
+        })
+
+    return {
+        "window_hours": hours,
+        "count": len(out),
+        "recent_signals": out,
     }
 
 

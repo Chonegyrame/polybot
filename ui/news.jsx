@@ -1,19 +1,19 @@
 // =============================================================
-// news.jsx — News tab: recent smart-money activity + lost signals
+// news.jsx — News tab: 3-card overview + inline expand
 // =============================================================
 //
-// Two cards on one page:
-//   A. "What's happening" — recent trim/exit events from /signals/exits/recent
-//   B. "Lost signals" — signals that fired in the last 72h but stopped firing
-//      on every (mode, category, top_n) combo, from /signals/lost
+// Three stat cards in a row at the top, each shows just the count for its
+// feed. Clicking a card toggles the matching full list inline below; only
+// one section is open at a time. Default open = "New signals".
 //
-// Polls every 60s. Dismissal is client-side only (localStorage); nothing is
-// written to the backend. Lost signals naturally disappear after 3 days via
-// the default ?hours=72 query, so dismissed-but-not-yet-purged items go away
-// even if the user never returns.
+//   1. New signals  · last 24h  -- /signals/recent?hours=24
+//   2. Exits/trims  · last 72h  -- /signals/exits/recent?hours=72
+//   3. Lost signals · last 72h  -- /signals/lost?hours=72
 //
-// Sidebar badge = items with timestamp newer than localStorage `news_last_seen_at`,
-// excluding dismissed lost-signals. Cleared whenever the user opens the page.
+// Polls every 60s on all three feeds via one App-level hook (useNewsBadge),
+// so the sidebar badge and the page share a single timer. Dismissal of
+// lost signals is client-side only (localStorage); other feeds have no
+// dismiss concept.
 
 const NEWS_LAST_SEEN_KEY = 'news_last_seen_at';
 const NEWS_DISMISSED_KEY = 'news_dismissed_lost_ids';
@@ -45,19 +45,27 @@ function _writeLastSeenNow() {
 // (for the badge count) and NewsPage (for the full data). Avoids two poll
 // intervals running concurrently when the user is on the News tab.
 function useNewsBadge() {
-  const lostRes = useApi('/signals/lost?hours=72', null, { pollMs: 60_000 });
-  const exitsRes = useApi('/signals/exits/recent?hours=72', null, { pollMs: 60_000 });
+  const recentRes = useApi('/signals/recent?hours=24', null, { pollMs: 60_000 });
+  const lostRes   = useApi('/signals/lost?hours=72',   null, { pollMs: 60_000 });
+  const exitsRes  = useApi('/signals/exits/recent?hours=72', null, { pollMs: 60_000 });
   // Re-render trigger so dismiss/markRead are reflected without external state.
   const [tick, setTick] = useState(0);
   const bump = useCallback(() => setTick(x => x + 1), []);
 
+  const recentSignals = recentRes.data?.recent_signals || [];
   const lostSignals = lostRes.data?.lost_signals || [];
   const exits = exitsRes.data?.exits || [];
   const dismissed = _readDismissedSet();
   const lastSeen = _readLastSeen();
   const lastSeenMs = lastSeen ? new Date(lastSeen).getTime() : 0;
 
+  // Unread = sum across all three feeds of items newer than lastSeen.
+  // Dismissed lost signals don't count toward unread.
   let unread = 0;
+  for (const r of recentSignals) {
+    const t = r.first_fired_at ? new Date(r.first_fired_at).getTime() : 0;
+    if (t > lastSeenMs) unread++;
+  }
   for (const e of exits) {
     const t = e.exited_at ? new Date(e.exited_at).getTime() : 0;
     if (t > lastSeenMs) unread++;
@@ -68,13 +76,39 @@ function useNewsBadge() {
     if (t > lastSeenMs) unread++;
   }
 
+  // Card counts: post-dedup row counts users would see if they expanded.
+  // ExitsCard dedupes by (cid, direction) keeping the most-recent exited_at;
+  // mirror that here so the card number matches the list length below.
+  const exitsDedupKey = new Set();
+  let exitsCount = 0;
+  const exitsSorted = [...exits].sort(
+    (a,b) => new Date(b.exited_at||0) - new Date(a.exited_at||0),
+  );
+  for (const r of exitsSorted) {
+    const k = `${r.condition_id}-${r.direction}`;
+    if (exitsDedupKey.has(k)) continue;
+    exitsDedupKey.add(k);
+    exitsCount++;
+  }
+  // Lost-signals card count excludes dismissed rows (matches what user sees
+  // before they expand the "Show N dismissed" details block).
+  const lostVisibleCount = lostSignals.filter(r => !dismissed.has(r.signal_log_id)).length;
+
   return {
-    lostSignals,
+    recentSignals,
     exits,
-    lostLoading: lostRes.loading,
+    lostSignals,
+    recentLoading: recentRes.loading,
     exitsLoading: exitsRes.loading,
-    lostError: lostRes.error,
+    lostLoading: lostRes.loading,
+    recentError: recentRes.error,
     exitsError: exitsRes.error,
+    lostError: lostRes.error,
+    counts: {
+      recent: recentSignals.length,
+      exits: exitsCount,
+      lost: lostVisibleCount,
+    },
     unread,
     dismissed,
     dismiss(signalLogId) {
@@ -93,24 +127,23 @@ function useNewsBadge() {
       _writeLastSeenNow();
       bump();
     },
-    // tick exposed only so callers using this object as a render dep refresh
-    // when bump fires (e.g. dismiss list updates without a feed change).
     _tick: tick,
   };
 }
 
 function NewsPage({ feed, openMarket }) {
-  // Mark-read on mount AND whenever the feed updates while we're on the page.
-  // Without the feed-update dep, a new exit arriving via the 60s poll would
-  // bump the badge to 1 even though the user is staring at the page. Refs
-  // identity changes per fetch so this re-fires naturally.
+  // Default-open: New signals. State is page-local — switching tab and back
+  // resets to default, which is fine ("New" is what the user wants 95% of
+  // the time per the design discussion).
+  const [expanded, setExpanded] = useState('recent');
+
+  // Mark-read on mount AND whenever any feed updates while we're on the page.
+  // Without the feed deps, a new item arriving via the 60s poll would bump
+  // the badge to 1 even though the user is staring at the page.
   useEffect(() => {
     feed.markRead();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [feed.lostSignals, feed.exits]);
-
-  const visibleLost = feed.lostSignals.filter(r => !feed.dismissed.has(r.signal_log_id));
-  const dismissedLost = feed.lostSignals.filter(r => feed.dismissed.has(r.signal_log_id));
+  }, [feed.recentSignals, feed.exits, feed.lostSignals]);
 
   return (
     <>
@@ -118,38 +151,199 @@ function NewsPage({ feed, openMarket }) {
         <div>
           <h1>News</h1>
           <div className="topbar-sub">
-            recent smart-money activity · signals that rolled off · auto-refresh 60s
+            new arrivals · smart-money activity · signals that rolled off · auto-refresh 60s
           </div>
         </div>
       </div>
       <div className="content">
-        <div style={{display:'grid',gridTemplateColumns:'1fr',gap:18}}>
-          <ActivityCard
-            exits={feed.exits}
+        <div style={{display:'grid',gridTemplateColumns:'repeat(3, 1fr)',gap:14,marginBottom:18}}>
+          <StatCard
+            title="New signals"
+            windowLabel="last 24h"
+            count={feed.counts.recent}
+            loading={feed.recentLoading}
+            active={expanded === 'recent'}
+            onClick={() => setExpanded('recent')}
+            tone="ok"
+          />
+          <StatCard
+            title="Exits / trims"
+            windowLabel="last 72h"
+            count={feed.counts.exits}
             loading={feed.exitsLoading}
-            error={feed.exitsError}
-            openMarket={openMarket}
+            active={expanded === 'exits'}
+            onClick={() => setExpanded('exits')}
+            tone="warn"
           />
-          <LostSignalsCard
-            rows={visibleLost}
-            dismissedRows={dismissedLost}
+          <StatCard
+            title="Lost signals"
+            windowLabel="last 72h"
+            count={feed.counts.lost}
             loading={feed.lostLoading}
-            error={feed.lostError}
-            openMarket={openMarket}
-            onDismiss={feed.dismiss}
-            onUndismiss={feed.undismiss}
+            active={expanded === 'lost'}
+            onClick={() => setExpanded('lost')}
+            tone="bad"
           />
+        </div>
+        <div>
+          {expanded === 'recent' && (
+            <NewSignalsCard
+              rows={feed.recentSignals}
+              loading={feed.recentLoading}
+              error={feed.recentError}
+              openMarket={openMarket}
+            />
+          )}
+          {expanded === 'exits' && (
+            <ActivityCard
+              exits={feed.exits}
+              loading={feed.exitsLoading}
+              error={feed.exitsError}
+              openMarket={openMarket}
+            />
+          )}
+          {expanded === 'lost' && (
+            <LostSignalsCard
+              rows={feed.lostSignals.filter(r => !feed.dismissed.has(r.signal_log_id))}
+              dismissedRows={feed.lostSignals.filter(r => feed.dismissed.has(r.signal_log_id))}
+              loading={feed.lostLoading}
+              error={feed.lostError}
+              openMarket={openMarket}
+              onDismiss={feed.dismiss}
+              onUndismiss={feed.undismiss}
+            />
+          )}
         </div>
       </div>
     </>
   );
 }
 
+function StatCard({ title, windowLabel, count, loading, active, onClick, tone }) {
+  // Active state = thicker accent border + slight bg lift, so the user can
+  // tell at a glance which section is showing below. Tone colors the count
+  // text via inline style (CSS vars from the theme), since .pos/.neg in
+  // styles.css are scoped to specific containers and won't apply here.
+  const toneColor = tone === 'ok'  ? 'var(--accent)'
+                  : tone === 'bad' ? 'var(--no)'
+                  : tone === 'warn' ? 'var(--amber)'
+                  : 'inherit';
+  return (
+    <div
+      className="card"
+      onClick={onClick}
+      style={{
+        cursor:'pointer',
+        padding:'14px 16px',
+        border: active ? '1px solid var(--accent)' : '1px solid var(--border)',
+        background: active ? 'var(--accent-soft)' : undefined,
+        transition:'border-color 120ms, background 120ms',
+      }}
+    >
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline',gap:8}}>
+        <div style={{fontSize:13,fontWeight:600}}>{title}</div>
+        <div className="muted mono" style={{fontSize:11}}>{windowLabel}</div>
+      </div>
+      <div style={{display:'flex',alignItems:'baseline',gap:10,marginTop:6}}>
+        <div style={{fontSize:28,fontWeight:600,lineHeight:1,color:toneColor}}>
+          {loading && count === 0 ? '…' : count}
+        </div>
+        <div className="muted" style={{fontSize:11}}>
+          {active ? 'showing below' : 'tap to view'}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NewSignalsCard({ rows, loading, error, openMarket }) {
+  // Already DESC by first_fired_at from the backend. No client-side dedup —
+  // /signals/recent already returns one row per (cid, direction).
+  return (
+    <div className="card">
+      <div className="card-head">
+        <h3>New signals · last 24h</h3>
+        <span className="muted mono" style={{fontSize:11}}>GET /signals/recent?hours=24</span>
+      </div>
+      <div className="muted" style={{fontSize:12,padding:'4px 14px 10px'}}>
+        Signals whose very first fire landed in the last 24 hours, across
+        any mode / category / top-N. Newest at the top.
+      </div>
+      {loading && rows.length === 0 && (
+        <div className="card-pad muted">Loading new signals…</div>
+      )}
+      {!loading && rows.length === 0 && (
+        <div className="card-pad muted">
+          {error
+            ? `Backend offline (${error}). New signals will appear here when reachable.`
+            : 'No new signals in the last 24 hours.'}
+        </div>
+      )}
+      <div>
+        {rows.map(r => (
+          <NewSignalRow key={`${r.condition_id}-${r.direction}`} r={r} openMarket={openMarket}/>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function NewSignalRow({ r, openMarket }) {
+  // Group the fired_in combos by mode so the line stays short on cards that
+  // fire on many combos. e.g. "absolute (sports, overall) + hybrid (sports)".
+  const byMode = {};
+  for (const c of (r.fired_in || [])) {
+    if (!byMode[c.mode]) byMode[c.mode] = new Set();
+    byMode[c.mode].add(c.category);
+  }
+  const firedInText = Object.entries(byMode)
+    .map(([mode, cats]) => `${mode} (${[...cats].join(', ')})`)
+    .join(' + ');
+
+  // State chip: still firing somewhere, or already rolled off / exited.
+  let stateChip = null;
+  if (r.is_still_firing) {
+    stateChip = <span className="chip ok" style={{minWidth:64,textAlign:'center'}}>FIRING</span>;
+  } else if (r.last_exit_event_type === 'exit') {
+    stateChip = <span className="chip bad" style={{minWidth:64,textAlign:'center'}}>EXITED</span>;
+  } else if (r.last_exit_event_type === 'trim') {
+    stateChip = <span className="chip warn" style={{minWidth:64,textAlign:'center'}}>TRIMMED</span>;
+  } else {
+    stateChip = <span className="chip" style={{minWidth:64,textAlign:'center'}}>ROLLED OFF</span>;
+  }
+
+  return (
+    <div
+      onClick={() => openMarket(r.condition_id, r.direction)}
+      style={{display:'flex',alignItems:'center',gap:12,padding:'12px 14px',borderTop:'1px solid var(--border)',cursor:'pointer'}}
+    >
+      {stateChip}
+      <div style={{flex:1, minWidth:0}}>
+        <div style={{fontSize:13.5,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>
+          <b>{r.market_question || (r.condition_id ? r.condition_id.slice(0,12)+'…' : '?')}</b>
+          {' · '}
+          <span className={`mono ${r.direction==='YES'?'pos':'neg'}`}>{r.direction}</span>
+        </div>
+        <div className="muted mono" style={{fontSize:11,marginTop:2}}>
+          peak {r.peak_trader_count ?? '?'} traders · {fmtUSD(r.peak_aggregate_usdc)}
+          {r.recent_cur_price != null ? ` · price $${Number(r.recent_cur_price).toFixed(2)}` : ''}
+          {firedInText ? ` · fires on ${firedInText}` : ''}
+        </div>
+      </div>
+      <div className="muted mono" style={{fontSize:11,whiteSpace:'nowrap',textAlign:'right'}}>
+        <div>{r.first_fired_at ? tsAgo(r.first_fired_at) : ''}</div>
+        <div style={{fontSize:10,opacity:0.7,marginTop:2}}>
+          {r.first_fired_at ? new Date(r.first_fired_at).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : ''}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ActivityCard({ exits, loading, error, openMarket }) {
   // Dedup: signal_exits fires once per (mode, category, top_n) combo, so the
-  // same market exit shows up 3+ times (absolute/sports + hybrid/sports +
-  // specialist/sports + specialist/overall ...). Collapse to one row per
-  // (condition_id, direction), keeping the most recent exited_at.
+  // same market exit shows up 3+ times. Collapse to one row per (condition_id,
+  // direction), keeping the most-recent exited_at.
   const sorted = [...exits].sort(
     (a,b) => new Date(b.exited_at||0) - new Date(a.exited_at||0),
   );
@@ -164,7 +358,7 @@ function ActivityCard({ exits, loading, error, openMarket }) {
   return (
     <div className="card">
       <div className="card-head">
-        <h3>What's happening · last 72h</h3>
+        <h3>Exits / trims · last 72h</h3>
         <span className="muted mono" style={{fontSize:11}}>GET /signals/exits/recent?hours=72</span>
       </div>
       {loading && rows.length === 0 && (
@@ -187,8 +381,7 @@ function ActivityCard({ exits, loading, error, openMarket }) {
 function ExitRow({ r, openMarket }) {
   // /signals/exits/recent doesn't currently return event_type per row, so we
   // infer the tier from the drop magnitude: trader_count or aggregate dropping
-  // 50%+ = exit (red), 25-50% = trim (amber). Matches the detector's own
-  // tiering (signal_exits.event_type column).
+  // 50%+ = exit (red), 25-50% = trim (amber).
   const traderRetention = r.peak_trader_count > 0
     ? r.exit_trader_count / r.peak_trader_count : 0;
   const aggRetention = r.peak_aggregate_usdc > 0

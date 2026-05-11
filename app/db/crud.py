@@ -2489,6 +2489,130 @@ async def list_lost_signals(
     return [dict(r) for r in rows]
 
 
+async def list_recent_signals(
+    conn: asyncpg.Connection,
+    *,
+    hours: int,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Signals whose very first fire (earliest first_fired_at across all
+    mode/category/top_n combos) landed within the last `hours`.
+
+    Powers the News tab "New signals" card -- one row per (cid, direction)
+    regardless of which combos surfaced it. For each pair we pick the
+    signal_log row with the largest peak_aggregate_usdc as the canonical
+    representative (same convention as list_lost_signals), and we report
+    which combos it is currently firing on (last_seen_at within the last
+    20 minutes -- two clean misses of the 10-min refresh).
+
+    Sorted by earliest_first_fired_at DESC so the freshest arrival is first.
+    """
+    rows = await conn.fetch(
+        """
+        WITH first_fired AS (
+            SELECT
+                condition_id, direction,
+                MIN(first_fired_at) AS earliest_first_fired_at,
+                MAX(last_seen_at)   AS latest_last_seen_at
+            FROM signal_log
+            GROUP BY condition_id, direction
+        ),
+        recent AS (
+            SELECT condition_id, direction,
+                   earliest_first_fired_at, latest_last_seen_at
+            FROM first_fired
+            WHERE earliest_first_fired_at >= NOW() - make_interval(hours => $1)
+        ),
+        chosen AS (
+            SELECT DISTINCT ON (sl.condition_id, sl.direction)
+                sl.id AS signal_log_id,
+                sl.condition_id, sl.direction,
+                sl.peak_trader_count, sl.peak_aggregate_usdc,
+                sl.first_top_trader_entry_price,
+                sl.signal_entry_offer,
+                sl.signal_entry_spread_bps,
+                sl.liquidity_tier,
+                r.earliest_first_fired_at,
+                r.latest_last_seen_at
+            FROM signal_log sl
+            JOIN recent r USING (condition_id, direction)
+            ORDER BY
+                sl.condition_id, sl.direction,
+                sl.peak_aggregate_usdc DESC NULLS LAST,
+                sl.first_fired_at ASC
+        ),
+        fired_in_combos AS (
+            -- Combos still actively firing this (cid, direction) -- last_seen_at
+            -- within the 20-min "two clean misses" window.
+            SELECT
+                sl.condition_id, sl.direction,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'mode', sl.mode,
+                        'category', sl.category,
+                        'top_n', sl.top_n
+                    )
+                    ORDER BY sl.mode, sl.category, sl.top_n
+                ) AS fired_in
+            FROM signal_log sl
+            JOIN recent r USING (condition_id, direction)
+            WHERE sl.last_seen_at >= NOW() - INTERVAL '20 minutes'
+            GROUP BY sl.condition_id, sl.direction
+        ),
+        last_exit AS (
+            SELECT DISTINCT ON (sl.condition_id, sl.direction)
+                sl.condition_id, sl.direction,
+                se.event_type AS last_exit_event_type,
+                se.exited_at  AS last_exit_at
+            FROM signal_exits se
+            JOIN signal_log sl ON sl.id = se.signal_log_id
+            JOIN recent r USING (condition_id, direction)
+            ORDER BY sl.condition_id, sl.direction, se.exited_at DESC
+        )
+        SELECT
+            c.signal_log_id, c.condition_id, c.direction,
+            c.earliest_first_fired_at AS first_fired_at,
+            c.latest_last_seen_at     AS last_seen_at,
+            c.peak_trader_count,
+            c.peak_aggregate_usdc::float           AS peak_aggregate_usdc,
+            c.first_top_trader_entry_price::float  AS smart_money_entry_price,
+            c.signal_entry_offer::float            AS signal_entry_offer,
+            c.signal_entry_spread_bps,
+            c.liquidity_tier,
+            m.question                 AS market_question,
+            m.slug                     AS market_slug,
+            e.category                 AS market_category,
+            m.event_id,
+            m.closed                   AS market_closed,
+            m.resolved_outcome,
+            m.end_date,
+            (
+                SELECT AVG(p.cur_price)::float
+                FROM positions p
+                WHERE p.condition_id = c.condition_id
+                  AND UPPER(p.outcome) = c.direction
+                  AND p.last_updated_at >= NOW() - INTERVAL '7 days'
+            ) AS recent_cur_price,
+            COALESCE(fic.fired_in, '[]'::jsonb) AS fired_in,
+            le.last_exit_event_type,
+            le.last_exit_at
+        FROM chosen c
+        LEFT JOIN markets m ON m.condition_id = c.condition_id
+        LEFT JOIN events  e ON e.id = m.event_id
+        LEFT JOIN fired_in_combos fic
+               ON fic.condition_id = c.condition_id
+              AND fic.direction    = c.direction
+        LEFT JOIN last_exit le
+               ON le.condition_id = c.condition_id
+              AND le.direction    = c.direction
+        ORDER BY c.earliest_first_fired_at DESC
+        LIMIT $2
+        """,
+        hours, limit,
+    )
+    return [dict(r) for r in rows]
+
+
 async def insider_holdings_for_markets(
     conn: asyncpg.Connection, condition_ids: list[str],
 ) -> set[tuple[str, str]]:
