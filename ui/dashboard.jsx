@@ -183,6 +183,18 @@ function SignalCard({ sig, topN, openMarket, openTrader }) {
   // bound skew by lower of headcount/dollar
   const boundSkew = Math.min(sig.direction_skew, sig.direction_dollar_skew);
 
+  // Freshness box: how long since this signal first fired anywhere.
+  // Color tiers: <6h = accent (fresh, worth a look), <24h = amber (recent),
+  // <7d = neutral, older = muted. Candidates (no signal_log) get nothing.
+  const firedHoursAgo = sig.first_fired_at
+    ? (Date.now() - new Date(sig.first_fired_at).getTime()) / 3600000
+    : null;
+  const freshTier = firedHoursAgo == null ? null
+    : firedHoursAgo < 6  ? { bg: 'rgba(34,197,94,0.12)',  fg: 'var(--accent)', bd: 'rgba(34,197,94,0.35)' }
+    : firedHoursAgo < 24 ? { bg: 'rgba(245,158,11,0.10)', fg: 'var(--amber)',  bd: 'rgba(245,158,11,0.30)' }
+    : firedHoursAgo < 168 ? { bg: 'var(--surface-2)',     fg: 'var(--text-2)', bd: 'var(--border)' }
+    : { bg: 'transparent', fg: 'var(--text-3)', bd: 'var(--border)' };
+
   return (
     <div className={cardClasses.join(' ')}>
       <div className="signal-top" onClick={() => openMarket(sig.condition_id, sig.direction)}>
@@ -199,15 +211,31 @@ function SignalCard({ sig, topN, openMarket, openTrader }) {
               {sig.signal_entry_source === 'clob_l2' ? 'L2 BOOK' : sig.signal_entry_source === 'gamma_fallback' ? 'GAMMA FALLBACK' : 'NO ENTRY'}
             </span>
             {sig.liquidity_tier && <span className="chip">{sig.liquidity_tier.toUpperCase()} BOOK · {fmtUSD(sig.liquidity_at_signal_usdc)}</span>}
-            {sig.first_fired_at && <span className="chip">{tsAgo(sig.first_fired_at)}</span>}
             {isStale && <span className="chip warn">STALE</span>}
             {sig.counterparty_count >= 3 && <span className="chip bad">⚠ 3+ TOP TRADERS OPPOSING</span>}
             {sig.counterparty_count >= 1 && sig.counterparty_count < 3 && <span className="chip warn">⚠ {sig.counterparty_count} OPPOSING</span>}
           </div>
           <h3 className={`signal-q ${isStale ? '' : ''}`}>{sig.market_question}</h3>
         </div>
-        <div className={`dir-badge ${sig.direction.toLowerCase()} ${isStale ? 'struck' : ''}`}>
-          ◆ {sig.direction} · {Math.round(boundSkew * 100)}%
+        <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:8}}>
+          <div className={`dir-badge ${sig.direction.toLowerCase()} ${isStale ? 'struck' : ''}`}>
+            ◆ {sig.direction} · {Math.round(boundSkew * 100)}%
+          </div>
+          {freshTier && (
+            <div
+              title={`First fired ${new Date(sig.first_fired_at).toLocaleString()}`}
+              style={{
+                fontSize: 11, fontFamily: 'var(--font-mono)',
+                padding: '4px 10px', borderRadius: 6,
+                background: freshTier.bg, color: freshTier.fg,
+                border: `1px solid ${freshTier.bd}`,
+                letterSpacing: '0.04em', textTransform: 'uppercase',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              Fired {tsAgo(sig.first_fired_at)}
+            </div>
+          )}
         </div>
       </div>
 

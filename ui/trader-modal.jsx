@@ -157,7 +157,12 @@ function TraderModal({ wallet, onClose, onBack, openMarket }) {
                     </td>
                     <td><span className={`dir-badge ${p.outcome.toLowerCase()}`} style={{padding:'2px 8px',fontSize:11}}>{p.outcome.toUpperCase()}</span></td>
                     <td className="num">{fmtUSD(p.current_value)}</td>
-                    <td className="num muted">{p.avg_price != null ? `$${Number(p.avg_price).toFixed(2)}` : '—'}</td>
+                    <td className="num muted">
+                      {p.avg_price != null ? `$${Number(p.avg_price).toFixed(2)}` : '—'}
+                      {p.size != null && p.avg_price != null && (
+                        <div className="mono muted" style={{fontSize:11}}>cost {fmtUSD(Number(p.size) * Number(p.avg_price))}</div>
+                      )}
+                    </td>
                     <td className="num">{p.cur_price != null ? `$${Number(p.cur_price).toFixed(2)}` : '—'}</td>
                     <td className={`num ${p.cash_pnl >= 0 ? 'pos' : 'neg'}`}>{fmtUSD(p.cash_pnl)} <span className="muted">({p.percent_pnl != null ? `${Number(p.percent_pnl) >= 0 ? '+' : ''}${Number(p.percent_pnl).toFixed(1)}%` : '—'})</span></td>
                     <td className="num">{fmtPct(p.portfolio_fraction)}</td>

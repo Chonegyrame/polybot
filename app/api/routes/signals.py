@@ -17,6 +17,107 @@ from app.services.signal_detector import detect_signals
 router = APIRouter(prefix="/signals", tags=["signals"])
 
 
+async def _enrich_signals(
+    conn: asyncpg.Connection,
+    signals: list[Any],
+    *,
+    mode: str,
+    category: str,
+    top_n: int,
+) -> list[dict[str, Any]]:
+    """Enrich raw Signal dataclasses with persisted signal_log fields, exit
+    state, lens info, and insider overlap. Shared by /signals/active and
+    /signals/new so both endpoints emit identical card-shaped dicts."""
+    if not signals:
+        return []
+    cids = [s.condition_id for s in signals]
+    insider_pairs = await crud.insider_holdings_for_markets(conn, cids)
+    info_by_key = await crud.get_signal_enrichment(
+        conn, mode=mode, category=category, top_n=top_n, condition_ids=cids,
+    )
+    out: list[dict[str, Any]] = []
+    for s in signals:
+        d = asdict(s)
+        extra = info_by_key.get((s.condition_id, s.direction))
+        d["signal_log_id"] = extra["signal_log_id"] if extra else None
+        d["first_fired_at"] = (
+            extra["first_fired_at"].isoformat()
+            if extra and extra["first_fired_at"] is not None else None
+        )
+        d["last_seen_at"] = (
+            extra["last_seen_at"].isoformat()
+            if extra and extra["last_seen_at"] is not None else None
+        )
+        d["peak_trader_count"] = (
+            extra["signal_peak_trader_count"]
+            if extra and extra.get("signal_peak_trader_count") is not None else None
+        )
+        d["peak_aggregate_usdc"] = (
+            float(extra["signal_peak_aggregate_usdc"])
+            if extra and extra.get("signal_peak_aggregate_usdc") is not None else None
+        )
+        d["signal_entry_spread_bps"] = (
+            extra["signal_entry_spread_bps"]
+            if extra and extra.get("signal_entry_spread_bps") is not None else None
+        )
+        d["liquidity_tier"] = extra["liquidity_tier"] if extra else None
+        d["liquidity_at_signal_usdc"] = (
+            float(extra["liquidity_at_signal_usdc"])
+            if extra and extra["liquidity_at_signal_usdc"] is not None else None
+        )
+        d["signal_entry_offer"] = (
+            float(extra["signal_entry_offer"])
+            if extra and extra["signal_entry_offer"] is not None else None
+        )
+        d["signal_entry_source"] = extra["signal_entry_source"] if extra else None
+        smart_money_basis = (
+            float(extra["first_top_trader_entry_price"])
+            if extra and extra.get("first_top_trader_entry_price") is not None else None
+        )
+        if d["signal_entry_offer"] is not None and smart_money_basis and smart_money_basis > 0:
+            d["gap_to_smart_money"] = d["signal_entry_offer"] / smart_money_basis - 1.0
+        else:
+            d["gap_to_smart_money"] = None
+        d["lens_count"] = (
+            int(extra["lens_count"]) if extra and extra.get("lens_count") is not None else 1
+        )
+        d["lens_list"] = list(extra["lens_list"]) if extra and extra.get("lens_list") else []
+        d["counterparty_count"] = (
+            int(extra["counterparty_count"]) if extra and extra.get("counterparty_count") is not None else 0
+        )
+        d["counterparty_warning"] = d["counterparty_count"] > 0
+        if extra and extra["exit_id"] is not None:
+            d["has_exited"] = True
+            d["exit_event"] = {
+                "exited_at": (
+                    extra["exited_at"].isoformat()
+                    if extra["exited_at"] is not None else None
+                ),
+                "drop_reason": extra["exit_drop_reason"],
+                "exit_bid_price": (
+                    float(extra["exit_bid_price"])
+                    if extra["exit_bid_price"] is not None else None
+                ),
+                "exit_trader_count": extra["exit_trader_count"],
+                "peak_trader_count": extra["peak_trader_count"],
+                "exit_aggregate_usdc": (
+                    float(extra["exit_aggregate_usdc"])
+                    if extra["exit_aggregate_usdc"] is not None else None
+                ),
+                "peak_aggregate_usdc": (
+                    float(extra["peak_aggregate_usdc"])
+                    if extra["peak_aggregate_usdc"] is not None else None
+                ),
+                "event_type": extra.get("exit_event_type"),
+            }
+        else:
+            d["has_exited"] = False
+            d["exit_event"] = None
+        d["has_insider"] = (s.condition_id, s.direction) in insider_pairs
+        out.append(d)
+    return out
+
+
 @router.get("/active")
 async def get_active_signals(
     mode: str = Query("absolute"),
@@ -28,12 +129,6 @@ async def get_active_signals(
 
     Computed live (not from signal_log) so the UI sees the latest state.
     The signal_log is for historical / backtest purposes, not display.
-
-    Each signal is enriched with `liquidity_tier` (and `liquidity_at_signal_usdc`
-    when available) from signal_log, since orderbook depth was captured at
-    first-fire and isn't recomputed live. Fresh signals never previously
-    fired carry liquidity_tier=None — the UI should render that as a hint
-    that depth hasn't been measured yet.
     """
     if mode not in VALID_MODES:
         raise HTTPException(400, f"mode must be one of {VALID_MODES}")
@@ -46,119 +141,9 @@ async def get_active_signals(
         category=category,     # type: ignore[arg-type]
         top_n=top_n,
     )
-
-    # Enrich with liquidity_tier from signal_log + exit info from signal_exits
-    # (single bulk query, LEFT JOIN signal_exits so non-exited signals come
-    # back with NULLs). B12 also fetches insider holdings to flag any signal
-    # whose contributing pool overlaps the manually curated insider list.
-    enriched: list[dict[str, Any]] = []
-    if signals:
-        cids = [s.condition_id for s in signals]
-        insider_pairs = await crud.insider_holdings_for_markets(conn, cids)
-        # F23: extracted to crud.get_signal_enrichment (CLAUDE.md rule)
-        info_by_key = await crud.get_signal_enrichment(
-            conn, mode=mode, category=category, top_n=top_n, condition_ids=cids,
-        )
-        for s in signals:
-            d = asdict(s)
-            extra = info_by_key.get((s.condition_id, s.direction))
-            # signal_log linkage — enables /signals/{id}/contributors lookup
-            # and the freshness/peak fields the UI signal card displays.
-            d["signal_log_id"] = extra["signal_log_id"] if extra else None
-            d["first_fired_at"] = (
-                extra["first_fired_at"].isoformat()
-                if extra and extra["first_fired_at"] is not None else None
-            )
-            d["last_seen_at"] = (
-                extra["last_seen_at"].isoformat()
-                if extra and extra["last_seen_at"] is not None else None
-            )
-            d["peak_trader_count"] = (
-                extra["signal_peak_trader_count"]
-                if extra and extra.get("signal_peak_trader_count") is not None else None
-            )
-            d["peak_aggregate_usdc"] = (
-                float(extra["signal_peak_aggregate_usdc"])
-                if extra and extra.get("signal_peak_aggregate_usdc") is not None else None
-            )
-            d["signal_entry_spread_bps"] = (
-                extra["signal_entry_spread_bps"]
-                if extra and extra.get("signal_entry_spread_bps") is not None else None
-            )
-            d["liquidity_tier"] = extra["liquidity_tier"] if extra else None
-            d["liquidity_at_signal_usdc"] = (
-                float(extra["liquidity_at_signal_usdc"])
-                if extra and extra["liquidity_at_signal_usdc"] is not None else None
-            )
-            d["signal_entry_offer"] = (
-                float(extra["signal_entry_offer"])
-                if extra and extra["signal_entry_offer"] is not None else None
-            )
-            d["signal_entry_source"] = extra["signal_entry_source"] if extra else None
-            # gap_to_smart_money: signed fraction (entry_offer / smart-money cost basis - 1).
-            # Negative = price moved AWAY from smart money (cheaper than they entered).
-            # Positive = price moved TOWARD smart money's profit zone (less edge left).
-            # Computed here so the UI doesn't have to recompute and the default
-            # signal-feed sort can read a single field. Uses the persisted
-            # first_top_trader_entry_price from signal_log rather than the live
-            # avg_entry_price so backtest and live numbers match.
-            smart_money_basis = (
-                float(extra["first_top_trader_entry_price"])
-                if extra and extra.get("first_top_trader_entry_price") is not None else None
-            )
-            if d["signal_entry_offer"] is not None and smart_money_basis and smart_money_basis > 0:
-                d["gap_to_smart_money"] = d["signal_entry_offer"] / smart_money_basis - 1.0
-            else:
-                d["gap_to_smart_money"] = None
-            # Lens count / list — same shape vw_signals_unique_market exposes
-            # to backtest. Format is "mode/category" (slash-separated).
-            d["lens_count"] = (
-                int(extra["lens_count"]) if extra and extra.get("lens_count") is not None else 1
-            )
-            d["lens_list"] = list(extra["lens_list"]) if extra and extra.get("lens_list") else []
-            # R4+R7 (Pass 3): counterparty_count is the new int. Boolean
-            # warning is derived for back-compat (count > 0 -> True).
-            d["counterparty_count"] = (
-                int(extra["counterparty_count"]) if extra and extra.get("counterparty_count") is not None else 0
-            )
-            d["counterparty_warning"] = d["counterparty_count"] > 0
-            # B1: exit-event enrichment. `has_exited` is the simple bool the
-            # UI uses for the strikethrough/badge. `exit_event` carries the
-            # detail dict for tooltips and side-by-side strategy compare.
-            # event_type ('trim'|'exit') drives the UI tier — trim = banner
-            # only (amber), exit = banner + paper-trade auto-close (red).
-            if extra and extra["exit_id"] is not None:
-                d["has_exited"] = True
-                d["exit_event"] = {
-                    "exited_at": (
-                        extra["exited_at"].isoformat()
-                        if extra["exited_at"] is not None else None
-                    ),
-                    "drop_reason": extra["exit_drop_reason"],
-                    "exit_bid_price": (
-                        float(extra["exit_bid_price"])
-                        if extra["exit_bid_price"] is not None else None
-                    ),
-                    "exit_trader_count": extra["exit_trader_count"],
-                    "peak_trader_count": extra["peak_trader_count"],
-                    "exit_aggregate_usdc": (
-                        float(extra["exit_aggregate_usdc"])
-                        if extra["exit_aggregate_usdc"] is not None else None
-                    ),
-                    "peak_aggregate_usdc": (
-                        float(extra["peak_aggregate_usdc"])
-                        if extra["peak_aggregate_usdc"] is not None else None
-                    ),
-                    "event_type": extra.get("exit_event_type"),
-                }
-            else:
-                d["has_exited"] = False
-                d["exit_event"] = None
-            # B12: insider overlap — True if any insider wallet currently holds
-            # this side of this market in `positions`.
-            d["has_insider"] = (s.condition_id, s.direction) in insider_pairs
-            enriched.append(d)
-
+    enriched = await _enrich_signals(
+        conn, signals, mode=mode, category=category, top_n=top_n,
+    )
     return {
         "mode": mode,
         "category": category,
