@@ -151,7 +151,7 @@ function Sparkline({ data, w = 80, h = 24, color }) {
 }
 
 // ---------- Sidebar ----------
-function Sidebar({ route, setRoute, newsUnread = 0 }) {
+function Sidebar({ route, setRoute, newsUnread = 0, insiderUnread = 0 }) {
   const items = [
     { id: 'dashboard', label: 'Dashboard',  ic: I.feed },
     { id: 'traders',   label: 'Top Traders', ic: I.traders },
@@ -180,7 +180,11 @@ function Sidebar({ route, setRoute, newsUnread = 0 }) {
       <div className="nav-group-label">Workspace</div>
       <div className="nav-item" onClick={()=>setRoute('testing/backtest')}><span style={{width:16,height:16}}>{I.chart}</span><span className="nav-label">Backtest</span></div>
       <div className="nav-item" onClick={()=>setRoute('testing/diag')}><span style={{width:16,height:16}}>{I.pulse}</span><span className="nav-label">Diagnostics</span></div>
-      <div className={`nav-item ${route==='insider'?'active':''}`} onClick={()=>setRoute('insider')}><span style={{width:16,height:16}}>{I.insider}</span><span className="nav-label">Insider wallets</span></div>
+      <div className={`nav-item ${route==='insider'?'active':''}`} onClick={()=>setRoute('insider')}>
+        <span style={{width:16,height:16}}>{I.insider}</span>
+        <span className="nav-label">Insider wallets</span>
+        {insiderUnread > 0 ? <span className="nav-badge">{insiderUnread}</span> : null}
+      </div>
 
       <div className="sidebar-foot">
         <HealthPillSide />

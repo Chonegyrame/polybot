@@ -334,16 +334,25 @@ async def upsert_event(
     tags: list[dict[str, Any]] | None,
     end_date: datetime | None,
     closed: bool,
+    start_time: datetime | None = None,
 ) -> None:
+    """Upsert an event. `start_time` (optional) is gamma's `startTime` —
+    the actual match start. Distinct from `end_date` (market resolution).
+    Used by the LoL collector as the active-window anchor since some matches
+    start hours before market resolution (notably BO5s with long buffers).
+    """
     await conn.execute(
         """
-        INSERT INTO events (id, slug, title, category, tags, end_date, closed, last_synced_at)
-        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, NOW())
+        INSERT INTO events (id, slug, title, category, tags, start_time, end_date, closed, last_synced_at)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, NOW())
         ON CONFLICT (id) DO UPDATE SET
             slug           = EXCLUDED.slug,
             title          = EXCLUDED.title,
             category       = EXCLUDED.category,
             tags           = EXCLUDED.tags,
+            -- COALESCE: don't overwrite a populated start_time with NULL
+            -- from a response that happens to omit it.
+            start_time     = COALESCE(EXCLUDED.start_time, events.start_time),
             end_date       = EXCLUDED.end_date,
             -- Pass 5 #14: monotonic. Once an event is marked closed,
             -- a later gamma response with closed=false (transient blip
@@ -359,6 +368,7 @@ async def upsert_event(
         title,
         category,
         json.dumps(tags) if tags is not None else None,
+        start_time,
         end_date,
         closed,
     )
@@ -1882,6 +1892,231 @@ async def list_insider_wallet_proxies(conn: asyncpg.Connection) -> list[str]:
     return [r["proxy_wallet"] for r in rows]
 
 
+# ---------------------------------------------------------------------------
+# insider_actions — NEW/TRIM/SELL feed (migration 021)
+# ---------------------------------------------------------------------------
+
+# A position-size reduction this fraction or larger fires a TRIM. Smaller
+# reductions are treated as rebalancing noise. Locked 2026-05-18.
+INSIDER_TRIM_THRESHOLD = 0.25
+
+
+async def compute_insider_actions(
+    conn: asyncpg.Connection,
+    proxy_wallet: str,
+    fresh_positions: Iterable[Any],
+) -> list[dict[str, Any]]:
+    """Diff fresh_positions against what's in the `positions` table for one
+    insider wallet, returning NEW/TRIM/SELL action dicts.
+
+    MUST be called BEFORE `upsert_positions_for_trader` for the same wallet —
+    otherwise existing state has already been overwritten and we'd see no
+    diff. Pure function (no writes) so callers can decide whether to log.
+
+    Sizing rules:
+      NEW   — (condition_id, asset) absent from DB, present now
+      SELL  — present in DB, absent from fresh set
+      TRIM  — size shrank by ≥INSIDER_TRIM_THRESHOLD (still > 0)
+    Position-size increases are intentionally not tracked in V1.
+    """
+    fresh_list = list(fresh_positions)
+
+    existing_rows = await conn.fetch(
+        """
+        SELECT condition_id, asset, outcome, size, cur_price
+        FROM positions
+        WHERE proxy_wallet = $1
+        """,
+        proxy_wallet,
+    )
+    existing_map: dict[tuple[str, str], dict[str, Any]] = {
+        (r["condition_id"], r["asset"]): dict(r) for r in existing_rows
+    }
+    fresh_map: dict[tuple[str, str], Any] = {
+        (p.condition_id, p.asset): p for p in fresh_list
+    }
+
+    actions: list[dict[str, Any]] = []
+
+    for key, old in existing_map.items():
+        if key in fresh_map:
+            continue
+        old_size = float(old["size"] or 0)
+        old_price = float(old["cur_price"]) if old["cur_price"] is not None else None
+        actions.append(
+            {
+                "proxy_wallet": proxy_wallet,
+                "condition_id": key[0],
+                "asset": key[1],
+                "outcome": old["outcome"],
+                "action_type": "SELL",
+                "size_before": old_size,
+                "size_after": 0.0,
+                "size_delta": -old_size,
+                "cur_price": old_price,
+                "value_delta_usd": -old_size * (old_price or 0.0),
+            }
+        )
+
+    for key, new in fresh_map.items():
+        old = existing_map.get(key)
+        new_size = float(new.size or 0)
+        new_price = float(new.cur_price) if new.cur_price is not None else None
+        if old is None:
+            actions.append(
+                {
+                    "proxy_wallet": proxy_wallet,
+                    "condition_id": key[0],
+                    "asset": key[1],
+                    "outcome": new.outcome,
+                    "action_type": "NEW",
+                    "size_before": 0.0,
+                    "size_after": new_size,
+                    "size_delta": new_size,
+                    "cur_price": new_price,
+                    "value_delta_usd": float(new.current_value or 0.0),
+                }
+            )
+            continue
+        old_size = float(old["size"] or 0)
+        if old_size <= 0:
+            continue
+        if new_size < old_size * (1 - INSIDER_TRIM_THRESHOLD):
+            actions.append(
+                {
+                    "proxy_wallet": proxy_wallet,
+                    "condition_id": key[0],
+                    "asset": key[1],
+                    "outcome": new.outcome,
+                    "action_type": "TRIM",
+                    "size_before": old_size,
+                    "size_after": new_size,
+                    "size_delta": new_size - old_size,
+                    "cur_price": new_price,
+                    "value_delta_usd": (new_size - old_size) * (new_price or 0.0),
+                }
+            )
+
+    return actions
+
+
+async def log_insider_actions(
+    conn: asyncpg.Connection, actions: list[dict[str, Any]],
+) -> None:
+    """Batch insert action rows. No-op on empty list."""
+    if not actions:
+        return
+    await conn.executemany(
+        """
+        INSERT INTO insider_actions (
+            proxy_wallet, condition_id, asset, outcome, action_type,
+            size_before, size_after, size_delta, cur_price, value_delta_usd
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        """,
+        [
+            (
+                a["proxy_wallet"], a["condition_id"], a["asset"], a["outcome"],
+                a["action_type"], a["size_before"], a["size_after"],
+                a["size_delta"], a["cur_price"], a["value_delta_usd"],
+            )
+            for a in actions
+        ],
+    )
+
+
+async def list_positions_for_wallet(
+    conn: asyncpg.Connection, proxy_wallet: str,
+) -> list[dict[str, Any]]:
+    """Open positions for one wallet enriched with market question/slug.
+    Sorted biggest-value-first so the expanded row shows meaningful bets
+    at the top.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT p.condition_id, p.asset, p.outcome,
+               p.size, p.avg_price, p.cur_price,
+               p.initial_value, p.current_value,
+               p.cash_pnl, p.realized_pnl, p.percent_pnl,
+               p.first_seen_at, p.last_updated_at,
+               m.question, m.slug
+        FROM positions p
+        LEFT JOIN markets m ON m.condition_id = p.condition_id
+        WHERE p.proxy_wallet = $1
+        ORDER BY p.current_value DESC NULLS LAST, p.size DESC
+        """,
+        proxy_wallet,
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_recent_insider_actions(
+    conn: asyncpg.Connection, limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Recent actions across all insider wallets, joined with wallet label
+    and market question for display."""
+    rows = await conn.fetch(
+        """
+        SELECT a.id, a.proxy_wallet, a.condition_id, a.asset, a.outcome,
+               a.action_type, a.size_before, a.size_after, a.size_delta,
+               a.cur_price, a.value_delta_usd, a.occurred_at, a.seen_at,
+               iw.label,
+               m.question, m.slug
+        FROM insider_actions a
+        JOIN insider_wallets iw ON iw.proxy_wallet = a.proxy_wallet
+        LEFT JOIN markets m ON m.condition_id = a.condition_id
+        ORDER BY a.occurred_at DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+    return [dict(r) for r in rows]
+
+
+async def list_recent_insider_actions_for_wallet(
+    conn: asyncpg.Connection, proxy_wallet: str, limit: int = 1,
+) -> list[dict[str, Any]]:
+    """Most-recent N actions for one wallet — drives the per-wallet activity
+    strip in the UI. Default limit=1 because the strip shows only the latest."""
+    rows = await conn.fetch(
+        """
+        SELECT a.id, a.proxy_wallet, a.condition_id, a.asset, a.outcome,
+               a.action_type, a.size_before, a.size_after, a.size_delta,
+               a.cur_price, a.value_delta_usd, a.occurred_at,
+               m.question, m.slug
+        FROM insider_actions a
+        LEFT JOIN markets m ON m.condition_id = a.condition_id
+        WHERE a.proxy_wallet = $1
+        ORDER BY a.occurred_at DESC
+        LIMIT $2
+        """,
+        proxy_wallet, limit,
+    )
+    return [dict(r) for r in rows]
+
+
+async def count_unseen_insider_actions(conn: asyncpg.Connection) -> int:
+    n = await conn.fetchval(
+        "SELECT COUNT(*) FROM insider_actions WHERE seen_at IS NULL"
+    )
+    return int(n or 0)
+
+
+async def mark_insider_actions_seen(conn: asyncpg.Connection) -> int:
+    """Mark every unseen action as seen. Returns the count marked.
+    Called when the user opens the Insider wallets page."""
+    result = await conn.execute(
+        "UPDATE insider_actions SET seen_at = NOW() WHERE seen_at IS NULL"
+    )
+    # asyncpg execute returns e.g. "UPDATE 7"
+    if result.startswith("UPDATE "):
+        try:
+            return int(result.split()[1])
+        except (IndexError, ValueError):
+            return 0
+    return 0
+
+
 async def list_signals_pending_price_snapshots(
     conn: asyncpg.Connection,
     *,
@@ -3069,3 +3304,328 @@ async def get_signal_contributors_and_counterparty(
         "counterparty": counterparty,
         "summary": summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Polymarket LoL collector
+# ---------------------------------------------------------------------------
+
+
+async def upsert_lol_market_meta(
+    conn: asyncpg.Connection,
+    *,
+    condition_id: str,
+    event_id: str,
+    market_kind: str,            # 'series' | 'game'
+    game_number: int | None,
+    bo_format: int | None,
+    team_a: str | None,
+    team_b: str | None,
+    league: str | None,
+    event_title: str | None,
+    starts_at_guess: datetime | None,
+    clob_token_a: str | None = None,
+    clob_token_b: str | None = None,
+    outcome_a_label: str | None = None,
+    outcome_b_label: str | None = None,
+    last_trade_price: float | None = None,
+    best_bid_at_sync: float | None = None,
+    best_ask_at_sync: float | None = None,
+    volume_num: float | None = None,
+    closed_time: datetime | None = None,
+    market_closed: bool | None = None,
+    resolved_outcome: str | None = None,
+) -> None:
+    """Upsert a row into polymarket_lol_market_meta — the LoL-specific
+    classification layer over the broader markets table.
+
+    The clob_token_a/b columns are populated from index-based pairing,
+    bypassing the markets table's Yes/No-label requirement (which
+    LoL game-winner markets routinely fail because outcomes are team names).
+
+    Closing-line scalar fields (last_trade_price, best_bid/ask_at_sync,
+    volume_num, closed_time) are harvested from the same gamma-api response
+    we already parse for metadata. These are the BEST source of closing-line
+    price information for resolved markets — the clob/prices-history endpoint
+    returns empty for resolved LoL markets (verified 2026-05-14).
+
+    `last_seen_at` is refreshed every call so the discovery job can prune
+    stale meta rows later.
+
+    COALESCE on the closing-line columns: once a market has resolved and we've
+    captured its closing scalar, subsequent discovery passes (which would
+    happen if the market briefly re-appears in the open-events feed during
+    a UMA dispute window) shouldn't overwrite the captured close with NULLs.
+    """
+    await conn.execute(
+        """
+        INSERT INTO polymarket_lol_market_meta (
+            condition_id, event_id, market_kind, game_number, bo_format,
+            team_a, team_b, league, event_title, starts_at_guess,
+            clob_token_a, clob_token_b, outcome_a_label, outcome_b_label,
+            last_trade_price, best_bid_at_sync, best_ask_at_sync,
+            volume_num, closed_time, market_closed, resolved_outcome,
+            classified_at, last_seen_at
+        )
+        VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9, $10,
+            $11, $12, $13, $14,
+            $15, $16, $17,
+            $18, $19, COALESCE($20, FALSE), $21,
+            NOW(), NOW()
+        )
+        ON CONFLICT (condition_id) DO UPDATE SET
+            event_id          = EXCLUDED.event_id,
+            market_kind       = EXCLUDED.market_kind,
+            game_number       = EXCLUDED.game_number,
+            bo_format         = EXCLUDED.bo_format,
+            team_a            = EXCLUDED.team_a,
+            team_b            = EXCLUDED.team_b,
+            league            = EXCLUDED.league,
+            event_title       = EXCLUDED.event_title,
+            starts_at_guess   = EXCLUDED.starts_at_guess,
+            clob_token_a      = COALESCE(EXCLUDED.clob_token_a, polymarket_lol_market_meta.clob_token_a),
+            clob_token_b     = COALESCE(EXCLUDED.clob_token_b, polymarket_lol_market_meta.clob_token_b),
+            outcome_a_label   = COALESCE(EXCLUDED.outcome_a_label, polymarket_lol_market_meta.outcome_a_label),
+            outcome_b_label   = COALESCE(EXCLUDED.outcome_b_label, polymarket_lol_market_meta.outcome_b_label),
+            last_trade_price  = COALESCE(EXCLUDED.last_trade_price, polymarket_lol_market_meta.last_trade_price),
+            best_bid_at_sync  = COALESCE(EXCLUDED.best_bid_at_sync, polymarket_lol_market_meta.best_bid_at_sync),
+            best_ask_at_sync  = COALESCE(EXCLUDED.best_ask_at_sync, polymarket_lol_market_meta.best_ask_at_sync),
+            volume_num        = COALESCE(EXCLUDED.volume_num, polymarket_lol_market_meta.volume_num),
+            closed_time       = COALESCE(EXCLUDED.closed_time, polymarket_lol_market_meta.closed_time),
+            -- Monotonic: once we've seen a market resolved, don't flip back.
+            market_closed     = (polymarket_lol_market_meta.market_closed OR EXCLUDED.market_closed),
+            resolved_outcome  = COALESCE(EXCLUDED.resolved_outcome, polymarket_lol_market_meta.resolved_outcome),
+            last_seen_at      = NOW()
+        """,
+        condition_id, event_id, market_kind, game_number, bo_format,
+        team_a, team_b, league, event_title, starts_at_guess,
+        clob_token_a, clob_token_b, outcome_a_label, outcome_b_label,
+        last_trade_price, best_bid_at_sync, best_ask_at_sync,
+        volume_num, closed_time, market_closed, resolved_outcome,
+    )
+
+
+async def insert_lol_price_snapshot(
+    conn: asyncpg.Connection,
+    *,
+    condition_id: str,
+    yes_bid: float | None = None,
+    yes_ask: float | None = None,
+    yes_mid: float | None = None,
+    no_bid: float | None = None,
+    no_ask: float | None = None,
+    no_mid: float | None = None,
+    yes_bid_size_5c: float | None = None,
+    yes_ask_size_5c: float | None = None,
+    spread_bps: int | None = None,
+    fetch_source: str = "clob_l2",
+    error_repr: str | None = None,
+) -> None:
+    """Append a price snapshot row. captured_at defaults to NOW() so the
+    20s-cadence snapshot job doesn't need to manage timestamps itself.
+    """
+    await conn.execute(
+        """
+        INSERT INTO polymarket_lol_price_snapshots (
+            condition_id, yes_bid, yes_ask, yes_mid,
+            no_bid, no_ask, no_mid,
+            yes_bid_size_5c, yes_ask_size_5c, spread_bps,
+            fetch_source, error_repr
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """,
+        condition_id, yes_bid, yes_ask, yes_mid,
+        no_bid, no_ask, no_mid,
+        yes_bid_size_5c, yes_ask_size_5c, spread_bps,
+        fetch_source, error_repr,
+    )
+
+
+async def list_lol_markets_active_tier(
+    conn: asyncpg.Connection,
+    *,
+    window_before_minutes: int = 30,
+    window_after_minutes: int = 360,
+    decided_threshold: float = 0.95,
+) -> list[asyncpg.Record]:
+    """Tier-1 markets to snapshot on the 20s cadence.
+
+    A market qualifies when ALL of:
+      - classified as a LoL market in our meta table
+      - not formally closed on Polymarket
+      - both CLOB token IDs known (snapshot needs both sides)
+      - within [start_time - 30min, start_time + 6h] (full BO5 buffer);
+        falls back to [end_date - 3h, end_date + 4h] when start_time is NULL
+      - NOT in "decided" state — i.e., the most recent snapshot's
+        yes_bid < decided_threshold AND no_bid < decided_threshold.
+        Markets where one side has hit 0.95+ are sitting in the
+        post-game/pre-settlement limbo and get the slower watcher cadence.
+
+    The "decided" check uses a lateral subquery against the latest snapshot
+    per market. Cost is fine — index on (condition_id, captured_at DESC).
+    """
+    rows = await conn.fetch(
+        """
+        WITH latest AS (
+            SELECT DISTINCT ON (s.condition_id)
+                s.condition_id,
+                s.yes_bid,
+                s.no_bid,
+                s.captured_at
+            FROM polymarket_lol_price_snapshots s
+            ORDER BY s.condition_id, s.captured_at DESC
+        )
+        SELECT
+            mm.condition_id,
+            mm.market_kind,
+            mm.game_number,
+            mm.event_id,
+            mm.team_a,
+            mm.team_b,
+            mm.clob_token_a,
+            mm.clob_token_b,
+            mm.outcome_a_label,
+            mm.outcome_b_label,
+            m.closed,
+            e.start_time,
+            e.end_date,
+            latest.yes_bid AS latest_yes_bid,
+            latest.no_bid  AS latest_no_bid
+        FROM polymarket_lol_market_meta mm
+        JOIN markets m ON m.condition_id = mm.condition_id
+        LEFT JOIN events e ON e.id = mm.event_id
+        LEFT JOIN latest ON latest.condition_id = mm.condition_id
+        WHERE
+            m.closed = FALSE
+            AND mm.clob_token_a IS NOT NULL
+            AND mm.clob_token_b IS NOT NULL
+            AND (
+                -- Anchor on start_time when we have it.
+                -- Window: start_time within [now - window_after, now + window_before].
+                -- i.e., match started up to window_after minutes ago AND/OR
+                -- starts up to window_before minutes from now.
+                (e.start_time IS NOT NULL
+                    AND e.start_time <= NOW() + ($1 || ' minutes')::INTERVAL
+                    AND e.start_time >= NOW() - ($2 || ' minutes')::INTERVAL
+                )
+                -- Fallback: start_time missing, use end_date with the
+                -- legacy [-3h, +4h] window.
+                OR (e.start_time IS NULL AND e.end_date IS NOT NULL
+                    AND e.end_date BETWEEN NOW() - INTERVAL '3 hours'
+                                       AND NOW() + INTERVAL '4 hours')
+            )
+            -- Decided filter: skip markets whose last snapshot shows one
+            -- side already at the threshold. Pass through markets with no
+            -- prior snapshot at all (fresh, never seen).
+            AND (
+                latest.condition_id IS NULL
+                OR (
+                    (latest.yes_bid IS NULL OR latest.yes_bid < $3)
+                    AND (latest.no_bid IS NULL OR latest.no_bid < $3)
+                )
+            )
+        ORDER BY e.start_time NULLS LAST, e.end_date NULLS LAST
+        """,
+        str(window_before_minutes),   # max minutes start_time can be in the future
+        str(window_after_minutes),    # max minutes start_time can be in the past
+        decided_threshold,
+    )
+    return list(rows)
+
+
+async def list_lol_markets_watcher_tier(
+    conn: asyncpg.Connection,
+    *,
+    watcher_horizon_hours: int = 24,
+    decided_threshold: float = 0.95,
+) -> list[asyncpg.Record]:
+    """Tier-2 markets to snapshot on the 5-min cadence.
+
+    Catches two market situations:
+      (a) PRE-GAME: classified market with start_time in the next
+          `watcher_horizon_hours`, outside Tier-1's [-30min, +6h]
+          active window. So we have low-resolution price history
+          before the game opens.
+      (b) DECIDED: in Tier-1's time window BUT the latest snapshot shows
+          one side >= decided_threshold. Game effectively over, waiting
+          for formal UMA settlement. We poll less aggressively.
+
+    Markets that qualify for Tier-1 do NOT appear here (mutually exclusive)
+    so we never double-poll. Closed markets are excluded entirely.
+    """
+    rows = await conn.fetch(
+        """
+        WITH latest AS (
+            SELECT DISTINCT ON (s.condition_id)
+                s.condition_id,
+                s.yes_bid,
+                s.no_bid
+            FROM polymarket_lol_price_snapshots s
+            ORDER BY s.condition_id, s.captured_at DESC
+        )
+        SELECT
+            mm.condition_id,
+            mm.market_kind,
+            mm.game_number,
+            mm.event_id,
+            mm.team_a,
+            mm.team_b,
+            mm.clob_token_a,
+            mm.clob_token_b,
+            e.start_time,
+            e.end_date,
+            CASE
+                WHEN latest.yes_bid >= $2 OR latest.no_bid >= $2 THEN 'decided'
+                ELSE 'pre_game'
+            END AS reason
+        FROM polymarket_lol_market_meta mm
+        JOIN markets m ON m.condition_id = mm.condition_id
+        LEFT JOIN events e ON e.id = mm.event_id
+        LEFT JOIN latest ON latest.condition_id = mm.condition_id
+        WHERE
+            m.closed = FALSE
+            AND mm.clob_token_a IS NOT NULL
+            AND mm.clob_token_b IS NOT NULL
+            AND (
+                -- (a) PRE-GAME: start_time in next watcher_horizon hours
+                --     AND not in the active tier's window
+                (
+                    e.start_time IS NOT NULL
+                    AND e.start_time BETWEEN NOW() AND NOW() + ($1 || ' hours')::INTERVAL
+                    AND e.start_time > NOW() + INTERVAL '30 minutes'
+                )
+                -- (b) DECIDED: in active tier's time window but latest
+                --     snapshot shows the game is effectively over
+                OR (
+                    latest.condition_id IS NOT NULL
+                    AND (latest.yes_bid >= $2 OR latest.no_bid >= $2)
+                    AND (
+                        (e.start_time IS NOT NULL
+                            AND e.start_time BETWEEN NOW() - INTERVAL '30 minutes'
+                                                 AND NOW() + INTERVAL '6 hours')
+                        OR (e.start_time IS NULL AND e.end_date IS NOT NULL
+                            AND e.end_date BETWEEN NOW() - INTERVAL '3 hours'
+                                               AND NOW() + INTERVAL '4 hours')
+                    )
+                )
+            )
+        ORDER BY e.start_time NULLS LAST, e.end_date NULLS LAST
+        """,
+        str(watcher_horizon_hours),
+        decided_threshold,
+    )
+    return list(rows)
+
+
+async def list_all_classified_lol_market_cids(
+    conn: asyncpg.Connection,
+) -> list[str]:
+    """Read-only helper for diagnostics / backfill scripts: every
+    condition_id we've classified into the LoL meta table.
+    """
+    rows = await conn.fetch(
+        "SELECT condition_id FROM polymarket_lol_market_meta ORDER BY classified_at DESC"
+    )
+    return [r["condition_id"] for r in rows]

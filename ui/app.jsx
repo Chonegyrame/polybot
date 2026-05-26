@@ -24,6 +24,9 @@ function App() {
   // the sidebar badge and the NewsPage share one polling timer instead of
   // two when the user is on the News tab.
   const newsFeed = useNewsBadge();
+  // Insider badge — polled every 30s, drives the unread count next to
+  // "Insider wallets" in the sidebar. Cleared when the user opens that page.
+  const insiderBadge = useInsiderBadge();
   // Paper trades: fetched live from GET /paper_trades, with mock fallback.
   // `placePaperTrade` POSTs to backend then re-fetches; offline writes go local.
   const [paperTrades, setPaperTrades] = useState(PB.PAPER_TRADES);
@@ -143,7 +146,7 @@ function App() {
 
   return (
     <div className="app">
-      <Sidebar route={route} setRoute={setRoute} newsUnread={newsFeed.unread} />
+      <Sidebar route={route} setRoute={setRoute} newsUnread={newsFeed.unread} insiderUnread={insiderBadge.count} />
       <main className="main">
         <ErrorBoundary key={route}>
           {route === 'dashboard' && (

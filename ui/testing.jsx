@@ -871,6 +871,149 @@ function DiagRow({ label, health, last, detail }) {
 // ============================================================
 // Insider Wallets page (tracked-wallet management)
 // ============================================================
+
+// Sidebar badge hook — App-level call, result passed into Sidebar. Polls every
+// 30s. Returns { count } where count = unseen NEW/TRIM/SELL actions. After the
+// Insider page calls POST /actions/mark_seen, the badge clears on the next
+// poll tick (up to 30s lag — acceptable since the user is on the page anyway).
+function useInsiderBadge() {
+  const res = useApi('/insider_wallets/actions/unseen_count', { count: 0 }, { pollMs: 30_000 });
+  return { count: res.data?.count || 0 };
+}
+window.useInsiderBadge = useInsiderBadge;
+
+// Color chip + verb for an action_type. Used in feed rows and per-wallet strips.
+const _ACTION_META = {
+  NEW:  { chip: 'ok',     verb: 'opened',  arrow: '▲' },
+  TRIM: { chip: 'warn',   verb: 'trimmed', arrow: '◐' },
+  SELL: { chip: 'bad',    verb: 'sold',    arrow: '▼' },
+};
+
+function ActionLine({ a, dense }) {
+  // One-line action summary used both in the global activity feed and in the
+  // per-wallet "latest activity" strip. Density flag tightens font sizes.
+  const meta = _ACTION_META[a.action_type] || { chip: '', verb: a.action_type, arrow: '·' };
+  const sizeBefore = a.size_before != null ? Math.round(a.size_before) : null;
+  const sizeAfter = a.size_after != null ? Math.round(a.size_after) : null;
+  const sizeText = a.action_type === 'TRIM'
+    ? `${fmtNum(sizeBefore)} → ${fmtNum(sizeAfter)} ${a.outcome || ''}`
+    : `${fmtNum(Math.abs(Math.round(a.size_delta || 0)))} ${a.outcome || ''}`;
+  const valueText = a.value_delta_usd != null && Math.abs(a.value_delta_usd) >= 1
+    ? ` · ${fmtUSD(Math.abs(a.value_delta_usd))}`
+    : '';
+  return (
+    <div style={{display:'flex',alignItems:'center',gap:8,fontSize:dense?12:13,lineHeight:1.4,flexWrap:'wrap'}}>
+      <span className={`chip ${meta.chip}`} style={{fontSize:10}}>{meta.arrow} {a.action_type}</span>
+      {a.label && <span style={{fontWeight:600}}>{a.label}</span>}
+      <span className="muted">{meta.verb}</span>
+      <span className="mono" style={{fontSize:dense?11:12}}>{sizeText}{valueText}</span>
+      {a.question && (
+        <>
+          <span className="muted">on</span>
+          <span style={{maxWidth:340,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{a.question}</span>
+        </>
+      )}
+      <span className="muted mono" style={{fontSize:11,marginLeft:'auto'}}>{tsAgo(a.occurred_at)}</span>
+    </div>
+  );
+}
+
+function WalletPositionsTable({ positions, loading }) {
+  if (loading) return <div className="muted" style={{padding:'12px 0',fontSize:12}}>loading positions…</div>;
+  if (!positions || positions.length === 0) {
+    return <div className="muted" style={{padding:'12px 0',fontSize:12}}>No open positions tracked. Wallet may be flat right now, or hasn't been picked up by the position-refresh loop yet (runs every ~10 min).</div>;
+  }
+  return (
+    <table className="table" style={{marginTop:8}}>
+      <thead>
+        <tr>
+          <th>Market</th>
+          <th>Side</th>
+          <th style={{textAlign:'right'}}>Size</th>
+          <th style={{textAlign:'right'}}>Avg</th>
+          <th style={{textAlign:'right'}}>Cur</th>
+          <th style={{textAlign:'right'}}>Value</th>
+          <th style={{textAlign:'right'}}>PnL</th>
+          <th>First seen</th>
+        </tr>
+      </thead>
+      <tbody>
+        {positions.map(p => {
+          const pnl = p.cash_pnl;
+          const pct = p.percent_pnl;
+          const pnlCls = pnl == null ? 'muted' : (pnl >= 0 ? 'pos' : 'neg');
+          return (
+            <tr key={`${p.condition_id}-${p.asset}`}>
+              <td style={{maxWidth:340,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{p.question || <span className="muted mono">{p.condition_id.slice(0,10)}…</span>}</td>
+              <td><span className={`chip ${p.outcome === 'Yes' ? 'ok' : 'bad'}`} style={{fontSize:10}}>{p.outcome || '—'}</span></td>
+              <td className="mono" style={{textAlign:'right',fontSize:12}}>{p.size == null ? '—' : fmtNum(Math.round(p.size))}</td>
+              <td className="mono" style={{textAlign:'right',fontSize:12}}>{p.avg_price == null ? '—' : p.avg_price.toFixed(3)}</td>
+              <td className="mono" style={{textAlign:'right',fontSize:12}}>{p.cur_price == null ? '—' : p.cur_price.toFixed(3)}</td>
+              <td className="mono" style={{textAlign:'right',fontSize:12}}>{p.current_value == null ? '—' : fmtUSD(p.current_value)}</td>
+              <td className={`mono ${pnlCls}`} style={{textAlign:'right',fontSize:12}}>
+                {pnl == null ? '—' : fmtUSD(pnl)}
+                {pct != null && <span style={{marginLeft:6,fontSize:10}}>({pct >= 0 ? '+' : ''}{pct.toFixed(1)}%)</span>}
+              </td>
+              <td className="muted mono" style={{fontSize:11}}>{tsAgo(p.first_seen_at)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function WalletCard({ w, expanded, positions, posLoading, onToggle, onEdit, onRemove }) {
+  return (
+    <div
+      style={{
+        borderTop: '1px solid var(--border)',
+        padding: '12px 16px',
+        cursor: 'pointer',
+        background: expanded ? 'var(--accent-soft)' : 'transparent',
+      }}
+      onClick={onToggle}
+    >
+      <div style={{display:'flex',alignItems:'center',gap:14}}>
+        <span style={{display:'inline-block',transform:expanded?'rotate(0deg)':'rotate(-90deg)',transition:'transform .12s',width:16,height:16,opacity:0.6}}>{I.caret}</span>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+            <b style={{fontSize:14}}>{w.label || 'unlabeled'}</b>
+            <span className="mono muted" style={{fontSize:11}}>{w.proxy_wallet.slice(0,8)}…{w.proxy_wallet.slice(-6)}</span>
+            <span className="muted mono" style={{fontSize:11}}>added {tsAgo(w.added_at)}</span>
+          </div>
+          {w.notes && <div className="muted" style={{fontSize:12,marginTop:3,maxWidth:600,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.notes}</div>}
+        </div>
+        <div style={{display:'flex',gap:6}} onClick={e => e.stopPropagation()}>
+          <button className="btn ghost sm" onClick={onEdit}>edit</button>
+          <button className="btn ghost sm" onClick={onRemove}>remove</button>
+        </div>
+      </div>
+
+      {/* Per-wallet latest-action strip — the "info box above each wallet" */}
+      {w.latest_action ? (
+        <div style={{
+          marginTop:10, marginLeft:30, padding:'8px 12px',
+          background:'var(--bg)', border:'1px solid var(--border)',
+          borderRadius:6,
+        }}>
+          <ActionLine a={{...w.latest_action, label: null}} dense />
+        </div>
+      ) : (
+        <div className="muted" style={{marginTop:8,marginLeft:30,fontSize:11,fontStyle:'italic'}}>
+          No actions recorded yet. NEW/TRIM/SELL events will appear here as the refresh loop sees them.
+        </div>
+      )}
+
+      {expanded && (
+        <div style={{marginTop:14,marginLeft:30}} onClick={e => e.stopPropagation()}>
+          <WalletPositionsTable positions={positions} loading={posLoading} />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function InsiderWallets() {
   // Live: GET /insider_wallets. POST to add, PATCH to edit, DELETE to remove.
   // Mock fallback for offline browsing.
@@ -882,6 +1025,10 @@ function InsiderWallets() {
   // is the form payload pre-filled from the row when the modal opens.
   const [editing, setEditing] = useState(null);
   const [editDraft, setEditDraft] = useState({ label: '', notes: '' });
+  const [expanded, setExpanded] = useState(null);
+  const [positionsCache, setPositionsCache] = useState({});
+  const [posLoading, setPosLoading] = useState(null);
+  const [actionsFeed, setActionsFeed] = useState([]);
   const [showToast, toastNode] = useToast();
 
   const refresh = useCallback(() => {
@@ -889,8 +1036,34 @@ function InsiderWallets() {
       (resp) => { setList(resp.wallets || []); setOffline(false); },
       (e) => { console.warn('Insider wallets offline:', e.message); setOffline(true); }
     );
+    apiGet('/insider_wallets/actions/recent?limit=20').then(
+      (resp) => { setActionsFeed(resp.actions || []); },
+      () => { /* feed is best-effort */ }
+    );
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
+
+  // Clear sidebar badge on page open. Fire-and-forget — if it fails the badge
+  // just stays sticky, which is recoverable on next refresh.
+  useEffect(() => {
+    apiPost('/insider_wallets/actions/mark_seen', {}).catch(() => {});
+  }, []);
+
+  const toggleExpand = useCallback(async (wallet) => {
+    if (expanded === wallet) { setExpanded(null); return; }
+    setExpanded(wallet);
+    if (positionsCache[wallet] !== undefined) return;
+    setPosLoading(wallet);
+    try {
+      const resp = await apiGet(`/insider_wallets/${wallet}/positions`);
+      setPositionsCache(c => ({ ...c, [wallet]: resp.positions || [] }));
+    } catch (e) {
+      console.warn('Positions fetch failed:', e.message);
+      setPositionsCache(c => ({ ...c, [wallet]: [] }));
+    } finally {
+      setPosLoading(p => p === wallet ? null : p);
+    }
+  }, [expanded, positionsCache]);
 
   const add = async () => {
     if (!/^0x[a-fA-F0-9]{40}$/.test(draft.proxy_wallet)) { showToast('Wallet must be 0x… 42 chars', 'bad'); return; }
@@ -937,7 +1110,7 @@ function InsiderWallets() {
       <div className="topbar">
         <div>
           <h1>Insider wallets</h1>
-          <div className="topbar-sub">manually-added "watch this wallet" overrides — bypass smart-money classification</div>
+          <div className="topbar-sub">manually-added "watch this wallet" overrides — click any wallet to see its open positions</div>
         </div>
         <div style={{display:'flex',gap:8}}>
           <button className="btn primary" onClick={()=>setShowAdd(true)}>+ Add wallet</button>
@@ -948,29 +1121,43 @@ function InsiderWallets() {
           <span style={{display:'flex'}}>{I.target}</span>
           <div>
             <div><b>What lives here</b></div>
-            <div className="muted" style={{fontSize:12}}>Insider wallets are tracked in addition to the auto-classified smart-money set. Use this for traders you have qualitative reason to follow (NBA insiders, alleged Fed leakers, niche specialists). Their activity feeds the same signal pipeline.</div>
+            <div className="muted" style={{fontSize:12}}>Insider wallets are tracked in addition to the auto-classified smart-money set. The position-refresh loop polls them every ~10 min — when a wallet opens a new position (NEW), trims by ≥25% (TRIM), or fully closes a position (SELL), an event is logged here and the sidebar badge increments. Click a wallet to see its open positions; the strip above each wallet shows its most recent action.</div>
           </div>
         </div>
-        <div className="card">
-          <div className="card-head"><h3>{list.length} insider wallets</h3><span className="muted mono" style={{fontSize:11}}>GET /insider-wallets</span></div>
-          <table className="table">
-            <thead><tr><th>Wallet</th><th>Label</th><th>Notes</th><th>Added</th><th>Last seen</th><th></th></tr></thead>
-            <tbody>
-              {list.map(w => (
-                <tr key={w.proxy_wallet}>
-                  <td className="mono" style={{fontSize:11}}>{w.proxy_wallet.slice(0,8)}…{w.proxy_wallet.slice(-6)}</td>
-                  <td><b>{w.label}</b></td>
-                  <td className="muted" style={{maxWidth:340,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{w.notes}</td>
-                  <td className="muted mono" style={{fontSize:11}}>{tsAgo(w.added_at)}</td>
-                  <td className="muted mono" style={{fontSize:11}}>{w.last_seen_at?tsAgo(w.last_seen_at):'never'}</td>
-                  <td style={{display:'flex',gap:6}}>
-                    <button className="btn ghost sm" onClick={()=>beginEdit(w)}>edit</button>
-                    <button className="btn ghost sm" onClick={()=>remove(w.proxy_wallet)}>remove</button>
-                  </td>
-                </tr>
+
+        {actionsFeed.length > 0 && (
+          <div className="card" style={{marginBottom:14}}>
+            <div className="card-head">
+              <h3>Recent activity</h3>
+              <span className="muted mono" style={{fontSize:11}}>last {actionsFeed.length} events · GET /insider_wallets/actions/recent</span>
+            </div>
+            <div style={{padding:'4px 16px 12px 16px',display:'flex',flexDirection:'column',gap:6}}>
+              {actionsFeed.slice(0, 10).map(a => (
+                <div key={a.id} style={{padding:'7px 10px',borderRadius:6,background:'var(--bg)',border:'1px solid var(--border)'}}>
+                  <ActionLine a={a} />
+                </div>
               ))}
-            </tbody>
-          </table>
+            </div>
+          </div>
+        )}
+
+        <div className="card">
+          <div className="card-head"><h3>{list.length} insider wallets</h3><span className="muted mono" style={{fontSize:11}}>GET /insider_wallets</span></div>
+          {list.length === 0 && (
+            <div className="muted" style={{padding:24,fontSize:13,textAlign:'center'}}>No wallets yet. Click <b>+ Add wallet</b> to start tracking one.</div>
+          )}
+          {list.map(w => (
+            <WalletCard
+              key={w.proxy_wallet}
+              w={w}
+              expanded={expanded === w.proxy_wallet}
+              positions={positionsCache[w.proxy_wallet]}
+              posLoading={posLoading === w.proxy_wallet}
+              onToggle={() => toggleExpand(w.proxy_wallet)}
+              onEdit={() => beginEdit(w)}
+              onRemove={() => remove(w.proxy_wallet)}
+            />
+          ))}
         </div>
       </div>
       {showAdd && (

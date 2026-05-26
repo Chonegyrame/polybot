@@ -346,6 +346,12 @@ async def refresh_top_trader_positions(
         log.info("phase 3: persisting positions for %d wallets...", len(results))
         from app.services.polymarket_types import PortfolioValue
         positions_dropped_unknown_market = 0  # surfaced in logs to avoid silent loss
+        # Snapshot the insider wallet set once so we know which wallets to
+        # diff for the insider-actions feed (NEW/TRIM/SELL). Cheap query (~1 row
+        # per insider) versus checking inside every loop iteration.
+        async with pool.acquire() as conn:
+            insider_set = set(await crud.list_insider_wallet_proxies(conn))
+        insider_actions_logged = 0
         for wallet, positions, pv_api in results:
             try:
                 async with pool.acquire() as conn:
@@ -354,6 +360,16 @@ async def refresh_top_trader_positions(
                     # Filter as a safety net so the FK never trips.
                     valid = await _filter_known_markets(conn, positions)
                     positions_dropped_unknown_market += len(positions) - len(valid)
+                    # Insider-action diff MUST run before upsert — otherwise
+                    # existing state is already overwritten and the diff sees
+                    # no change. Skipped for non-insider wallets (vast majority).
+                    if wallet in insider_set:
+                        actions = await crud.compute_insider_actions(
+                            conn, wallet, valid,
+                        )
+                        if actions:
+                            await crud.log_insider_actions(conn, actions)
+                            insider_actions_logged += len(actions)
                     if valid:
                         await crud.upsert_positions_for_trader(conn, wallet, valid)
                     # F3: prefer the value from data-api /value (true total
@@ -389,6 +405,11 @@ async def refresh_top_trader_positions(
             log.warning(
                 "phase 3: dropped %d position(s) whose markets were not in DB even after JIT discovery — likely archived",
                 positions_dropped_unknown_market,
+            )
+        if insider_actions_logged:
+            log.info(
+                "phase 3: logged %d insider-action row(s) (NEW/TRIM/SELL)",
+                insider_actions_logged,
             )
 
         # Phase 4: drop-out cleanup. R13 (Pass 3): now requires N consecutive
