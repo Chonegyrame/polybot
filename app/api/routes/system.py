@@ -30,9 +30,10 @@ REFRESH_AMBER_MAX_MINUTES = 60
 SNAPSHOT_GREEN_MAX_DAYS = 1
 SNAPSHOT_AMBER_MAX_DAYS = 3
 
-# Wallet classifier — meant to run weekly. Allow one missed week before alerting.
-CLASSIFIER_GREEN_MAX_DAYS = 8
-CLASSIFIER_AMBER_MAX_DAYS = 16
+# Wallet classifier — runs every 3 days. Green within one cycle, amber one
+# missed cycle, red beyond that.
+CLASSIFIER_GREEN_MAX_DAYS = 4
+CLASSIFIER_AMBER_MAX_DAYS = 8
 
 # Tracked wallet pool — should never be empty in steady state.
 WALLETS_RED_MIN = 1

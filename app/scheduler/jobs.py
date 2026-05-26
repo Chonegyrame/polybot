@@ -838,24 +838,29 @@ async def classify_tracked_wallets(
     sem = asyncio.Semaphore(concurrency)
 
     async def classify_one(wallet: str) -> tuple[str, str | None, Exception | None]:
-        async with sem:
-            try:
+        try:
+            async with sem:
                 trades = await pm.get_trades(wallet, limit=500)
-            except Exception as e:  # noqa: BLE001
-                return wallet, None, e
-        features = compute_features(trades)
-        result = classify(features)
-        async with pool.acquire() as conn:
-            await crud.upsert_wallet_classification(
-                conn,
-                proxy_wallet=wallet,
-                wallet_class=result.wallet_class,
-                confidence=result.confidence,
-                features=result.features,
-                trades_observed=int(features.get("n_trades", 0) or 0),
-                classifier_version=CLASSIFIER_VERSION,
-            )
-        return wallet, result.wallet_class, None
+            # v1.2: pull current positions so compute_features can compute the
+            # position_both_sides_count signal. Outside the API semaphore — DB
+            # call, not Polymarket API.
+            async with pool.acquire() as conn:
+                positions = await crud.list_positions_for_wallet(conn, wallet)
+            features = compute_features(trades, positions=positions)
+            result = classify(features)
+            async with pool.acquire() as conn:
+                await crud.upsert_wallet_classification(
+                    conn,
+                    proxy_wallet=wallet,
+                    wallet_class=result.wallet_class,
+                    confidence=result.confidence,
+                    features=result.features,
+                    trades_observed=int(features.get("n_trades", 0) or 0),
+                    classifier_version=CLASSIFIER_VERSION,
+                )
+            return wallet, result.wallet_class, None
+        except Exception as e:  # noqa: BLE001
+            return wallet, None, e
 
     async with PolymarketClient() as pm:
         tasks = [classify_one(w) for w in wallets]
@@ -1818,6 +1823,44 @@ async def catch_up_snapshot_if_stale(max_age_hours: int = 24) -> SnapshotResult 
         else:
             log.info("last snapshot was %s (%d day(s) ago) — running catch-up", latest, gap)
     return await daily_leaderboard_snapshot()
+
+
+async def catch_up_wallet_hygiene_if_stale(
+    max_age_days: int = 3,
+) -> tuple[ClassifyResult, SybilDetectionResult] | None:
+    """Run classifier + sybil detector sequentially if the latest
+    classification is older than `max_age_days`.
+
+    Designed to be called at app startup so wallet-hygiene jobs self-heal
+    when the laptop has been off across one or more scheduled fires. Both
+    jobs are paired in design: classifier tags MM/arb behavioral signatures,
+    sybil tags cluster members — both feed the top-N exclusion filter in
+    trader_ranker, both keyed off `wallet_classifications.classified_at`.
+    We use the classifier's most-recent write as the freshness signal for
+    the pair; sybil doesn't update the timestamp when zero clusters are
+    found, so a classifier-driven signal is the more reliable proxy.
+    """
+    pool = await init_pool(min_size=1, max_size=12)
+    async with pool.acquire() as conn:
+        latest = await crud.latest_classification_at(conn)
+    now = datetime.now(timezone.utc)
+    if latest is None:
+        log.info("no prior classifications — running first wallet-hygiene cycle")
+    else:
+        gap_days = (now - latest).days
+        if gap_days < max_age_days:
+            log.info(
+                "last classification %s (%d day(s) ago) — within %dd window, skipping catch-up",
+                latest.isoformat(), gap_days, max_age_days,
+            )
+            return None
+        log.info(
+            "last classification was %s (%d day(s) ago) — running wallet-hygiene catch-up",
+            latest.isoformat(), gap_days,
+        )
+    classify_result = await classify_tracked_wallets()
+    sybil_result = await detect_sybil_clusters_in_pool()
+    return classify_result, sybil_result
 
 
 # ---------------------------------------------------------------------------

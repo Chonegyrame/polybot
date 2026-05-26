@@ -32,6 +32,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.scheduler.jobs import (
     catch_up_snapshot_if_stale,
+    catch_up_wallet_hygiene_if_stale,
     classify_tracked_wallets,
     compute_trader_category_stats,
     daily_leaderboard_snapshot,
@@ -86,23 +87,22 @@ def build_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # Weekly: re-classify wallets (catches new MMs/arbs entering the pool)
-    # and re-detect sybil clusters. Run early Monday UTC to spread load away
-    # from the daily snapshot. Both are heavy-ish (~1 minute each) so we
-    # offset them so they don't run concurrently.
+    # Every 3 days: re-classify wallets (catches new MMs/arbs entering the
+    # pool). Laptop downtime across a fire is bridged by
+    # catch_up_classifier_if_stale at startup.
     scheduler.add_job(
         classify_tracked_wallets,
-        trigger=CronTrigger(day_of_week="mon", hour=3, minute=0, timezone="UTC"),
-        id="weekly_classify",
-        name="Weekly wallet classification",
+        trigger=IntervalTrigger(days=3),
+        id="triweekly_classify",
+        name="Wallet classification (every 3 days)",
         misfire_grace_time=86_400,
         replace_existing=True,
     )
     scheduler.add_job(
         detect_sybil_clusters_in_pool,
-        trigger=CronTrigger(day_of_week="mon", hour=3, minute=15, timezone="UTC"),
-        id="weekly_sybil",
-        name="Weekly sybil cluster detection",
+        trigger=IntervalTrigger(days=3),
+        id="triweekly_sybil",
+        name="Sybil cluster detection (every 3 days)",
         misfire_grace_time=86_400,
         replace_existing=True,
     )
@@ -226,6 +226,12 @@ async def lifespan_scheduler() -> AsyncIterator[AsyncIOScheduler]:
     # `max_instances=1` on the job prevents racing the next scheduled tick.
     asyncio.create_task(_startup_position_refresh())
 
+    # Background wallet-hygiene catch-up — fires only if the most recent
+    # classification is older than 3 days. Runs classifier + sybil sequentially.
+    # Non-blocking so polybot startup stays fast; ~2 min total when stale,
+    # updates the system status pill to green once done.
+    asyncio.create_task(_startup_wallet_hygiene_catchup())
+
     try:
         yield scheduler
     finally:
@@ -243,6 +249,16 @@ async def _startup_position_refresh() -> None:
         log.info("startup position-refresh complete")
     except Exception as e:  # noqa: BLE001
         log.warning("startup position-refresh failed (next tick will retry): %s", e)
+
+
+async def _startup_wallet_hygiene_catchup() -> None:
+    """Background catch-up at lifespan startup. Self-heals classifier + sybil
+    when polybot was off across one or more scheduled fires."""
+    try:
+        log.info("startup wallet-hygiene catch-up check...")
+        await catch_up_wallet_hygiene_if_stale()
+    except Exception as e:  # noqa: BLE001
+        log.warning("startup wallet-hygiene catch-up failed (next tick will retry): %s", e)
 
 
 def _log_jobs(scheduler: AsyncIOScheduler) -> None:
