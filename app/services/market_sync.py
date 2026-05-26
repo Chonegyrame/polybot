@@ -95,6 +95,7 @@ async def _persist_event_and_markets(
         title=event.title,
         category=derived_category,
         tags=event.tags,
+        start_time=_parse_iso(event.start_time),
         end_date=_parse_iso(event.end_date),
         closed=event.closed,
     )
@@ -344,6 +345,7 @@ async def discover_and_persist_markets(
                 title=ev.title,
                 category=_derive_category(ev.tags, fallback=ev.category),
                 tags=ev.tags,
+                start_time=_parse_iso(ev.start_time),
                 end_date=_parse_iso(ev.end_date),
                 closed=ev.closed,
             )

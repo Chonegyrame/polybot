@@ -31,6 +31,10 @@ from app.services.exit_detector import ExitEvent, detect_exits
 from app.services.half_life import pick_offset_for_age
 from app.services.market_sync import discover_and_persist_markets
 from app.services.orderbook import compute_book_metrics
+from app.services.polymarket_lol import (
+    discover_lol_events_and_classify,
+    snapshot_one_market,
+)
 from app.services.polymarket_types import LeaderboardEntry, Position
 from app.services.signal_detector import Signal, detect_signals, detect_signals_and_watchlist
 from app.services.trader_ranker import (
@@ -1793,3 +1797,152 @@ async def catch_up_snapshot_if_stale(max_age_hours: int = 24) -> SnapshotResult 
         else:
             log.info("last snapshot was %s (%d day(s) ago) — running catch-up", latest, gap)
     return await daily_leaderboard_snapshot()
+
+
+# ---------------------------------------------------------------------------
+# LoL collector jobs
+# ---------------------------------------------------------------------------
+#
+# Two scheduled jobs power the LoL data collector:
+#   - discover_lol_markets_job          : every 15 min — sweeps gamma-api for
+#                                         new/updated LoL events, upserts
+#                                         events+markets, classifies into
+#                                         polymarket_lol_market_meta.
+#   - snapshot_lol_prices_job           : every 20 s — for each market in the
+#                                         active window (event end_date within
+#                                         [now - 3h, now + 4h]), captures an
+#                                         L2 book snapshot to
+#                                         polymarket_lol_price_snapshots.
+#
+# Both jobs are idempotent and concurrency-safe via max_instances=1 on the
+# APScheduler registration in runner.py.
+
+
+@dataclass
+class LolDiscoveryResult:
+    events_seen: int
+    markets_seen: int
+    markets_classified: int
+    duration_seconds: float
+
+
+@dataclass
+class LolSnapshotResult:
+    markets_attempted: int
+    snapshots_written: int
+    failures: int
+    duration_seconds: float
+
+
+async def discover_lol_markets_job() -> LolDiscoveryResult:
+    """15-min cadence. Sweep gamma-api for LoL events, upsert events+markets,
+    classify into polymarket_lol_market_meta.
+
+    Cost is bounded: only fetches the LoL slice of gamma's catalog (two tag
+    slugs), and each slice is normally <50 events.
+    """
+    started = datetime.now(timezone.utc)
+    log.info("=== discover_lol_markets_job ===")
+    pool = await init_pool(min_size=1, max_size=2)
+    events_seen = markets_seen = classified = 0
+    async with PolymarketClient() as pm:
+        async with pool.acquire() as conn:
+            events_seen, markets_seen, classified = (
+                await discover_lol_events_and_classify(conn, pm)
+            )
+    duration = (datetime.now(timezone.utc) - started).total_seconds()
+    log.info(
+        "=== discover_lol_markets_job done in %.1fs -- events=%d, markets=%d, classified=%d ===",
+        duration, events_seen, markets_seen, classified,
+    )
+    return LolDiscoveryResult(
+        events_seen=events_seen,
+        markets_seen=markets_seen,
+        markets_classified=classified,
+        duration_seconds=duration,
+    )
+
+
+async def _snapshot_lol_market_list(
+    market_rows: list, tier_name: str,
+) -> LolSnapshotResult:
+    """Shared snapshot worker — fetch L2 books for each market in the list
+    and write rows to polymarket_lol_price_snapshots.
+
+    Used by both the active (20s) and watcher (5min) tier jobs. Sequential
+    fetches respect the PolymarketClient rate-limiter.
+    """
+    started = datetime.now(timezone.utc)
+    if not market_rows:
+        return LolSnapshotResult(
+            markets_attempted=0, snapshots_written=0, failures=0,
+            duration_seconds=(datetime.now(timezone.utc) - started).total_seconds(),
+        )
+
+    pool = await init_pool(min_size=1, max_size=2)
+    attempted = written = failed = 0
+
+    async with PolymarketClient() as pm:
+        for row in market_rows:
+            attempted += 1
+            async with pool.acquire() as conn:
+                try:
+                    ok = await snapshot_one_market(
+                        conn, pm,
+                        condition_id=row["condition_id"],
+                        clob_token_a=row["clob_token_a"],
+                        clob_token_b=row["clob_token_b"],
+                    )
+                    if ok:
+                        written += 1
+                    else:
+                        failed += 1
+                except Exception as e:  # noqa: BLE001
+                    failed += 1
+                    log.warning(
+                        "snapshot_lol[%s]: failed for cid=%s: %r",
+                        tier_name, row["condition_id"][:12], e,
+                    )
+
+    duration = (datetime.now(timezone.utc) - started).total_seconds()
+    log.info(
+        "snapshot_lol[%s]: attempted=%d, written=%d, failed=%d, duration=%.2fs",
+        tier_name, attempted, written, failed, duration,
+    )
+    return LolSnapshotResult(
+        markets_attempted=attempted,
+        snapshots_written=written,
+        failures=failed,
+        duration_seconds=duration,
+    )
+
+
+async def snapshot_lol_prices_active_job() -> LolSnapshotResult:
+    """Tier-1 (20-second cadence) — markets in the active match window.
+
+    Filters: start_time within [now - 6h, now + 30min] (full BO5 buffer),
+    not formally closed, not in "decided" state (yes_bid/no_bid >= 0.95).
+    Falls back to end_date-anchored window when start_time is NULL.
+
+    See crud.list_lol_markets_active_tier for the exact predicate.
+    """
+    pool = await init_pool(min_size=1, max_size=2)
+    async with pool.acquire() as conn:
+        active = await crud.list_lol_markets_active_tier(conn)
+    return await _snapshot_lol_market_list(active, "active")
+
+
+async def snapshot_lol_prices_watcher_job() -> LolSnapshotResult:
+    """Tier-2 (5-minute cadence) — pre-game scheduling watcher + decided
+    markets awaiting formal settlement.
+
+    Pre-game tier catches markets with start_time in the next 24h that
+    are not yet in the active window. Decided tier covers markets in the
+    active window whose latest snapshot already shows one side >= 0.95.
+
+    See crud.list_lol_markets_watcher_tier for the exact predicate.
+    """
+    pool = await init_pool(min_size=1, max_size=2)
+    async with pool.acquire() as conn:
+        watcher = await crud.list_lol_markets_watcher_tier(conn)
+    return await _snapshot_lol_market_list(watcher, "watcher")

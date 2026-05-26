@@ -590,15 +590,22 @@ class PolymarketClient:
         closed: bool | None = None,
         order: str | None = None,
         ascending: bool | None = None,
+        tag_slug: str | None = None,
     ) -> list[Event]:
+        """Fetch events. Pass `tag_slug` (e.g. "league-of-legends") to filter
+        by tag — used by the LoL collector to discover only esports events
+        without doing a broad sweep of the whole gamma catalog.
+        """
         url = f"{settings.gamma_api_base}/events"
-        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        params: list[tuple[str, Any]] = [("limit", limit), ("offset", offset)]
         if closed is not None:
-            params["closed"] = "true" if closed else "false"
+            params.append(("closed", "true" if closed else "false"))
         if order is not None:
-            params["order"] = order
+            params.append(("order", order))
         if ascending is not None:
-            params["ascending"] = "true" if ascending else "false"
+            params.append(("ascending", "true" if ascending else "false"))
+        if tag_slug is not None:
+            params.append(("tag_slug", tag_slug))
         data = await self._get_json(url, params=params)
         items = _safe_list_or_empty(data, "gamma-api/events")
         return [Event.from_dict(d) for d in items]

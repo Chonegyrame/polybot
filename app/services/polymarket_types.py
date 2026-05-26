@@ -392,6 +392,7 @@ class Event:
     title: str | None
     category: str | None
     tags: list[dict[str, Any]]
+    start_time: str | None  # gamma's `startTime` — the actual match start
     end_date: str | None
     updated_at: str | None  # gamma's `updatedAt` — drives incremental sync
     closed: bool
@@ -408,6 +409,7 @@ class Event:
             title=d.get("title"),
             category=d.get("category"),
             tags=list(d.get("tags") or []),
+            start_time=d.get("startTime"),
             end_date=d.get("endDate"),
             updated_at=d.get("updatedAt"),
             closed=bool(d.get("closed")),

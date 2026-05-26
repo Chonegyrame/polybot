@@ -36,9 +36,12 @@ from app.scheduler.jobs import (
     compute_trader_category_stats,
     daily_leaderboard_snapshot,
     detect_sybil_clusters_in_pool,
+    discover_lol_markets_job,
     heal_unavailable_signal_books,
     record_signal_price_snapshots,
     refresh_positions_then_log_signals,
+    snapshot_lol_prices_active_job,
+    snapshot_lol_prices_watcher_job,
 )
 
 log = logging.getLogger(__name__)
@@ -128,6 +131,41 @@ def build_scheduler() -> AsyncIOScheduler:
         id="heal_unavailable_books",
         name="Retry book capture for signal_entry_source='unavailable' rows",
         misfire_grace_time=600,
+        replace_existing=True,
+    )
+
+    # LoL collector: discovery sweeps gamma-api for LoL events every 15 min
+    # and classifies their markets into polymarket_lol_market_meta. Cheap.
+    scheduler.add_job(
+        discover_lol_markets_job,
+        trigger=IntervalTrigger(minutes=15),
+        id="lol_discover",
+        name="LoL collector — gamma-api discovery + classification",
+        misfire_grace_time=300,
+        replace_existing=True,
+    )
+
+    # LoL collector tier 1: snapshot every market in the active match
+    # window (start_time within [now-6h, now+30min], not decided).
+    # 20-second cadence. max_instances=1 prevents overlap.
+    scheduler.add_job(
+        snapshot_lol_prices_active_job,
+        trigger=IntervalTrigger(seconds=20),
+        id="lol_snapshot_active",
+        name="LoL collector — Tier 1 active snapshot (20s)",
+        misfire_grace_time=15,
+        replace_existing=True,
+    )
+
+    # LoL collector tier 2: sparse-watcher cadence for pre-game scheduling
+    # (start_time in next 24h, outside the active window) and for decided
+    # markets awaiting formal settlement.
+    scheduler.add_job(
+        snapshot_lol_prices_watcher_job,
+        trigger=IntervalTrigger(minutes=5),
+        id="lol_snapshot_watcher",
+        name="LoL collector — Tier 2 watcher snapshot (5min)",
+        misfire_grace_time=120,
         replace_existing=True,
     )
 
