@@ -26,14 +26,18 @@ Arc of the 2026-06-01 session (lots of dead-ends cleared with data):
   UI section. Full plan in `ESPORTS_PLAN.md`. **Next: user provides ~10 wallets →
   build Phase 1 (watchlist + safe 5s tracker).**
 
-### Git / push status (2026-06-01)
-- This session's work is committed; working tree clean. `.mcp.json` is now
-  untracked + gitignored (was leaking the Supabase token).
-- **PUSH STILL BLOCKED**: the Supabase token is in commit `f9aea5f` history.
-  To push: (1) user rotates the token at supabase.com/dashboard/account/tokens,
-  (2) scrub `.mcp.json` from the unpushed commits (`git filter-repo` /
-  filter-branch over `origin/main..HEAD`), (3) `git push`. Token rotation is the
-  user's action and gates everything.
+### Git / push status (2026-06-01) — ✅ RESOLVED
+- **Pushed & synced** — `main` == `origin/main` (`ca3ddfc..6d1f8e5`). The push
+  block is gone.
+- `.mcp.json` was scrubbed from history via `git filter-branch` over the
+  unpushed range, then reflog-expired + GC'd, so the Supabase token is gone
+  from GitHub-bound AND local history. `.mcp.json` is untracked + gitignored;
+  the live working-tree copy remains (MCP still works).
+- The token was **never actually pushed to GitHub** (it only ever lived in
+  local commits, now scrubbed) → rotation is **optional** hygiene, not required.
+- Separate, NOT blocking: Supabase Advisor flags 6 tables with RLS disabled
+  (lol_* + polymarket_lol_*). Only matters if the anon key is exposed (e.g.
+  client-side UI). Address later if so.
 
 ---
 
