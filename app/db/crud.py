@@ -431,6 +431,49 @@ async def upsert_market(
     )
 
 
+async def list_unresolved_signal_condition_ids(
+    conn: asyncpg.Connection,
+) -> list[str]:
+    """Distinct condition_ids that fired a signal but have no recorded
+    resolution yet (market row missing or resolved_outcome IS NULL).
+
+    These are the backfill targets: ~90% of fired signals sit here because the
+    incremental sync only pages closed=false events and never re-fetches the
+    resolution for already-known markets, so the backtest can't see them.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT s.condition_id
+        FROM signal_log s
+        LEFT JOIN markets m ON m.condition_id = s.condition_id
+        WHERE m.resolved_outcome IS NULL
+        """
+    )
+    return [r["condition_id"] for r in rows]
+
+
+async def set_market_resolution(
+    conn: asyncpg.Connection, condition_id: str, resolved_outcome: str,
+) -> bool:
+    """Backfill ONLY a market's resolution, leaving every other column intact.
+
+    Deliberately NOT `upsert_market`: that overwrites event_id/slug/etc. from a
+    Market object, and a by-condition_id fetch carries no parent event_id — a
+    full upsert would null the event link the backtest joins on for category.
+    Only touches rows currently unresolved (idempotent, monotonic). Returns
+    True iff a row was updated.
+    """
+    status = await conn.execute(
+        """
+        UPDATE markets
+        SET resolved_outcome = $2, closed = TRUE, last_synced_at = NOW()
+        WHERE condition_id = $1 AND resolved_outcome IS NULL
+        """,
+        condition_id, resolved_outcome,
+    )
+    return status.endswith(" 1")
+
+
 # ---------------------------------------------------------------------------
 # health / utility
 # ---------------------------------------------------------------------------

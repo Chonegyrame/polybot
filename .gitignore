@@ -55,3 +55,10 @@ backup_*.sql
 # Oracle's Elixir LoL match-data dumps — public data, ~300k lines combined,
 # kept on disk for the LoL bot but not durable repo state.
 *_LoL_esports_match_data_from_OraclesElixir.csv
+
+# btcbot paper ledger (local only)
+btcbot/paper_ledger.db
+btcbot/__pycache__/
+
+# secrets — never commit
+.mcp.json

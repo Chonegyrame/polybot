@@ -69,7 +69,10 @@ def _should_retry(exc: BaseException) -> bool:
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
-        return status == 429 or status >= 500
+        # 408 = data-api transient timeout. Confirmed transient, NOT size-based
+        # (a $2.3M market served every offset fine while a $119k one 408'd), so
+        # retrying with backoff clears most of them.
+        return status in (408, 429) or status >= 500
     return False
 
 
@@ -610,6 +613,21 @@ class PolymarketClient:
         items = _safe_list_or_empty(data, "gamma-api/events")
         return [Event.from_dict(d) for d in items]
 
+    async def get_event_by_slug(self, slug: str) -> Event | None:
+        """Fetch a single event by its exact gamma slug.
+
+        Used by the BTC up/down bot to resolve the live trading window
+        directly from a computed slug (e.g. `btc-updown-5m-<unixstart>`)
+        without sweeping the event catalog. Returns None if no event
+        matches the slug (e.g. the window hasn't been created yet).
+        """
+        url = f"{settings.gamma_api_base}/events"
+        data = await self._get_json(url, params={"slug": slug})
+        items = _safe_list_or_empty(data, "gamma-api/events?slug")
+        if not items:
+            return None
+        return Event.from_dict(items[0])
+
     async def get_markets(
         self,
         limit: int = 100,
@@ -724,7 +742,7 @@ class PolymarketClient:
         return []
 
     async def get_market_trades(
-        self, condition_id: str, limit: int = 100,
+        self, condition_id: str, limit: int = 100, offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Recent fills on a market via data-api. Used by B2 counterparty diagnostic.
 
@@ -743,10 +761,11 @@ class PolymarketClient:
         detection is non-blocking, missing fills means warning stays False.
         """
         url = f"{settings.data_api_base}/trades"
+        params: dict[str, Any] = {"market": condition_id, "limit": limit}
+        if offset:
+            params["offset"] = offset
         try:
-            data = await self._get_json(
-                url, params={"market": condition_id, "limit": limit}
-            )
+            data = await self._get_json(url, params=params)
         except httpx.HTTPStatusError as e:
             # F13: log loudly with status code + body excerpt so silent
             # failure modes (auth / quota / route changes) become visible.
