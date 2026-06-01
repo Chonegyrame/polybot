@@ -62,3 +62,6 @@ btcbot/__pycache__/
 
 # secrets — never commit
 .mcp.json
+
+# local handoff doc — not tracked
+session-state.md
