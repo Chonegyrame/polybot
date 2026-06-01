@@ -24,6 +24,13 @@ def _float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     gamma_api_base: str = _str("GAMMA_API_BASE", "https://gamma-api.polymarket.com")
@@ -45,6 +52,12 @@ class Settings:
     # even when retries fire after a 429.
     rate_limit_per_second: float = _float("RATE_LIMIT_PER_SECOND", 8.0)
     http_timeout_seconds: float = _float("HTTP_TIMEOUT_SECONDS", 30.0)
+
+    # Esports sharp tracker: run the live tracker loop inside the API process
+    # (lifespan) so a single `polybot` launch = UI + API + esports tracking.
+    # Set ESPORTS_TRACKER_ENABLED=false to run it only standalone (esports.bat).
+    esports_tracker_enabled: bool = _bool("ESPORTS_TRACKER_ENABLED", True)
+    esports_tracker_cycle_seconds: float = _float("ESPORTS_TRACKER_CYCLE_SECONDS", 8.0)
 
 
 settings = Settings()

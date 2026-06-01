@@ -168,6 +168,7 @@ function App() {
             />
           )}
           {route === 'insider' && <InsiderWallets />}
+          {route === 'esports' && <EsportsPage openMarket={openMarket} />}
         </ErrorBoundary>
       </main>
       {trader && (

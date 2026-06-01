@@ -9,6 +9,8 @@ Run locally:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -21,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api.routes import (
     backtest,
+    esports,
     insider,
     markets,
     paper_trades,
@@ -29,6 +32,7 @@ from app.api.routes import (
     traders,
     watchlist,
 )
+from app.config import settings
 from app.scheduler.runner import lifespan_scheduler
 
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
@@ -38,9 +42,28 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Boot the scheduler alongside the API. Stops cleanly on shutdown."""
+    """Boot the scheduler + esports tracker alongside the API.
+
+    The esports sharp tracker runs as an in-process asyncio task (writes its own
+    local SQLite, reads via PolymarketClient's shared rate limiter), so one
+    `polybot`/uvicorn launch = UI + Supabase jobs + esports tracking. Disable
+    with ESPORTS_TRACKER_ENABLED=false (then run it standalone via esports.bat).
+    """
     async with lifespan_scheduler():
-        yield
+        tracker_task: asyncio.Task | None = None
+        if settings.esports_tracker_enabled:
+            from esports.tracker import run as run_esports_tracker
+            tracker_task = asyncio.create_task(
+                run_esports_tracker(settings.esports_tracker_cycle_seconds)
+            )
+            log.info("esports tracker task started (in-process)")
+        try:
+            yield
+        finally:
+            if tracker_task is not None:
+                tracker_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await tracker_task
 
 
 app = FastAPI(
@@ -67,6 +90,7 @@ app.include_router(backtest.router)
 app.include_router(paper_trades.router)
 app.include_router(insider.router)
 app.include_router(watchlist.router)
+app.include_router(esports.router)
 
 # Serve the UI at /ui/* from the same FastAPI process so a single `uvicorn`
 # command boots backend + scheduler + UI. html=True makes /ui/ resolve to

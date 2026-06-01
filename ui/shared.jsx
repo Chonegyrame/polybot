@@ -157,6 +157,7 @@ function Sidebar({ route, setRoute, newsUnread = 0, insiderUnread = 0 }) {
     { id: 'traders',   label: 'Top Traders', ic: I.traders },
     { id: 'markets',   label: 'Markets',     ic: I.bag },
     { id: 'news',      label: 'News',        ic: I.bell, badge: newsUnread > 0 ? newsUnread : null },
+    { id: 'esports',   label: 'Esports',     ic: I.pulse },
     { id: 'testing',   label: 'Testing',    ic: I.beaker },
   ];
   return (

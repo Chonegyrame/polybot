@@ -780,6 +780,37 @@ class PolymarketClient:
             data, "data-api/trades?market", list_keys=("data", "trades"),
         )
 
+    async def get_market_holders(
+        self, condition_id: str, limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Top current holders of a market via data-api `/holders?market=<cid>`.
+
+        Returns one entry per outcome token: `{token, holders:[...]}`, where each
+        holder carries `proxyWallet, name, pseudonym, amount (shares), outcomeIndex,
+        verified`. Far lighter than `/trades?market` — a single request, no deep
+        offset pagination — so it does NOT trigger the concurrent-408 storm that
+        the trade tape does. Used by the esports-sharp discovery sweep to surface
+        big position-holders across many markets cheaply.
+
+        Caveat: this is a CURRENT-holders snapshot, so it misses traders who
+        already exited (sharps often do). It's a discovery signal only — real PnL
+        is reconstructed per-wallet from /trades?user afterward.
+
+        Returns [] on error or unexpected shape.
+        """
+        url = f"{settings.data_api_base}/holders"
+        try:
+            data = await self._get_json(url, params={"market": condition_id, "limit": limit})
+        except httpx.HTTPStatusError as e:
+            log.warning(
+                "data-api /holders?market=%s HTTP error: status=%s body=%r",
+                condition_id[:12],
+                getattr(e.response, "status_code", "?"),
+                getattr(e.response, "text", "")[:200],
+            )
+            return []
+        return data if isinstance(data, list) else []
+
     async def get_orderbook(self, token_id: str) -> dict[str, Any] | None:
         """L2 orderbook for an outcome token from CLOB.
 
