@@ -115,3 +115,34 @@ async def refresh_esports_markets(pm: PolymarketClient, conn) -> tuple[int, int]
 
     n = db.replace_esports_markets(conn, list(rows.values())) if rows else 0
     return n, events_seen
+
+
+def _infer_winner(m) -> str | None:
+    """Winning outcome label from a settled market's one-hot outcome_prices."""
+    if not (m.closed and m.outcomes and m.outcome_prices
+            and len(m.outcomes) == len(m.outcome_prices)):
+        return None
+    try:
+        idx = next(i for i, p in enumerate(m.outcome_prices) if p > 0.5)
+        return m.outcomes[idx]
+    except (StopIteration, IndexError):
+        return None
+
+
+async def refresh_active_resolutions(pm: PolymarketClient, conn) -> int:
+    """Fast, cheap resolution check for ONLY the markets we have live sharp
+    action in (a few dozen), so a finished game flips to 'done' within seconds
+    instead of waiting on the 15-min universe sweep. Returns # newly resolved.
+    """
+    from esports import db
+
+    cids = db.hot_condition_ids(conn)
+    if not cids:
+        return 0
+    markets = await pm.get_markets_by_condition_ids(cids, closed=True)
+    newly = 0
+    for m in markets:
+        winner = _infer_winner(m)
+        if winner and m.condition_id and db.set_market_resolution(conn, m.condition_id, winner):
+            newly += 1
+    return newly

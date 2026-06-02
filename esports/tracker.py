@@ -29,7 +29,11 @@ import time
 
 from app.services.polymarket import PolymarketClient
 from esports import db
-from esports.markets import classify_market_type, refresh_esports_markets
+from esports.markets import (
+    classify_market_type,
+    refresh_active_resolutions,
+    refresh_esports_markets,
+)
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -37,6 +41,11 @@ sys.stdout.reconfigure(encoding="utf-8")
 # totals/props are created when the event is, so this comfortably precedes
 # trading). Detection is membership in esports_markets (tag-based).
 REFRESH_SECONDS = 900
+
+# Fast resolution check for markets we hold live action in — so a finished game
+# greys out within ~a minute, not on the 15-min universe cadence. Cheap: only
+# the handful of condition_ids in recent actions.
+RESOLUTION_SECONDS = 45
 
 # Title fallback ONLY for the obvious winner markets, in case a brand-new
 # market is traded before the next universe refresh. Tag-based membership is
@@ -147,6 +156,7 @@ async def run(cycle_seconds: float) -> None:
         # Build the esports market universe before the first poll so handicap/
         # total/prop markets are detectable from cycle 1.
         last_refresh = 0.0
+        last_resolution = 0.0
         cycles = 0
         while True:
             t0 = time.time()
@@ -158,12 +168,24 @@ async def run(cycle_seconds: float) -> None:
                           f"(LoL+CS, open + recent)")
                 except Exception as e:  # noqa: BLE001
                     print(f"  ! universe refresh error: {type(e).__name__}: {str(e)[:80]}")
+            if t0 - last_resolution >= RESOLUTION_SECONDS:
+                try:
+                    resolved = await refresh_active_resolutions(pm, conn)
+                    last_resolution = t0
+                    if resolved:
+                        print(f"[resolved] {resolved} active market(s) settled")
+                except Exception as e:  # noqa: BLE001
+                    print(f"  ! resolution refresh error: {type(e).__name__}: {str(e)[:80]}")
             total = 0
+            errors = 0
+            last_err = None
             for w in wallets:
                 try:
                     total += await poll_wallet(pm, conn, w)
                 except Exception as e:  # noqa: BLE001 — loop must never die
-                    print(f"  ! {w[:10]} poll error: {type(e).__name__}: {str(e)[:80]}")
+                    errors += 1
+                    last_err = f"{type(e).__name__}: {str(e)[:80]}"
+                    print(f"  ! {w[:10]} poll error: {last_err}")
             cycles += 1
             if cycles == 1:
                 print(f"baseline pass done ({len(wallets)} wallets), "
@@ -171,6 +193,16 @@ async def run(cycle_seconds: float) -> None:
             elif total:
                 print(f"[cycle {cycles}] logged {total} new action(s)")
             elapsed = time.time() - t0
+            # Heartbeat for the UI liveness ring (real: stops/errors if it stalls).
+            try:
+                db.set_tracker_status(
+                    conn, last_cycle_at=t0, last_cycle_ms=elapsed * 1000.0,
+                    cycle_seconds=cycle_seconds, cycles=cycles, wallets=len(wallets),
+                    errors_last_cycle=errors, last_error=last_err,
+                    last_error_at=(time.time() if last_err else None),
+                )
+            except Exception:  # noqa: BLE001 — heartbeat must never kill the loop
+                pass
             await asyncio.sleep(max(0.0, cycle_seconds - elapsed))
 
 

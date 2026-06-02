@@ -68,18 +68,35 @@ CREATE INDEX IF NOT EXISTS ix_actions_cid ON esports_sharp_actions(condition_id)
 -- handicap/total/prop markets whose TITLE omits the game name (the old
 -- title-keyword check missed those). game/market_type come from the sweep.
 CREATE TABLE IF NOT EXISTS esports_markets (
-    condition_id TEXT PRIMARY KEY,
-    game         TEXT,                   -- 'lol' / 'cs'
-    title        TEXT,
-    market_type  TEXT,                   -- winner / handicap / total / prop / other
-    closed       INTEGER NOT NULL DEFAULT 0,
-    refreshed_at REAL
+    condition_id    TEXT PRIMARY KEY,
+    game            TEXT,                -- 'lol' / 'cs'
+    title           TEXT,
+    market_type     TEXT,                -- winner / handicap / total / prop / other
+    closed          INTEGER NOT NULL DEFAULT 0,
+    resolved_outcome TEXT,               -- winning outcome once settled (authoritative "finished" flag)
+    resolved_at     REAL,                -- when WE first detected the resolution
+    refreshed_at    REAL
 );
 
 CREATE TABLE IF NOT EXISTS tracker_cursor (
     wallet     TEXT PRIMARY KEY,
     last_ts    REAL NOT NULL,           -- newest traded_at processed for this wallet
     updated_at REAL
+);
+
+-- Single-row heartbeat the tracker writes each poll cycle so the UI can show a
+-- REAL liveness ring (fills toward the next poll; stops/errors if it stalls).
+CREATE TABLE IF NOT EXISTS tracker_status (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    last_cycle_at     REAL,             -- start ts of the most recent poll pass
+    last_cycle_ms     REAL,             -- how long that pass took (lag detection)
+    cycle_seconds     REAL,             -- configured interval between passes
+    cycles            INTEGER,
+    wallets           INTEGER,
+    errors_last_cycle INTEGER,
+    last_error        TEXT,
+    last_error_at     REAL,
+    updated_at        REAL
 );
 """
 
@@ -94,6 +111,12 @@ def connect(path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE esports_sharp_actions ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    # Idempotent migration for the resolution columns (added 2026-06-02).
+    for col in ("resolved_outcome TEXT", "resolved_at REAL"):
+        try:
+            conn.execute(f"ALTER TABLE esports_markets ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -213,8 +236,59 @@ def lookup_market(conn: sqlite3.Connection, condition_id: str) -> sqlite3.Row | 
     ).fetchone()
 
 
+def hot_condition_ids(conn: sqlite3.Connection, since_seconds: float = 43200.0) -> list[str]:
+    """Distinct markets we've logged sharp actions in recently — the small set
+    worth polling for resolution (NOT the whole 10k-market universe)."""
+    import time as _t
+    cutoff = _t.time() - since_seconds
+    rows = conn.execute(
+        """SELECT DISTINCT a.condition_id FROM esports_sharp_actions a
+           WHERE a.condition_id IS NOT NULL AND a.detected_at >= ?
+             AND a.condition_id NOT IN (
+                 SELECT condition_id FROM esports_markets
+                  WHERE resolved_outcome IS NOT NULL)""",
+        (cutoff,),
+    ).fetchall()
+    return [r["condition_id"] for r in rows]
+
+
+def set_market_resolution(conn: sqlite3.Connection, condition_id: str, outcome: str) -> bool:
+    """Record the winning outcome for a market (idempotent). Returns True if
+    this was a NEW resolution (first time we marked it), else False."""
+    import time as _t
+    cur = conn.execute(
+        """UPDATE esports_markets
+              SET resolved_outcome=?, resolved_at=?, closed=1
+            WHERE condition_id=? AND resolved_outcome IS NULL""",
+        (outcome, _t.time(), condition_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def market_count(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT COUNT(*) c FROM esports_markets").fetchone()["c"]
+
+
+def set_tracker_status(conn: sqlite3.Connection, **f) -> None:
+    """Upsert the single-row tracker heartbeat. Called once per poll cycle."""
+    f["updated_at"] = time.time()
+    fields = ("last_cycle_at", "last_cycle_ms", "cycle_seconds", "cycles",
+              "wallets", "errors_last_cycle", "last_error", "last_error_at",
+              "updated_at")
+    params = {k: f.get(k) for k in fields}
+    conn.execute(
+        f"""INSERT INTO tracker_status (id, {', '.join(fields)})
+            VALUES (1, {', '.join(':' + k for k in fields)})
+            ON CONFLICT(id) DO UPDATE SET
+            {', '.join(f'{k}=excluded.{k}' for k in fields)}""",
+        params,
+    )
+    conn.commit()
+
+
+def get_tracker_status(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM tracker_status WHERE id=1").fetchone()
 
 
 def recent_actions(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:

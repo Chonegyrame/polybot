@@ -153,3 +153,20 @@
   .filter-row.filters { grid-template-columns: repeat(3, 1fr); }
   .filter-row.strategy, .filter-row.sizing { grid-template-columns: 1fr 1fr; }
 }
+
+
+/* ---- esports section helpers (shared by feed + match cards) ---- */
+.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.link-like { color: var(--accent); }
+.link-like:hover { color: var(--accent-2); }
+
+
+/* ---- esports drill-down (match -> sub-market -> trades) ---- */
+@keyframes esPulse {
+  0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--yes) 50%, transparent); }
+  70%  { box-shadow: 0 0 0 6px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.es-live-dot { animation: esPulse 2s infinite; }
+.es-sub-head:hover { background: var(--panel-2); }
+.es-trade-row:hover { background: var(--panel-2); }
