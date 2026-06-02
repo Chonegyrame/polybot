@@ -75,12 +75,15 @@ async def refresh_esports_markets(pm: PolymarketClient, conn) -> tuple[int, int]
                     break
                 events_seen += len(page)
                 for ev in page:
+                    ev_start = _parse_dt(ev.start_time)
+                    start_epoch = ev_start.timestamp() if ev_start else None
                     for m in ev.markets:
                         if m.condition_id:
                             rows[m.condition_id] = {
                                 "condition_id": m.condition_id, "game": game,
                                 "title": m.question or ev.title,
                                 "market_type": classify_market_type(m.question),
+                                "start_time": start_epoch,
                                 "closed": 0,
                             }
                 if len(page) < 100:
@@ -101,12 +104,15 @@ async def refresh_esports_markets(pm: PolymarketClient, conn) -> tuple[int, int]
                         done = True
                         break
                     events_seen += 1
+                    ev_start = _parse_dt(ev.start_time)
+                    start_epoch = ev_start.timestamp() if ev_start else None
                     for m in ev.markets:
                         if m.condition_id and m.condition_id not in rows:
                             rows[m.condition_id] = {
                                 "condition_id": m.condition_id, "game": game,
                                 "title": m.question or ev.title,
                                 "market_type": classify_market_type(m.question),
+                                "start_time": start_epoch,
                                 "closed": 1,
                             }
                 if len(page) < 100:

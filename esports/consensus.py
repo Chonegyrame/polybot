@@ -174,6 +174,8 @@ def group_into_matches(actions: list[dict], max_matches: int = 40) -> list[dict]
         wallets = {a["wallet"] for a in acts}
         follow_wallets = {a["wallet"] for a in acts if a.get("follow")}
         last = max((a.get("detected_at") for a in acts if a.get("detected_at")), default=None)
+        # All sub-markets of a match share the event start; take the earliest seen.
+        start_time = min((a.get("start_time") for a in acts if a.get("start_time")), default=None)
         open_flags = [a.get("market_open") for a in acts]
         is_live = any(f is True for f in open_flags)
 
@@ -186,6 +188,7 @@ def group_into_matches(actions: list[dict], max_matches: int = 40) -> list[dict]
             "total_notional": sum((a.get("notional") or 0) for a in acts),
             "action_count": len(acts),
             "last_detected_at": last,
+            "start_time": start_time,
             "is_live": is_live,
             "primary": markets[0] if markets else None,
             "markets": markets,

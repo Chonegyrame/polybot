@@ -31,7 +31,8 @@ router = APIRouter(prefix="/esports", tags=["esports"])
 # Pulls wallet name/follow + the market's closed flag from the universe.
 _ACTION_SQL = """
     SELECT a.*, s.name, s.follow,
-           em.closed AS market_closed, em.resolved_outcome AS resolved_outcome
+           em.closed AS market_closed, em.resolved_outcome AS resolved_outcome,
+           em.start_time AS market_start
       FROM esports_sharp_actions a
       LEFT JOIN esports_sharps  s  ON s.wallet = a.wallet
       LEFT JOIN esports_markets em ON em.condition_id = a.condition_id
@@ -60,6 +61,7 @@ def _shape_action(r: sqlite3.Row) -> dict[str, Any]:
         "live_bid": r["live_bid"], "live_ask": ask, "slippage": slip,
         "market_open": (closed == 0) if closed is not None else None,
         "resolved_outcome": r["resolved_outcome"],
+        "start_time": _iso(r["market_start"]),
         "traded_at": _iso(r["traded_at"]),
         "detected_at": _iso(r["detected_at"]),
     }
@@ -231,7 +233,7 @@ async def matches(
             f"{_ACTION_SQL} {where} ORDER BY a.detected_at DESC LIMIT ?", params,
         ).fetchall()
         actions = [_shape_action(r) for r in rows]
-        grouped = group_into_matches(actions)
+        grouped = group_into_matches(actions, max_matches=80)
         return {
             "matches": grouped,
             "live_count": sum(1 for m in grouped if m["is_live"]),

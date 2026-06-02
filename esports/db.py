@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS esports_markets (
     game            TEXT,                -- 'lol' / 'cs'
     title           TEXT,
     market_type     TEXT,                -- winner / handicap / total / prop / other
+    start_time      REAL,                -- event/match start (epoch) — for date sectioning
     closed          INTEGER NOT NULL DEFAULT 0,
     resolved_outcome TEXT,               -- winning outcome once settled (authoritative "finished" flag)
     resolved_at     REAL,                -- when WE first detected the resolution
@@ -111,8 +112,8 @@ def connect(path: Path | str = DEFAULT_DB) -> sqlite3.Connection:
             conn.execute(f"ALTER TABLE esports_sharp_actions ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass  # column already exists
-    # Idempotent migration for the resolution columns (added 2026-06-02).
-    for col in ("resolved_outcome TEXT", "resolved_at REAL"):
+    # Idempotent migration for the resolution + start_time columns (2026-06-02).
+    for col in ("resolved_outcome TEXT", "resolved_at REAL", "start_time REAL"):
         try:
             conn.execute(f"ALTER TABLE esports_markets ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -217,13 +218,13 @@ def replace_esports_markets(conn: sqlite3.Connection, rows: list[dict]) -> int:
     now = _t.time()
     conn.executemany(
         """INSERT INTO esports_markets
-             (condition_id,game,title,market_type,closed,refreshed_at)
-           VALUES (:condition_id,:game,:title,:market_type,:closed,:refreshed_at)
+             (condition_id,game,title,market_type,start_time,closed,refreshed_at)
+           VALUES (:condition_id,:game,:title,:market_type,:start_time,:closed,:refreshed_at)
            ON CONFLICT(condition_id) DO UPDATE SET
              game=excluded.game, title=excluded.title,
-             market_type=excluded.market_type, closed=excluded.closed,
-             refreshed_at=excluded.refreshed_at""",
-        [{**r, "refreshed_at": now} for r in rows],
+             market_type=excluded.market_type, start_time=excluded.start_time,
+             closed=excluded.closed, refreshed_at=excluded.refreshed_at""",
+        [{"start_time": None, **r, "refreshed_at": now} for r in rows],
     )
     conn.commit()
     return len(rows)

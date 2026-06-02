@@ -334,6 +334,47 @@ function MatchStat({ label, value, accent }) {
   );
 }
 
+// Local-date key (YYYY-MM-DD) + a friendly label for date sectioning.
+function dayKeyOf(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d)) return null;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function dayLabel(iso) {
+  const d = new Date(iso);
+  const t0 = new Date(); const today = new Date(t0.getFullYear(), t0.getMonth(), t0.getDate());
+  const dd = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const diff = Math.round((dd - today) / 86400000);
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Tomorrow';
+  if (diff === -1) return 'Yesterday';
+  return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+// Group matches into date sections: today first, then upcoming days ascending,
+// then earlier days, then any with no scheduled time. Order within a day is
+// preserved (backend already sorts live/strongest first).
+function sectionMatches(matches) {
+  const byDay = new Map();
+  const noDate = [];
+  for (const m of matches) {
+    const k = dayKeyOf(m.start_time);
+    if (!k) { noDate.push(m); continue; }
+    if (!byDay.has(k)) byDay.set(k, []);
+    byDay.get(k).push(m);
+  }
+  const todayK = dayKeyOf(new Date().toISOString());
+  const keys = [...byDay.keys()].sort();
+  const upcoming = keys.filter(k => k >= todayK);
+  const earlier = keys.filter(k => k < todayK).reverse();
+  const secs = [...upcoming, ...earlier].map(k => ({
+    key: k, label: dayLabel(byDay.get(k)[0].start_time), matches: byDay.get(k),
+  }));
+  if (noDate.length) secs.push({ key: 'none', label: 'No scheduled time', matches: noDate });
+  return secs;
+}
+
 function MatchesView({ followOnly, game, openMarket, openWallet }) {
   let path = `/esports/matches?window=400`;
   if (followOnly) path += '&follow_only=true';
@@ -344,6 +385,7 @@ function MatchesView({ followOnly, game, openMarket, openWallet }) {
   const offline = res.source === 'mock';
   const sb = useApi(`/esports/scoreboard${game && game !== 'all' ? `?game=${game}` : ''}`, null, { pollMs: 30000 }).data;
   const hasScore = sb && sb.resolved_markets > 0;
+  const sections = useMemo(() => sectionMatches(matches), [matches]);
 
   if (res.loading && matches.length === 0) {
     return <div className="card card-pad muted">Loading matches…</div>;
@@ -381,8 +423,18 @@ function MatchesView({ followOnly, game, openMarket, openWallet }) {
         )}
       </div>
       {offline && <div className="card-pad muted" style={{ fontSize: 12 }}>⚠ Backend offline — showing cached/empty data.</div>}
-      {matches.map(m => (
-        <MatchCard key={m.match_key} m={m} openMarket={openMarket} openWallet={openWallet} />
+      {sections.map(sec => (
+        <div key={sec.key} style={{ marginBottom: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, margin: '14px 2px 8px' }}>
+            <span style={{ fontSize: 12.5, fontWeight: 700, letterSpacing: 0.3,
+              color: sec.label === 'Today' ? 'var(--yes)' : 'var(--text-2)', textTransform: 'uppercase' }}>{sec.label}</span>
+            <span className="muted" style={{ fontSize: 11 }}>{sec.matches.length} {sec.matches.length === 1 ? 'match' : 'matches'}</span>
+            <span style={{ flex: 1, height: 1, background: 'var(--border)' }} />
+          </div>
+          {sec.matches.map(m => (
+            <MatchCard key={m.match_key} m={m} openMarket={openMarket} openWallet={openWallet} />
+          ))}
+        </div>
       ))}
     </>
   );
