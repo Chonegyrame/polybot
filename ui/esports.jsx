@@ -189,12 +189,18 @@ function ActionChip({ side }) {
 // LEVEL 2 — one sub-market (Game 1 winner / Match winner / a total / handicap).
 // Collapsed: label + consensus + how many sharps, how big, at what price.
 // Expanded: the individual trades inside it (who, when, price, size, exits).
-function SubMarketRow({ mk, openMarket, openWallet }) {
+function SubMarketRow({ mk, liveAsks, openMarket, openWallet }) {
   const [open, setOpen] = useState(false);
   const oc = mk.outcomes || [];
   const leanAvg = oc[0]?.avg_entry;
   const typeChip = TYPE_LABEL[mk.market_type];
   const live = mk.market_open === true && !mk.resolved;
+  // Prefer a freshly-fetched live ask for open markets; fall back to the
+  // detection-time capture until/unless the live fetch provides one.
+  const liveAsk = (live && mk.lean_asset && liveAsks && liveAsks[mk.lean_asset] != null)
+    ? liveAsks[mk.lean_asset] : null;
+  const showAsk = liveAsk != null ? liveAsk : mk.our_ask;
+  const askIsLive = liveAsk != null;
   return (
     <div style={{ borderTop: '1px solid var(--border)', opacity: mk.resolved ? 0.62 : 1 }}>
       <div className="es-sub-head" onClick={() => setOpen(o => !o)}
@@ -229,10 +235,15 @@ function SubMarketRow({ mk, openMarket, openWallet }) {
                 : <span className="muted">—</span>}
             </span>
           ) : (
-            <span style={{ width: 78, textAlign: 'right' }} title="avg price the lean side paid → most recent ask we saw">
+            <span style={{ width: 86, textAlign: 'right' }} title={askIsLive
+                ? 'avg entry the lean side paid → LIVE ask right now (what you’d pay to follow)'
+                : 'avg entry → ask captured when we caught the signal · open a live match to refresh'}>
               <span className="mono muted">@{leanAvg != null ? leanAvg.toFixed(2) : '—'}</span>
-              {mk.our_ask != null && mk.our_ask >= 0.02 && mk.our_ask <= 0.98 && leanAvg != null &&
-                <span className={`mono ${mk.our_ask > leanAvg ? 'neg' : 'pos'}`}> →{mk.our_ask.toFixed(2)}</span>}
+              {showAsk != null && showAsk >= 0.02 && showAsk <= 0.98 && leanAvg != null &&
+                <span className={`mono ${showAsk > leanAvg ? 'neg' : 'pos'}`}> →{showAsk.toFixed(2)}
+                  {askIsLive && <span title="live ask — refreshing" style={{ display: 'inline-block', width: 5, height: 5,
+                    borderRadius: '50%', background: 'var(--yes)', marginLeft: 4, verticalAlign: 'middle' }} />}
+                </span>}
             </span>
           )}
           {mk.exits > 0 ? <span className="neg mono" style={{ width: 30 }} title="exits / sells">↩{mk.exits}</span>
@@ -271,6 +282,7 @@ function SubMarketRow({ mk, openMarket, openWallet }) {
 // of the most-active market. Expanded: every sub-market (live/hottest first).
 function MatchCard({ m, openMarket, openWallet }) {
   const [open, setOpen] = useState(false);
+  const [liveAsks, setLiveAsks] = useState({});
   const isLive = mk => mk.market_open === true && !mk.resolved;
   // Live markets on top, then still-open, then finished at the bottom.
   const markets = [...(m.markets || [])].sort((a, b) =>
@@ -279,6 +291,25 @@ function MatchCard({ m, openMarket, openWallet }) {
     || (b.buyers - a.buyers) || (b.notional - a.notional));
   const hottest = markets.find(isLive) || markets.find(mk => !mk.resolved) || markets[0];
   const hoc = hottest?.outcomes || [];
+
+  // While the card is OPEN and the match is live, fetch a LIVE ask for the lean
+  // side of each open market (deduped) and refresh every 25s. Scoped to the
+  // expanded card so it stays light on the shared rate limiter. The captured
+  // our_ask is the fallback until the first fetch lands.
+  useEffect(() => {
+    if (!open || !m.is_live) return;
+    const assets = [...new Set((m.markets || [])
+      .filter(mk => mk.market_open === true && !mk.resolved && mk.lean_asset)
+      .map(mk => mk.lean_asset))];
+    if (assets.length === 0) return;
+    let cancelled = false;
+    const pull = () => apiGet(`/esports/live_asks?assets=${assets.join(',')}`)
+      .then(r => { if (!cancelled) setLiveAsks(r.asks || {}); })
+      .catch(() => {});
+    pull();
+    const id = setInterval(pull, 25000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [open, m.is_live, m.match_key]);
   return (
     <div className="card" style={{ marginBottom: 12, overflow: 'hidden' }}>
       <div className="es-sub-head" onClick={() => setOpen(o => !o)}
@@ -316,7 +347,7 @@ function MatchCard({ m, openMarket, openWallet }) {
                   Finished
                 </div>
               )}
-              <SubMarketRow mk={mk} openMarket={openMarket} openWallet={openWallet} />
+              <SubMarketRow mk={mk} liveAsks={liveAsks} openMarket={openMarket} openWallet={openWallet} />
             </React.Fragment>
           ))}
         </div>

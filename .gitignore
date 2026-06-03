@@ -32,6 +32,9 @@ logs/
 # Local data
 data/
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
 
@@ -65,3 +68,6 @@ btcbot/__pycache__/
 
 # local handoff doc — not tracked
 session-state.md
+
+# local-only throwaway preview harnesses (desk/esports UI verification)
+_*_preview.py

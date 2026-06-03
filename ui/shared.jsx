@@ -166,6 +166,10 @@ function Sidebar({ route, setRoute, newsUnread = 0, insiderUnread = 0 }) {
         <div className="brand-mark">P</div>
         <div className="brand-word">POLYBOT<span className="dot">.</span></div>
       </div>
+      <div className="ws-toggle" role="navigation" aria-label="Workspace">
+        <span className="ws-opt on">Polymarket</span>
+        <a className="ws-opt" href="/desk/" title="Switch to BIG STOCK — stock notes, futures journal, alerts">Stock</a>
+      </div>
       <div className="nav-group-label">Navigate</div>
       {items.map(it => (
         <div

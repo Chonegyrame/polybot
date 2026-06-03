@@ -36,6 +36,7 @@ from app.config import settings
 from app.scheduler.runner import lifespan_scheduler
 
 UI_DIR = Path(__file__).resolve().parent.parent.parent / "ui"
+DESK_UI_DIR = Path(__file__).resolve().parent.parent.parent / "desk_ui"
 
 log = logging.getLogger(__name__)
 
@@ -92,11 +93,26 @@ app.include_router(insider.router)
 app.include_router(watchlist.router)
 app.include_router(esports.router)
 
+# BIG STOCK desk — a fully isolated sibling module (own SQLite, own router).
+# It imports nothing from app.*; these two lines are the ONLY coupling. Guarded
+# so a desk-side import error can never take down the Polymarket API.
+try:
+    from desk.api import router as desk_router
+
+    app.include_router(desk_router)
+except Exception:  # pragma: no cover - desk is optional, never block the core app
+    log.exception("BIG STOCK desk failed to load; continuing without it")
+
 # Serve the UI at /ui/* from the same FastAPI process so a single `uvicorn`
 # command boots backend + scheduler + UI. html=True makes /ui/ resolve to
 # /ui/index.html so the user can navigate to /ui directly.
 if UI_DIR.exists():
     app.mount("/ui", StaticFiles(directory=str(UI_DIR), html=True), name="ui")
+
+# Serve the BIG STOCK desk UI at /desk/* from the same process. html=True makes
+# /desk/ resolve to /desk/index.html.
+if DESK_UI_DIR.exists():
+    app.mount("/desk", StaticFiles(directory=str(DESK_UI_DIR), html=True), name="desk")
 
 
 @app.get("/", include_in_schema=False)

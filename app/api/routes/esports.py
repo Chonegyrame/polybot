@@ -13,6 +13,7 @@ yet (tracker never started), endpoints return empty payloads with
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -53,7 +54,7 @@ def _shape_action(r: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": r["id"], "wallet": r["wallet"], "name": r["name"],
         "follow": bool(r["follow"]) if r["follow"] is not None else None,
-        "condition_id": r["condition_id"], "title": r["title"],
+        "condition_id": r["condition_id"], "asset": r["asset"], "title": r["title"],
         "slug": r["slug"], "outcome": r["outcome"], "side": r["side"],
         "game": r["game"], "market_type": r["market_type"],
         "their_price": their, "size": r["size"], "usdc_size": r["usdc_size"],
@@ -242,6 +243,39 @@ async def matches(
         }
     finally:
         conn.close()
+
+
+@router.get("/live_asks")
+async def live_asks(
+    assets: str = Query(..., description="comma-separated CLOB outcome token ids"),
+) -> dict[str, Any]:
+    """Current best ask for each token id, fetched LIVE from the CLOB book.
+
+    Read-only and on-demand: the UI calls this only for the open markets in a
+    match card you've EXPANDED, so a stale captured ask can be replaced with what
+    you'd actually pay right now. Capped + deduped to bound calls against the
+    shared rate limiter the tracker also uses. Nothing is written; the tracker,
+    capture logic and backtest data are untouched."""
+    ids = list(dict.fromkeys(x for x in (assets.split(",") if assets else []) if x))[:24]
+    out: dict[str, float | None] = {}
+    if not ids:
+        return {"asks": out, "fetched_at": _iso(time.time())}
+
+    async def _one(pm: PolymarketClient, tid: str) -> None:
+        try:
+            book = await pm.get_orderbook(tid)
+            prices = [float(l["price"]) for l in ((book or {}).get("asks") or [])
+                      if l.get("price") is not None]
+            out[tid] = min(prices) if prices else None  # best ask = lowest offer
+        except Exception:  # noqa: BLE001 — degrade to null for this token
+            out[tid] = None
+
+    try:
+        async with PolymarketClient() as pm:
+            await asyncio.gather(*[_one(pm, t) for t in ids])
+    except Exception:  # noqa: BLE001 — whole-batch failure → all null, UI keeps captured
+        pass
+    return {"asks": out, "fetched_at": _iso(time.time())}
 
 
 @router.get("/scoreboard")

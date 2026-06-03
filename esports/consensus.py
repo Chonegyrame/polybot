@@ -108,6 +108,9 @@ def _market_consensus(actions: list[dict]) -> dict[str, Any]:
     avg_entry = _avg([a.get("their_price") for a in lean_acts])
     our_ask = next((a.get("live_ask") for a in reversed(lean_acts)
                     if a.get("live_ask") is not None), None)
+    # Token id of the lean outcome — lets the UI refetch a LIVE ask for open
+    # markets (the captured our_ask above goes stale during a live game).
+    lean_asset = next((a.get("asset") for a in reversed(lean_acts) if a.get("asset")), None)
 
     # Resolution + honest forward-test result for the consensus (lean) side.
     resolved_outcome = next((a.get("resolved_outcome") for a in actions
@@ -139,8 +142,10 @@ def _market_consensus(actions: list[dict]) -> dict[str, Any]:
         "against_count": total_buyers - lean_count,
         "skew": (lean_count / total_buyers) if total_buyers else None,
         "avg_entry": avg_entry,
-        # most-recent *captured* ask on the lean side ≈ what you'd pay to follow now
+        # most-recent *captured* ask on the lean side (snapshot at detection)
         "our_ask": our_ask,
+        # token of the lean outcome → UI fetches a live ask for open markets
+        "lean_asset": lean_asset,
         "notional": sum((a.get("notional") or 0) for a in actions),
         "exits": len(sells),
         "actions": sorted(actions, key=lambda a: a.get("detected_at") or "", reverse=True),
